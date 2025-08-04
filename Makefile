@@ -1,4 +1,4 @@
-.PHONY: format build cargo docker-build
+.PHONY: format build cargo docker-build docker-build-img
 
 # Detect system type and set shell accordingly
 SYSTEM_TYPE := $(shell uname -s)
@@ -23,8 +23,15 @@ build: format
 cargo:
 	cargo $(ARGS)
 
-# 4. Build compilation image under curvine-docker
+# 4. Build through docker compilation image
 docker-build:
+	docker run --rm -v $(PWD):/workspace -w /workspace curvine/curvine-compile:latest make all
+
+docker-build-cached:
+	docker run --rm -v $(PWD):/workspace -w /workspace curvine/curvine-compile:build-cached make all
+
+# 5. Build compilation image under curvine-docker
+docker-build-img:
 	docker build -t curvine-build -f curvine-docker/deploy/Dockerfile.build curvine-docker
 
 MODE ?= debug
@@ -50,5 +57,5 @@ cli:
 ufs:
 	cargo build -p curvine-ufs $(CARGO_FLAGS)
 
-# 5. All in one
+# 6. All in one
 all: build

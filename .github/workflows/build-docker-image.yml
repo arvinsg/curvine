@@ -4,7 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       push_image:
-        description: '是否推送镜像到 GitHub Container Registry'
+        description: 'Whether to push image to GitHub Container Registry'
+        required: false
+        default: false
+        type: boolean
+      use_cache:
+        description: 'Whether to build image with dependency cache'
         required: false
         default: false
         type: boolean
@@ -37,7 +42,8 @@ jobs:
           username: curvine
           password: ${{ secrets.PAT_DOCKERIO_TOKEN }}
       
-      - name: Build and push Docker image
+      - name: Build and push Docker image (standard)
+        if: inputs.use_cache == false
         uses: docker/build-push-action@v5
         with:
           context: ./curvine-docker/compile
@@ -46,5 +52,18 @@ jobs:
           tags: |
             ghcr.io/curvineio/curvine-compile:latest
             curvine/curvine-compile:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Build and push Docker image (with cache)
+        if: inputs.use_cache == true
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./curvine-docker/compile/Dockerfile_rocky9_cached
+          push: ${{ inputs.push_image }}
+          tags: |
+            ghcr.io/curvineio/curvine-compile:build-cached
+            curvine/curvine-compile:build-cached
           cache-from: type=gha
           cache-to: type=gha,mode=max

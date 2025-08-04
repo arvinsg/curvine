@@ -133,12 +133,18 @@ This project requires the following dependencies. Please ensure they are install
 You can either:
 1. Use the pre-configured `curvine-docker/compile/Dockerfile_rocky9` to build a compilation image
 2. Reference this Dockerfile to create a compilation image for other operating system versions
+3. We also supply `curvine/curvine-compile` image on dockerhub
 
 ### 🚀 Build Steps (Linux - Ubuntu/Debian example)
 
 ```bash
 # Compiled files are in build/dist
 make all
+
+# or use curvine-compile:latest docker images to build
+make docker-build
+# or use curvine-compile:build-cached docker images to build, this image already cached most dependency crates
+make docker-build-cached
 ```
 
 After successful compilation, target file will be generated in the build/dist directory. This file is the Curvine installation package that can be used for deployment or building images.

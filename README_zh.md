@@ -137,12 +137,17 @@ FSDataInputStream in = fs.open(new Path("/user/test/file.txt"));
 
 1. 使用预配置的 `curvine-docker/compile/Dockerfile_rocky9` 来构建编译镜像
 2. 参考此 Dockerfile 为其他操作系统版本创建编译镜像
+3. curvine在dockerhub上提供了`curvine/curvine-compile:latest` 镜像(基于rocky9)，可以使用此镜像进行编译
 
 ### 🚀 构建步骤 (Linux - Ubuntu/Debian 示例)
 
 ```bash
 # Compiled files are in build/dist
 sh build/build.sh
+# or use curvine-compile:latest docker images to build
+make docker-build
+# or use curvine-compile:build-cached docker images to build, this image already cached most dependency crates
+make docker-build-cached
 ```
 
 编译成功后，目标文件将生成在 build/dist 目录中。该文件是可用于部署或构建镜像的 Curvine 安装包。

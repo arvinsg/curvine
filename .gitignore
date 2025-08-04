@@ -4,7 +4,7 @@ testing/
 .vscode
 resources/
 glacier-cache.iml
-Cargo.lock
+# Cargo.lock - commented out to enable dependency caching in CI builds
 *.patch
 *.iml
 *.iws
