@@ -15,6 +15,7 @@
 #![allow(unused_variables)]
 
 use crate::*;
+use curvine_common::state::{FileStatus, FileType};
 use orpc::io::IOResult;
 use orpc::sys;
 use orpc::sys::{FFIUtils, RawIO};
@@ -53,11 +54,14 @@ impl FuseUtils {
         }
     }
 
-    pub fn get_mode(perm: u32, is_dir: bool) -> u32 {
-        if is_dir {
-            perm | (libc::S_IFDIR as u32)
-        } else {
-            perm | (libc::S_IFREG as u32)
+    pub fn get_mode(perm: u32, typ: FileType) -> u32 {
+        match typ {
+            FileType::Dir => perm | (libc::S_IFDIR as u32),
+
+            #[cfg(target_os = "linux")]
+            FileType::Link => FUSE_DEFAULT_MODE | (libc::S_IFLNK as u32),
+
+            _ => perm | (libc::S_IFREG as u32),
         }
     }
 
@@ -142,5 +146,13 @@ impl FuseUtils {
         )?;
 
         Ok(clone_fd)
+    }
+
+    pub fn fuse_st_size(status: &FileStatus) -> u64 {
+        match status.file_type {
+            FileType::Link => status.target.as_ref().map(|x| x.len()).unwrap_or(0) as u64,
+            FileType::Dir => FUSE_DEFAULT_PAGE_SIZE as u64,
+            _ => status.len as u64,
+        }
     }
 }

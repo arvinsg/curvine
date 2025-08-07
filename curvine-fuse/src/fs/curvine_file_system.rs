@@ -28,6 +28,7 @@ use curvine_common::state::{FileStatus, SetAttrOpts};
 use log::{debug, error, info};
 use orpc::common::ByteUnit;
 use orpc::runtime::Runtime;
+use orpc::sys::FFIUtils;
 use orpc::{sys, try_option};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -127,14 +128,15 @@ impl CurvineFileSystem {
 
         // Use mode from FileStatus if available, otherwise use default calculation
         let mode = if status.mode != 0 {
-            FuseUtils::get_mode(status.mode, status.is_dir)
+            FuseUtils::get_mode(status.mode, status.file_type)
         } else {
-            FuseUtils::get_mode(FUSE_DEFAULT_MODE & !conf.umask, status.is_dir)
+            FuseUtils::get_mode(FUSE_DEFAULT_MODE & !conf.umask, status.file_type)
         };
+        let size = FuseUtils::fuse_st_size(status);
 
         Ok(fuse_attr {
             ino: status.id as u64,
-            size: status.len as u64,
+            size,
             blocks,
             atime: 0,
             mtime: ctime_sec,
@@ -232,13 +234,14 @@ impl CurvineFileSystem {
         let start_index = arg.offset as usize;
         let mut res = FuseDirentList::new(arg);
         for (index, status) in list.iter().enumerate().skip(start_index) {
+            let attr = Self::status_to_attr(&self.conf, status)?;
+            let entry = Self::create_entry_out(&self.conf, attr);
+
             if plus {
-                let attr = Self::status_to_attr(&self.conf, status)?;
-                let entry = Self::create_entry_out(&self.conf, attr);
                 if !res.add_plus((index + 1) as u64, status, entry) {
                     break;
                 }
-            } else if !res.add((index + 1) as u64, status) {
+            } else if !res.add((index + 1) as u64, status, entry) {
                 break;
             }
         }
@@ -1004,5 +1007,66 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn batch_forget(&self, op: BatchForget<'_>) -> FuseResult<()> {
         self.state.batch_forget_node(op.nodes)
+    }
+
+    // Create a symbolic link
+    async fn symlink(&self, op: Symlink<'_>) -> FuseResult<fuse_entry_out> {
+        let linkname = try_option!(op.linkname.to_str());
+        let target = try_option!(op.target.to_str());
+        let id = op.header.nodeid;
+        info!("symlink: linkname={:?}, target={:?}", linkname, target);
+
+        if linkname.len() > FUSE_MAX_NAME_LENGTH {
+            return err_fuse!(libc::ENAMETOOLONG);
+        }
+
+        let (parent, linkname) = if linkname == FUSE_CURRENT_DIR {
+            (id, None)
+        } else if linkname == FUSE_PARENT_DIR {
+            let parent = self.state.get_parent_id(id)?;
+            (parent, None)
+        } else {
+            (id, Some(linkname))
+        };
+
+        let link_path = self.state.get_path_common(parent, linkname)?;
+
+        // Call backend filesystem to create the symbolic link
+        // Use force=false to prevent overwriting existing files (standard ln -s behavior)
+        self.fs.symlink(target, &link_path, false).await?;
+
+        // Get the created symlink's attributes
+        let entry = self.lookup_path(parent, linkname, &link_path).await?;
+
+        Ok(Self::create_entry_out(&self.conf, entry))
+    }
+
+    // Read the target of a symbolic link
+    async fn readlink(&self, op: Readlink<'_>) -> FuseResult<BytesMut> {
+        let path = self.state.get_path(op.header.nodeid)?;
+
+        // Get file status to read the symlink target
+        let status = self.fs_get_status(&path).await?;
+
+        // Check if it's actually a symlink
+        if status.file_type != curvine_common::state::FileType::Link {
+            return err_fuse!(libc::EINVAL, "Not a symbolic link: {}", path);
+        }
+
+        // Get the target from the file status
+        let curvine_target = match status.target {
+            Some(target) => target,
+            None => {
+                return err_fuse!(libc::ENODATA, "Symbolic link has no target: {}", path);
+            }
+        };
+
+        // Return the original target path as stored (POSIX standard behavior)
+        let os_bytes = FFIUtils::get_os_bytes(&curvine_target);
+        let mut result = BytesMut::with_capacity(os_bytes.len() + 1);
+        result.extend_from_slice(os_bytes);
+        result.extend_from_slice(&[0]);
+
+        Ok(result.split_to(result.len() - 1))
     }
 }
