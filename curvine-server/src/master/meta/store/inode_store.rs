@@ -243,6 +243,45 @@ impl InodeStore {
 
         Ok(())
     }
+    
+    pub fn apply_hardlink(&self, existing_file: &InodeView, parent: &InodeView, new_name: &str) -> CommonResult<()> {
+        let mut batch = self.store.new_batch();
+        
+        // 更新文件的 nlink 计数和修改时间
+        batch.write_inode(existing_file)?;
+        
+        // 更新父目录
+        batch.write_inode(parent)?;
+        
+        // 添加新的硬链接条目到父目录（指向同一个 inode）
+        batch.add_child(parent.id(), new_name, existing_file.id())?;
+        
+        batch.commit()?;
+        
+        Ok(())
+    }
+    
+    // 只删除目录条目，不删除 inode（用于硬链接）
+    pub fn apply_unlink(&self, parent: &InodeView, file: &InodeView) -> CommonResult<DeleteResult> {
+        let mut batch = self.store.new_batch();
+        
+        // 更新文件的 nlink 计数
+        batch.write_inode(file)?;
+        
+        // 更新父目录
+        batch.write_inode(parent)?;
+        
+        // 只删除父目录中的条目，不删除 inode 本身
+        batch.delete_child(parent.id(), file.name())?;
+        
+        batch.commit()?;
+        
+        // 返回删除结果（没有实际删除文件，所以文件和块计数为 0）
+        Ok(DeleteResult {
+            inodes: 0,
+            blocks: Default::default(),
+        })
+    }
 
     // Restore to a directory tree from rocksdb
     pub fn create_tree(&self) -> CommonResult<(i64, InodeView)> {

@@ -12,22 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod feature;
-pub mod inode;
-
-mod fs_dir;
-pub use self::fs_dir::FsDir;
-
-mod fs_stats;
-pub use self::fs_stats::FileSystemStats;
-
-mod inode_id;
-pub use self::inode_id::InodeId;
-
-pub mod store;
-
-mod block_meta;
-pub use block_meta::BlockMeta;
-
-#[cfg(test)]
-mod tests;
+mod test_hardlink;

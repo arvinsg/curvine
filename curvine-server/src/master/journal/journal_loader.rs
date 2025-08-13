@@ -27,6 +27,7 @@ use curvine_common::raft::{RaftResult, RaftUtils};
 use curvine_common::utils::SerdeUtils;
 use log::{error, info, warn};
 use orpc::common::FileUtils;
+use orpc::common::LocalTime;
 use orpc::sync::AtomicCounter;
 use orpc::{err_box, try_option, try_option_ref, CommonResult};
 use std::path::Path;
@@ -77,6 +78,8 @@ impl JournalLoader {
             JournalEntry::SetAttr(e) => self.set_attr(e),
 
             JournalEntry::Symlink(e) => self.symlink(e),
+            
+            JournalEntry::Hardlink(e) => self.hardlink(e),
         }
     }
 
@@ -194,6 +197,18 @@ impl JournalLoader {
         let mut fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.link)?;
         fs_dir.unprotected_symlink(inp, entry.new_inode, entry.force)?;
+        Ok(())
+    }
+    
+    pub fn hardlink(&self, entry: HardlinkEntry) -> CommonResult<()> {
+        let mut fs_dir = self.fs_dir.write();
+        let existing_inp = InodePath::resolve(fs_dir.root_ptr(), entry.existing_path)?;
+        let new_link_inp = InodePath::resolve(fs_dir.root_ptr(), entry.new_link_path)?;
+        
+        let existing_inode = try_option!(existing_inp.get_last_inode());
+        let new_parent = try_option!(new_link_inp.get_inode(-2));
+        
+        let _ = fs_dir.unprotected_hardlink(existing_inode, new_parent, entry.new_name, LocalTime::mills() as i64)?;
         Ok(())
     }
 

@@ -107,6 +107,16 @@ pub struct SymlinkEntry {
     pub(crate) force: bool,
 }
 
+// hardlink
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct HardlinkEntry {
+    pub(crate) op_ms: u64,
+    pub(crate) existing_path: String,  // 现有文件路径
+    pub(crate) new_link_path: String,  // 新硬链接路径
+    pub(crate) file_id: i64,            // 共享的 inode id
+    pub(crate) new_name: String,        // 新硬链接的名称
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
@@ -120,6 +130,7 @@ pub enum JournalEntry {
     UnMount(UnMountEntry),
     SetAttr(SetAttrEntry),
     Symlink(SymlinkEntry),
+    Hardlink(HardlinkEntry),
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

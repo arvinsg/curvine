@@ -159,7 +159,7 @@ impl FsDir {
         inp: &InodePath,
         mtime: i64,
     ) -> FsResult<DeleteResult> {
-        let target = match inp.get_last_inode() {
+        let mut target = match inp.get_last_inode() {
             Some(v) => v,
             None => return err_box!("Path not exists: {}", inp.path()),
         };
@@ -168,14 +168,41 @@ impl FsDir {
             Some(v) => v,
             None => return err_box!("Abnormal data status"),
         };
+        
+        // 如果是文件，检查硬链接计数
+        let should_delete_inode = if target.is_file() {
+            let file = target.as_file_mut()?;
+            let remaining_links = file.decrement_nlink();
+            remaining_links == 0  // 只有当没有硬链接时才真正删除
+        } else {
+            true  // 目录总是删除
+        };
+        
         let child = target.as_ref();
-
-        // Delete the data in rocksdb.
         parent.update_mtime(mtime);
-        let del_res = self.store.apply_delete(parent.as_ref(), child)?;
+        
+        let del_res = if should_delete_inode {
+            // 完全删除 inode 和所有数据
+            self.store.apply_delete(parent.as_ref(), child)?
+        } else {
+            // 只删除目录条目，保留 inode（因为还有其他硬链接）
+            // 注意：这里需要传入更新后的 inode（nlink 已减少）
+            self.store.apply_unlink(parent.as_ref(), target.as_ref())?
+        };
 
-        // After deletion occurs, the target address cannot be used.
+        // 从父目录中删除条目
         let _ = parent.delete_child(child.id(), child.name())?;
+        
+        // 如果是硬链接删除，需要确保所有指向同一 inode 的路径都能看到更新后的 nlink
+        if !should_delete_inode && target.is_file() {
+            // 强制更新内存中的 inode 引用
+            // 这里我们需要重新从存储中加载 inode 以确保一致性
+            if let Some(updated_inode) = self.store.get_inode(target.id())? {
+                // 更新内存中的 inode
+                let _ = mem::replace(target.as_mut(), updated_inode);
+            }
+        }
+        
         Ok(del_res)
     }
 
@@ -779,5 +806,93 @@ impl FsDir {
         self.store
             .apply_symlink(parent.as_ref(), new_inode_ptr.as_ref())?;
         Ok(link)
+    }
+
+    // 创建硬链接
+    pub fn hardlink(&mut self, existing_inp: &InodePath, mut new_link_inp: InodePath) -> FsResult<InodePath> {
+        let op_ms = LocalTime::mills();
+        
+        // 获取已存在文件的 inode
+        let existing_inode = match existing_inp.get_last_inode() {
+            Some(v) => {
+                if v.is_dir() {
+                    return err_box!("Cannot create hard link to directory: {}", existing_inp.path());
+                }
+                if v.is_link() {
+                    return err_box!("Cannot create hard link to symlink: {}", existing_inp.path());
+                }
+                v
+            }
+            None => return err_ext!(FsError::file_not_found(existing_inp.path())),
+        };
+        
+        // 检查新链接的父目录是否存在
+        let new_parent = match new_link_inp.get_inode(-2) {
+            Some(v) => {
+                if !v.is_dir() {
+                    return err_box!("Parent path is not a directory: {}", new_link_inp.get_parent_path());
+                }
+                v
+            }
+            None => return err_box!("Parent directory does not exist: {}", new_link_inp.get_parent_path()),
+        };
+        
+        // 检查新链接路径是否已存在
+        if new_link_inp.get_last_inode().is_some() {
+            return err_ext!(FsError::file_exists(new_link_inp.path()));
+        }
+        
+        let file_id = existing_inode.id();
+        let new_name = new_link_inp.name().to_string();
+        let new_link_path = new_link_inp.path().to_string();
+        
+        let new_inode = self.unprotected_hardlink(existing_inode, new_parent, new_name.clone(), op_ms as i64)?;
+        new_link_inp.append(new_inode)?;
+        
+        // 记录日志
+        self.journal_writer.log_hardlink(
+            op_ms,
+            existing_inp.path(),
+            &new_link_path,
+            file_id,
+            &new_name,
+        )?;
+        
+        Ok(new_link_inp)
+    }
+    
+    pub(crate) fn unprotected_hardlink(
+        &mut self,
+        mut existing_inode: InodePtr,
+        mut new_parent: InodePtr,
+        new_name: String,
+        mtime: i64,
+    ) -> FsResult<InodePtr> {
+        // 增加硬链接计数
+        let file = existing_inode.as_file_mut()?;
+        file.increment_nlink();
+        file.update_mtime(mtime);
+        
+        // 更新父目录
+        new_parent.update_mtime(mtime);
+        
+        // 创建新的硬链接条目（共享同一个 inode）
+        // 注意：硬链接不创建新的 inode，而是在父目录中添加指向现有 inode 的新条目
+        self.store.apply_hardlink(
+            existing_inode.as_ref(),
+            new_parent.as_ref(),
+            &new_name,
+        )?;
+        
+        // 在内存中添加硬链接条目到父目录
+        // 对于硬链接，我们需要创建一个新的 InodeFile 副本，但保持相同的 id
+        let hardlink_file = existing_inode.as_file_ref()?.clone();
+        let mut new_file = hardlink_file;
+        new_file.name = new_name;
+        // 确保新的硬链接文件有相同的 id（共享同一个 inode）
+        new_file.id = existing_inode.id();
+        let new_inode = new_parent.add_child(File(new_file))?;
+        
+        Ok(new_inode)
     }
 }

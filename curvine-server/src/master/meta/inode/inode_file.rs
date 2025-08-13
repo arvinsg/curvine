@@ -33,6 +33,8 @@ pub struct InodeFile {
     pub(crate) len: i64,
     pub(crate) block_size: i64,
     pub(crate) replicas: u16,
+    
+    pub(crate) nlink: u32,  // 硬链接计数
 
     pub(crate) storage_policy: StoragePolicy,
 
@@ -55,6 +57,7 @@ impl InodeFile {
             len: 0,
             block_size: 0,
             replicas: 0,
+            nlink: 1,  // 初始硬链接计数为1
 
             storage_policy: Default::default(),
             features: FileFeature::new(),
@@ -76,6 +79,7 @@ impl InodeFile {
             len: 0,
             block_size: opts.block_size,
             replicas: opts.replicas,
+            nlink: 1,  // 初始硬链接计数为1
 
             storage_policy: opts.storage_policy,
             features: FileFeature::new(),
@@ -106,6 +110,7 @@ impl InodeFile {
             len: 0,
             block_size: 0,
             replicas: 0,
+            nlink: 1,  // 软链接也有一个引用计数
 
             storage_policy: Default::default(),
             features: FileFeature {
@@ -215,13 +220,29 @@ impl InodeFile {
 
     pub fn simple_string(&self) -> String {
         format!(
-            "id={}, pid={}, name={}, len={}, blocks={:?}",
+            "id={}, pid={}, name={}, len={}, nlink={}, blocks={:?}",
             self.id,
             self.parent_id,
             self.name,
             self.len,
+            self.nlink,
             self.block_ids()
         )
+    }
+    
+    pub fn increment_nlink(&mut self) {
+        self.nlink += 1;
+    }
+    
+    pub fn decrement_nlink(&mut self) -> u32 {
+        if self.nlink > 0 {
+            self.nlink -= 1;
+        }
+        self.nlink
+    }
+    
+    pub fn update_mtime(&mut self, mtime: i64) {
+        self.mtime = mtime;
     }
 }
 
