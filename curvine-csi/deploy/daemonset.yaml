@@ -1,0 +1,116 @@
+kind: DaemonSet
+apiVersion: apps/v1
+metadata:
+  name: curvine-csi-node
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: curvine-csi-node
+  template:
+    metadata:
+      labels:
+        app: curvine-csi-node
+    spec:
+      serviceAccountName: csi-node
+      tolerations:
+        - operator: Exists
+      priorityClassName: system-node-critical
+      dnsPolicy: ClusterFirstWithHostNet
+
+      containers:
+        - name: csi-plugin
+          image: curvine/curvine-csi:latest
+          imagePullPolicy: Always
+          command: ["/opt/curvine/bin/csi"]
+          args:
+            - --endpoint=$(CSI_ENDPOINT)
+            - --nodeid=$(NODE_NAME)
+          env:
+            - name: CSI_ENDPOINT
+              value: unix:///csi/csi.sock
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - rm /csi/csi.sock
+          livenessProbe:
+            failureThreshold: 5
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+          name: csi-plugin
+          ports:
+            - containerPort: 9909
+              name: healthz
+              protocol: TCP
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - mountPath: /csi
+              name: plugin-dir
+            - mountPath: /var/lib/kubelet
+              mountPropagation: Bidirectional
+              name: kubelet-dir
+            - mountPath: /registration
+              name: registration-dir
+            - mountPath: /opt/curvine/conf
+              name: curvine-config
+              readOnly: true
+        - name: node-driver-registrar
+          args:
+            - --csi-address=$(ADDRESS)
+            - --kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)
+            - --v=5
+          env:
+            - name: CURVINE_CONF_FILE
+              value: /opt/curvine/conf/curvine-cluster.toml
+            - name: ADDRESS
+              value: /csi/csi.sock
+            - name: DRIVER_REG_SOCK_PATH
+              value: /var/lib/kubelet/csi-plugins/csi.curvine.io/csi.sock
+          image: quay.io/k8scsi/csi-node-driver-registrar:v2.1.0
+          volumeMounts:
+            - mountPath: /csi
+              name: plugin-dir
+            - mountPath: /registration
+              name: registration-dir
+        - name: liveness-probe
+          args:
+            - --csi-address=$(ADDRESS)
+            - --health-port=$(HEALTH_PORT)
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+            - name: HEALTH_PORT
+              value: "9909"
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.11.0
+          volumeMounts:
+            - mountPath: /csi
+              name: plugin-dir
+      volumes:
+        - hostPath:
+            path: /var/lib/kubelet/csi-plugins/csi.curvine.io/
+            type: DirectoryOrCreate
+          name: plugin-dir
+        - hostPath:
+            path: /var/lib/kubelet
+            type: DirectoryOrCreate
+          name: kubelet-dir
+        - hostPath:
+            path: /var/lib/kubelet/plugins_registry/
+            type: Directory
+          name: registration-dir
+        - name: curvine-config
+          configMap:
+            name: curvine-config
+            defaultMode: 0755

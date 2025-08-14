@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: curvine-pv
+  labels:
+    type: curvine
+spec:
+  storageClassName: curvine-sc
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Delete
+  csi:
+    driver: curvine
+    volumeHandle: curvine-volume-1
+    volumeAttributes:
+      curvinePath: "/"
+      type: "Directory"

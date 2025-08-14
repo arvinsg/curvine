@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: curvine-test-pod
+  labels:
+    app: curvine-test
+spec:
+  containers:
+    - name: web-server
+      image: nginx:stable-alpine
+      ports:
+        - containerPort: 80
+          name: "http-server"
+      volumeMounts:
+        - mountPath: "/usr/share/nginx/html"
+          name: curvine-storage
+  volumes:
+    - name: curvine-storage
+      persistentVolumeClaim:
+        claimName: curvine-pvc

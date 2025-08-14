@@ -13,7 +13,7 @@
 // limitations under the License.
 
 # Image URL to use all building/pushing image targets
-IMG ?= curvine-csi:latest
+IMG ?= curvine/curvine-csi:latest
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
