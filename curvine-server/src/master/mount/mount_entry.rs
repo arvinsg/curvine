@@ -40,7 +40,7 @@ impl MountPointEntry {
         let strategy = ConsistencyStrategy::from(consistency_conf);
         let block_size = mnt_opt.block_size;
         let replicas = mnt_opt.replicas;
-        let storage_type = mnt_opt.storage_type.map(|x| StorageType::from(x));
+        let storage_type = mnt_opt.storage_type.map(StorageType::from);
 
         MountPointEntry {
             id,
