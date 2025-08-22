@@ -18,7 +18,7 @@ use bytes::{Bytes, BytesMut};
 use curvine_client::file::{FsClient, FsWriter};
 use curvine_client::unified::UnifiedReader;
 use curvine_common::fs::{CurvineURI, Path, Reader, Writer};
-use curvine_common::state::{CreateFileOptsBuilder, MountInfo, TtlAction};
+use curvine_common::state::CreateFileOptsBuilder;
 use curvine_common::FsResult;
 use curvine_ufs::fs::{AsyncChunkReader, AsyncChunkWriter};
 use orpc::sys::DataSlice;
@@ -177,7 +177,8 @@ impl CurvineFsWriter {
             .block_size(task.block_size)
             .storage_type(task.storage_type)
             .ttl_ms(task.ttl_ms)
-            .ttl_action(task.ttl_action)?;
+            .ttl_action(task.ttl_action)
+            .build();
         let status = client.create_with_opts(&path, opts).await?;
         let writer = FsWriter::create(
             client.context(),

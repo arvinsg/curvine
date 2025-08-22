@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::worker::load::load_task::{TaskExecutionConfig, TaskOperation, WorkerLoadError};
-use crate::worker::load::{CurvineFsWriter, LoadTask, UfsConnector};
+use crate::worker::load::{CurvineFsWriter, LoadTask};
 use curvine_client::file::FsClient;
-use curvine_common::fs::{FileSystem, Path, Reader, RpcCode};
+use curvine_common::fs::{FileSystem, Path, RpcCode};
 use curvine_common::proto::{
     LoadMetrics, LoadState, LoadTaskReportRequest, LoadTaskReportResponse,
 };
@@ -231,7 +231,7 @@ async fn execute_load_task(
     // Create reader from external storage
     let reader = match fs.open(&source_path).await {
         Ok(reader) =>  {
-            Box::new(S3ReaderWrapper::new(reader, 0))
+            S3ReaderWrapper::new(reader, 0)
         }
         Err(e) => {
             update_task_failure(tasks, task, format!("Failed to create reader: {}", e));
@@ -243,11 +243,11 @@ async fn execute_load_task(
 
     // Update task with total file size
     if let Some(mut task_ref) = tasks.get_mut(&task.task_id) {
-        task_ref.set_total_size(reader.len() as u64);
+        task_ref.set_total_size(reader.content_length());
     }
 
     let writer = match CurvineFsWriter::new(fs_client, task).await {
-        Ok(writer) => Box::new(writer),
+        Ok(writer) => writer,
         Err(e) => {
             update_task_failure(tasks, task, format!("Failed to create writer: {}", e));
             return Err(

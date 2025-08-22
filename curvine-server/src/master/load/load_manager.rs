@@ -19,7 +19,7 @@ use core::time::Duration;
 use std::collections::linked_list::LinkedList;
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::proto::{LoadState, LoadTaskReportRequest};
+use curvine_common::proto::{CancelLoadResponse, LoadState, LoadTaskReportRequest};
 use curvine_common::state::{FileStatus, LoadJobOptions, MountInfo, WorkerAddress};
 use log::{debug, error, info, warn};
 use orpc::client::ClientFactory;
@@ -124,11 +124,14 @@ impl LoadManager {
             }
         } else {
             // 文件一般是自动加载，并且是并行执行的，校验ufs_mtime，防止分发大量重复任务。
-            let cv_status = self.master_fs.file_status(target_path.path())?;
-            if cv_status.storage_policy.ufs_mtime == 0 {
+            if let Ok(cv_status) = self.master_fs.file_status(target_path.path()) {
+                if cv_status.storage_policy.ufs_mtime == 0 {
+                    false
+                }  else {
+                    cv_status.storage_policy.ufs_mtime == source_status.mtime
+                }
+            } else {
                 false
-            }  else {
-                cv_status.storage_policy.ufs_mtime == source_status.mtime
             }
         }
     }
@@ -160,7 +163,7 @@ impl LoadManager {
 
         // Send a cancel request to all assigned Workers
         for worker in assigned_workers {
-            let res = self.rt.block_on(async{
+            let res: FsResult<CancelLoadResponse> = self.rt.block_on(async{
                 let client = self.get_worker_client(&worker).await?;
                 let res = client.cancel_job(&job_id).await?;
                 Ok(res)
@@ -203,8 +206,8 @@ impl LoadManager {
     pub fn handle_task_report(&self, report: LoadTaskReportRequest) -> CommonResult<()> {
         let job_id = report.job_id.clone();
         let mut task_id = String::new();
-        let mut path = String::new();
-        let mut target_path = String::new();
+        let mut _path = String::new();
+        let mut _target_path = String::new();
         let mut total_size: u64 = 0;
         let mut loaded_size: u64 = 0;
         let message = report.message.unwrap_or_default();
@@ -212,8 +215,8 @@ impl LoadManager {
 
         if let Some(metrics) = report.metrics {
             task_id = metrics.task_id;
-            path = metrics.path;
-            target_path = metrics.target_path;
+            _path = metrics.path;
+            _target_path = metrics.target_path;
             total_size = metrics.total_size.unwrap_or(0) as u64;
             loaded_size = metrics.loaded_size.unwrap_or(0) as u64;
         }
@@ -351,6 +354,7 @@ impl LoadManager {
                     &job,
                     source_path.clone_uri(),
                     target_path.clone_path(),
+                    mnt,
                 ).await?;
                 task.total_size = Some(status.len as u64);
 
@@ -369,7 +373,7 @@ impl LoadManager {
                 Some(job_ref.clone())
             }
             None => {
-                Ok(None)
+                None
             }
         }
     }

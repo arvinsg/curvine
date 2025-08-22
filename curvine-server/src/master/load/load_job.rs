@@ -150,10 +150,10 @@ impl LoadJob {
             .unwrap_or(mnt.storage_type.unwrap_or(client_conf.storage_type));
 
         let ttl_ms = options.ttl_ms
-            .unwrap_or(mnt.ttl_ms.unwrap_or(0));
+            .unwrap_or(mnt.ttl_ms);
 
         let ttl_action = options.ttl_action
-            .unwrap_or(mnt.ttl_action.unwrap_or(TtlAction::None));
+            .unwrap_or(mnt.ttl_action);
 
         let expire_time = Some(Utc::now() + chrono::Duration::milliseconds(conf.default_ttl_seconds as i64));
         let now = Utc::now();
@@ -311,19 +311,19 @@ impl LoadJob {
         if all_completed {
             self.update_state(
                 LoadState::Completed,
-                Some("All subtasks completed".to_string()),
+                "All subtasks completed",
             );
         } else if any_failed {
-            self.update_state(LoadState::Failed, Some("Some subtasks failed".to_string()));
+            self.update_state(LoadState::Failed, "Some subtasks failed");
         } else if any_canceled {
             self.update_state(
                 LoadState::Canceled,
-                Some("Some subtasks canceled".to_string()),
+                "Some subtasks canceled",
             );
         } else if any_loading {
-            self.update_state(LoadState::Loading, Some("Tasks in progress".to_string()));
+            self.update_state(LoadState::Loading, "Tasks in progress");
         } else if any_pending {
-            self.update_state(LoadState::Pending, Some("Tasks pending".to_string()));
+            self.update_state(LoadState::Pending, "Tasks pending");
         }
     }
 

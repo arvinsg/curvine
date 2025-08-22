@@ -14,7 +14,6 @@
 
 use crate::proto::*;
 use crate::state::*;
-use crate::master::load::LoadJobOptions;
 use orpc::{try_err, CommonResult};
 use prost::bytes::BytesMut;
 use prost::Message;

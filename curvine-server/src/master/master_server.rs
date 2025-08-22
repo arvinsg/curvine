@@ -141,7 +141,8 @@ impl Master {
         let rt = Arc::new(conf.master_server_conf().create_runtime());
 
         let load_manager = Arc::new(LoadManager::from_cluster_conf(
-            Arc::new(fs.clone()),
+            fs.clone(),
+            mount_manager.clone(),
             rt.clone(),
             &conf,
         ));

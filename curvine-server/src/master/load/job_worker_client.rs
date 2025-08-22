@@ -5,8 +5,8 @@ use curvine_common::proto::{CancelLoadRequest, CancelLoadResponse, LoadTaskReque
 use orpc::client::RpcClient;
 use crate::master::{LoadJob, TaskDetail};
 use prost::Message as PMessage;
+use curvine_common::state::MountInfo;
 use curvine_common::utils::RpcUtils;
-use orpc::message::{Builder, MessageBuilder, RequestStatus};
 
 #[derive(Clone)]
 pub struct JobWorkerClient {
@@ -33,6 +33,7 @@ impl JobWorkerClient {
         job: &LoadJob,
         source_path: String,
         target_path: String,
+        mnt: &MountInfo,
     ) -> FsResult<TaskDetail> {
         let request = LoadTaskRequest {
             job_id: job.job_id.to_string(),
@@ -43,13 +44,12 @@ impl JobWorkerClient {
             storage_type: job.storage_type.into(),
             ttl_ms: job.ttl_ms,
             ttl_action: job.ttl_action.into(),
+            ufs_conf: mnt.properties.clone(),
         };
 
-        let response = self.rpc(RpcCode::SubmitLoadTask, request).await?;
-        let task_response: LoadTaskResponse = response.parse_header()?;
-
+        let response: LoadTaskResponse = self.rpc(RpcCode::SubmitLoadTask, request).await?;
         let task_detail = TaskDetail::new(
-            task_response.task_id,
+            response.task_id,
             source_path,
             target_path,
             worker_id,
@@ -63,8 +63,7 @@ impl JobWorkerClient {
             job_id: job_id.to_string(),
         };
 
-        let response = self.rpc(RpcCode::CancelLoadJob, request).await?;
-        let response: CancelLoadResponse = response.parse_header()?;
+        let response: CancelLoadResponse = self.rpc(RpcCode::CancelLoadJob, request).await?;
         Ok(response)
     }
 }

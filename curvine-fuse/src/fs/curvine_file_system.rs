@@ -1052,10 +1052,10 @@ impl fs::FileSystem for CurvineFileSystem {
 
         // Check file access permissions before opening
         let status = self.fs_get_status(&path).await?;
-        let action = OpenAction::try_from(op.arg.flags)?;
 
         // Determine what permissions we need to check
         #[cfg(target_os = "linux")] {
+            let action = OpenAction::try_from(op.arg.flags)?;
             let required_mask = match action {
                 OpenAction::ReadOnly => libc::R_OK as u32,
                 OpenAction::WriteOnly => libc::W_OK as u32,

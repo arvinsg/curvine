@@ -75,6 +75,7 @@ impl LoadTask {
             storage_type: req.storage_type.into(),
             ttl_ms: req.ttl_ms,
             ttl_action: req.ttl_action.into(),
+            ufs_conf: req.ufs_conf,
         }
     }
 

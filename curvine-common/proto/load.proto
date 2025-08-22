@@ -111,6 +111,7 @@ message LoadTaskRequest {
   required StorageTypeProto storage_type = 6;
   required int64 ttl_ms = 7;
   required TtlActionProto ttl_action = 8;
+  map<string, string> ufs_conf = 9;
 }
 
 // Worker responds to the LoadTaskRequest submitted by the Server side and allocates a task_id

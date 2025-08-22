@@ -117,7 +117,7 @@ impl FileLoadService {
             request.source_path, request.target_path
         );
 
-        let task = LoadTask::new(request);
+        let task = LoadTask::new(request.clone());
 
         match self.submit_task(task.clone()).await {
             Ok(_) => {

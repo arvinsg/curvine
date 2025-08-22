@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::master::{LoadManager, RpcContext};
-use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     CancelLoadRequest, CancelLoadResponse, GetLoadStatusRequest, GetLoadStatusResponse,
@@ -21,12 +20,10 @@ use curvine_common::proto::{
     LoadTaskReportResponse,
 };
 use curvine_common::FsResult;
-use log::{debug, error, info, warn};
+use log::debug;
 use orpc::err_box;
-use orpc::error::ErrorImpl;
-use orpc::handler::MessageHandler;
 use orpc::message::Message;
-use orpc::runtime::{RpcRuntime, Runtime};
+use orpc::runtime::Runtime;
 use std::sync::Arc;
 use curvine_common::utils::ProtoUtils;
 
@@ -203,7 +200,7 @@ impl MasterLoadService {
         ctx.response(response)
     }
 
-    fn handle(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    pub fn handle(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         match ctx.code {
             RpcCode::SubmitLoadJob => self.submit_load_job(ctx),
             RpcCode::GetLoadStatus => self.get_load_status(ctx),
