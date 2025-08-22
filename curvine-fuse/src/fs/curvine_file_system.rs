@@ -1055,15 +1055,17 @@ impl fs::FileSystem for CurvineFileSystem {
         let action = OpenAction::try_from(op.arg.flags)?;
 
         // Determine what permissions we need to check
-        let required_mask = match action {
-            OpenAction::ReadOnly => libc::R_OK as u32,
-            OpenAction::WriteOnly => libc::W_OK as u32,
-            OpenAction::ReadWrite => (libc::R_OK | libc::W_OK) as u32,
-        };
+        #[cfg(target_os = "linux")] {
+            let required_mask = match action {
+                OpenAction::ReadOnly => libc::R_OK as u32,
+                OpenAction::WriteOnly => libc::W_OK as u32,
+                OpenAction::ReadWrite => (libc::R_OK | libc::W_OK) as u32,
+            };
 
-        // Check if the current user has the required permissions
-        if !self.check_access_permissions(&status, op.header.uid, op.header.gid, required_mask) {
-            return err_fuse!(libc::EACCES, "Permission denied to open file: {}", path);
+            // Check if the current user has the required permissions
+            if !self.check_access_permissions(&status, op.header.uid, op.header.gid, required_mask) {
+                return err_fuse!(libc::EACCES, "Permission denied to open file: {}", path);
+            }
         }
 
         // Enforce parent directory search permission

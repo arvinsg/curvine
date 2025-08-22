@@ -425,7 +425,7 @@ impl MessageHandler for MasterHandler {
             | RpcCode::CancelLoadJob
             | RpcCode::ReportLoadTask => {
                 if let Some(ref mut load_service) = self.load_service {
-                    return load_service.handle(msg);
+                    return load_service.handle(ctx);
                 } else {
                     return Err(FsError::common("Load service not initialized"));
                 }

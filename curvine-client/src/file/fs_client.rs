@@ -24,7 +24,7 @@ use curvine_common::FsResult;
 use orpc::client::ClusterConnector;
 use orpc::message::MessageBuilder;
 use orpc::runtime::RpcRuntime;
-use orpc::{err_box, ternary};
+use orpc::err_box;
 use prost::Message as PMessage;
 use std::collections::LinkedList;
 use std::sync::Arc;
@@ -326,13 +326,10 @@ impl FsClient {
     pub async fn async_cache(
         &self,
         path: &Path,
-        ttl: Option<String>,
-        recursive: bool,
     ) -> FsResult<CacheJobResult> {
         let req = LoadJobRequest {
-            path: path.full_path().to_owned(),
-            ttl,
-            recursive: ternary!(recursive, Some(recursive), None),
+            path: path.clone_uri(),
+            job_options: LoadJobOptionsProto::default(),
         };
 
         let rep: LoadJobResponse = self.rpc(RpcCode::SubmitLoadJob, req).await?;

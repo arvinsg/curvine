@@ -28,6 +28,7 @@ use orpc::handler::MessageHandler;
 use orpc::message::Message;
 use orpc::runtime::{RpcRuntime, Runtime};
 use std::sync::Arc;
+use curvine_common::utils::ProtoUtils;
 
 /// The master loads the task service
 /// Handle load task related requests from clients and Worker
@@ -52,19 +53,16 @@ impl MasterLoadService {
     /// validating parameters, and forwarding to the load manager.
     pub fn submit_load_job(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: LoadJobRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(req.path.clone()), None);
+
         // Check the request parameters
         if req.path.is_empty() {
             return err_box!("Path cannot be empty");
         }
-
-        let ttl = req.ttl.as_deref();
-        let recursive = req.recursive.unwrap_or(false);
+        let job_opts = ProtoUtils::job_options_from_pb(req.job_options);
 
         // Submit task - use block_on to call async method
-        let (job_id, target_path) = self
-            .rt
-            .block_on(self.load_manager.submit_job(&req.path, ttl, recursive))?;
-
+        let (job_id, target_path) = self.load_manager.submit_job(&req.path, job_opts)?;
         // Construct the response
         let response = LoadJobResponse {
             job_id,
@@ -81,24 +79,15 @@ impl MasterLoadService {
     /// a response with detailed metrics.
     pub fn get_load_status(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: GetLoadStatusRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(req.job_id.clone()), None);
 
         // Get the task ID
-        let job_id = req.job_id.clone();
-        ctx.set_audit(Some(job_id.clone()), None);
+        let job_id = req.job_id;
 
-        info!("Received get_load_status request for job: {}", job_id);
-
-        // Get task status - use block_on to call async method
-        let job = match self
-            .rt
-            .block_on(self.load_manager.get_load_job_status(job_id.clone()))?
-        {
-            Some(status) => status,
-            None => {
-                return Err(FsError::Common(ErrorImpl::with_source(
-                    format!("Job with id {} not found", job_id).into(),
-                )))
-            }
+        let job = if let Some(v) = self.load_manager.get_load_job_status(job_id.clone()) {
+            v
+        } else {
+            return err_box!("Job {} not found", job_id)
         };
 
         //Accumulate loaded_size and total_size
@@ -150,15 +139,11 @@ impl MasterLoadService {
         let req: CancelLoadRequest = ctx.parse_header()?;
 
         // Get the task ID
-        let job_id = req.job_id.clone();
+        let job_id = req.job_id;
         ctx.set_audit(Some(job_id.clone()), None);
 
-        info!("Received cancel_load_job request for job: {}", job_id);
-
         // Cancel the task - use block_on to call async method
-        let success = self
-            .rt
-            .block_on(self.load_manager.cancel_job(job_id.clone()))?;
+        let success =self.load_manager.cancel_job(job_id.clone())?;
 
         // Construct the response
         let response = CancelLoadResponse {
@@ -180,13 +165,11 @@ impl MasterLoadService {
     /// updating the job status in the load manager.
     pub fn handle_task_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: LoadTaskReportRequest = ctx.parse_header()?;
-
         let job_id = req.job_id.clone();
+        ctx.set_audit(Some(job_id.clone()), None);
+
         let worker_id = req.worker_id;
         let state = req.state;
-
-        // Set up audit information
-        ctx.set_audit(Some(job_id.clone()), None);
 
         // Logging, the detailed level is adjusted according to the report type
         if let Some(ref metrics) = req.metrics {
@@ -205,20 +188,7 @@ impl MasterLoadService {
         }
 
         // Process task reports - use block_on to call async method
-        match self
-            .rt
-            .block_on(self.load_manager.handle_task_report(req.clone()))
-        {
-            Ok(_) => {
-                debug!("Successfully processed task report for job: {}", job_id);
-            }
-            Err(e) => {
-                error!("Failed to process task report for job {}: {}", job_id, e);
-                return Err(FsError::Common(ErrorImpl::with_source(
-                    format!("Failed to handle task report: {}", e).into(),
-                )));
-            }
-        }
+        self.load_manager.handle_task_report(req.clone())?;
 
         // Construct the response
         let response = LoadTaskReportResponse {
@@ -232,37 +202,14 @@ impl MasterLoadService {
         // Return response
         ctx.response(response)
     }
-}
 
-impl MessageHandler for MasterLoadService {
-    type Error = FsError;
-
-    /// Handle incoming RPC messages by dispatching to the appropriate handler method
-    ///
-    /// Routes messages based on their RPC code to the corresponding handler method
-    /// and records any errors that occur during processing.
-    fn handle(&mut self, msg: &Message) -> FsResult<Message> {
-        let code = RpcCode::from(msg.code());
-
-        // Create RpcContext
-        let mut rpc_context = RpcContext::new(msg);
-        let ctx = &mut rpc_context;
-
-        let response = match code {
+    fn handle(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        match ctx.code {
             RpcCode::SubmitLoadJob => self.submit_load_job(ctx),
             RpcCode::GetLoadStatus => self.get_load_status(ctx),
             RpcCode::CancelLoadJob => self.cancel_load_job(ctx),
             RpcCode::ReportLoadTask => self.handle_task_report(ctx),
-            _ => Err(FsError::Common(ErrorImpl::with_source(
-                format!("Unsupported operation: {:?}", code).into(),
-            ))),
-        };
-
-        // Record the request processing status
-        if let Err(ref e) = response {
-            warn!("Request {:?} failed: {}", code, e);
+            v => err_box!("Unsupported operation: {:?}", v),
         }
-
-        response
     }
 }

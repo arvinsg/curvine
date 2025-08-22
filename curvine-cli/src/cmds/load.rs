@@ -14,7 +14,7 @@
 
 use crate::util::*;
 use clap::Parser;
-use curvine_client::LoadClient;
+use curvine_client::JobMasterClient;
 use orpc::CommonResult;
 
 #[derive(Parser, Debug)]
@@ -32,7 +32,7 @@ pub struct LoadCommand {
 }
 
 impl LoadCommand {
-    pub async fn execute(&self, client: LoadClient) -> CommonResult<()> {
+    pub async fn execute(&self, client: JobMasterClient) -> CommonResult<()> {
         if self.path.trim().is_empty() {
             eprintln!("Error: Path cannot be empty");
             std::process::exit(1);

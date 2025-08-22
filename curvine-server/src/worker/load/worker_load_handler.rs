@@ -34,17 +34,11 @@ use tokio::sync::mpsc;
 ///
 #[derive(Clone)]
 pub struct FileLoadService {
-    /// Task storage
     tasks: Arc<DashMap<String, LoadTask>>,
-    ///T ask sending channel
     task_tx: mpsc::Sender<TaskOperation>,
-    /// Is it running
     running: Arc<std::sync::RwLock<bool>>,
-    /// Task execution configuration
-    exxec_config: TaskExecutionConfig,
-    /// File system client
+    exec_config: TaskExecutionConfig,
     fs_client: Arc<FsClient>,
-    /// Tokio runtime
     runtime: Arc<Runtime>,
 }
 
@@ -58,7 +52,7 @@ impl FileLoadService {
             tasks: Arc::new(DashMap::new()),
             task_tx,
             running: Arc::new(std::sync::RwLock::new(false)),
-            exxec_config: TaskExecutionConfig::default(),
+            exec_config: TaskExecutionConfig::default(),
             fs_client: Arc::new(fs_client),
             runtime,
         }
@@ -77,7 +71,7 @@ impl FileLoadService {
             tasks: Arc::new(DashMap::new()),
             task_tx,
             running: Arc::new(std::sync::RwLock::new(false)),
-            exxec_config: TaskExecutionConfig::from_cluster_conf(conf),
+            exec_config: TaskExecutionConfig::from_cluster_conf(conf),
             fs_client: Arc::new(fs_client),
             runtime,
         }
@@ -100,7 +94,7 @@ impl FileLoadService {
         let tasks = Arc::clone(&self.tasks);
         let running = Arc::clone(&self.running);
         let fs_client = Arc::clone(&self.fs_client);
-        let exec_config = self.exxec_config.clone();
+        let exec_config = self.exec_config.clone();
         let rt = Arc::clone(&self.runtime);
 
         self.runtime.spawn(async move {
@@ -123,13 +117,7 @@ impl FileLoadService {
             request.source_path, request.target_path
         );
 
-        let task = LoadTask::new(
-            request.job_id.clone(),
-            request.source_path.clone(),
-            request.target_path.clone(),
-            request.ttl_ms,
-            request.ttl_action,
-        );
+        let task = LoadTask::new(request);
 
         match self.submit_task(task.clone()).await {
             Ok(_) => {

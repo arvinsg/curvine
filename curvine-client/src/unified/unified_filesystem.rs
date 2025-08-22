@@ -240,7 +240,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem
         if mount.info.auto_cache() {
             match self
                 .cv
-                .async_cache(&ufs_path, mount.info.get_ttl(), false)
+                .async_cache(&ufs_path)
                 .await
             {
                 Err(e) => warn!("Submit async cache error for {}: {}", ufs_path, e),

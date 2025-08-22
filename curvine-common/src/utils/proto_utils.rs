@@ -14,6 +14,7 @@
 
 use crate::proto::*;
 use crate::state::*;
+use crate::master::load::LoadJobOptions;
 use orpc::{try_err, CommonResult};
 use prost::bytes::BytesMut;
 use prost::Message;
@@ -553,6 +554,26 @@ impl ProtoUtils {
             replicas: opts.replicas,
             mount_type: MountType::from(opts.mount_type),
             remove_properties: opts.remove_properties,
+        }
+    }
+
+    pub fn job_options_to_pb(opts: LoadJobOptions) -> LoadJobOptionsProto {
+        LoadJobOptionsProto {
+            replicas: opts.replicas,
+            block_size: opts.block_size,
+            storage_type: opts.storage_type.map(|v| v.into()),
+            ttl_ms: opts.ttl_ms,
+            ttl_action: opts.ttl_action.map(|v| v.into()),
+        }
+    }
+
+    pub fn job_options_from_pb(opts: LoadJobOptionsProto) -> LoadJobOptions {
+        LoadJobOptions {
+            replicas: opts.replicas,
+            block_size: opts.block_size,
+            storage_type: opts.storage_type.map(|v| v.into()),
+            ttl_ms: opts.ttl_ms,
+            ttl_action: opts.ttl_action.map(|v| v.into()),
         }
     }
 }

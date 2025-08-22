@@ -19,3 +19,6 @@ mod master_load_handler;
 pub use crate::master::load::load_manager::LoadManager;
 pub use load_job::*;
 pub use master_load_handler::MasterLoadService;
+
+mod job_worker_client;
+pub use self::job_worker_client::JobWorkerClient;

@@ -27,11 +27,12 @@ pub struct MasterLoadConf {
 impl Default for MasterLoadConf {
     fn default() -> Self {
         Self {
-            job_ttl_seconds: 7 * 24 * 3600,
+            job_ttl_seconds: 24 * 3600,
             job_cleanup_interval_seconds: 3600,
         }
     }
 }
+
 ///Configuration of Worker Loading Function
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

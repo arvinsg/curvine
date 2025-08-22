@@ -21,6 +21,7 @@ use curvine_common::fs::Path;
 use curvine_common::FsResult;
 use curvine_ufs::err_ufs;
 use std::collections::HashMap;
+use curvine_common::state::MountInfo;
 
 #[cfg(feature = "s3")]
 use curvine_ufs::s3::*;
@@ -93,6 +94,11 @@ impl UfsFileSystem {
 
             None => err_ufs!("Missing scheme"),
         }
+    }
+
+    pub fn with_mount(mnt: &MountInfo) -> FsResult<Self> {
+        let path = Path::from_str(&mnt.ufs_path)?;
+        Self::new(&path, mnt.properties.clone())
     }
 }
 impl_filesystem_for_enum!(UfsFileSystem);

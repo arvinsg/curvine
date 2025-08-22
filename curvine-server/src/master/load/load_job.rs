@@ -13,12 +13,11 @@
 // limitations under the License.
 
 use chrono::{DateTime, Utc};
-use curvine_common::conf::ClusterConf;
+use curvine_common::conf::{ClientConf, ClusterConf};
 use curvine_common::proto::LoadState;
-use curvine_common::state::WorkerAddress;
+use curvine_common::state::{LoadJobOptions, MountInfo, StorageType, TtlAction, WorkerAddress};
 use log::info;
 use std::collections::HashMap;
-use uuid::Uuid;
 
 /// Load the Task Manager configuration
 #[derive(Clone)]
@@ -28,6 +27,8 @@ pub struct LoadManagerConfig {
 
     /// Clean up expired task interval (seconds)
     pub cleanup_interval_seconds: u64,
+
+    pub client_conf: ClientConf,
 }
 
 impl LoadManagerConfig {
@@ -39,6 +40,7 @@ impl LoadManagerConfig {
         Self {
             default_ttl_seconds: load_conf.job_ttl_seconds,
             cleanup_interval_seconds: load_conf.job_cleanup_interval_seconds,
+            client_conf: conf.client.clone(),
         }
     }
 }
@@ -60,8 +62,7 @@ pub struct LoadJob {
     pub total_size: u64,
     /// Loaded size (bytes)
     pub loaded_size: u64,
-    /// Whether to process folders recursively
-    pub recursive: bool,
+
     /// The Worker node assigned to this task
     pub assigned_workers: Vec<WorkerAddress>,
     /// Subtask details, used to track the subtask status of folder recursive processing
@@ -72,6 +73,12 @@ pub struct LoadJob {
     pub update_time: DateTime<Utc>,
     /// Expiry time
     pub expire_time: Option<DateTime<Utc>>,
+
+    pub replicas: i32,
+    pub block_size: i64,
+    pub storage_type: StorageType,
+    pub ttl_ms: i64,
+    pub ttl_action: TtlAction,
 }
 
 /// Subtask details
@@ -80,7 +87,7 @@ pub struct TaskDetail {
     /// Task ID
     pub task_id: String,
     /// Source path
-    pub path: String,
+    pub source_path: String,
     /// Target path
     pub target_path: String,
     /// Current status
@@ -99,33 +106,82 @@ pub struct TaskDetail {
     pub update_time: DateTime<Utc>,
 }
 
-impl LoadJob {
-    /// Create a new loading task
-    pub fn new(source_path: String, target_path: String, recursive: bool) -> Self {
+impl TaskDetail {
+    pub fn new(
+        task_id: String,
+        source_path: String,
+        target_path: String,
+        worker_id: u32,
+    ) -> Self {
         let now = Utc::now();
         Self {
-            job_id: Uuid::new_v4().to_string(),
+            task_id,
+            source_path,
+            target_path,
+            state: LoadState::Pending,
+            message: None,
+            total_size: None,
+            loaded_size: None,
+            worker_id,
+            create_time: now,
+            update_time: now,
+        }
+    }
+}
+
+impl LoadJob {
+    /// Create a new loading task
+    pub fn new(
+        job_id: String,
+        source_path: String,
+        target_path: String,
+        options: &LoadJobOptions,
+        mnt: &MountInfo,
+        conf: &LoadManagerConfig,
+    ) -> Self {
+        let client_conf = &conf.client_conf;
+        let replicas = options.replicas
+            .unwrap_or(mnt.replicas.unwrap_or(client_conf.replicas));
+
+        let block_size = options.block_size
+            .unwrap_or(mnt.block_size.unwrap_or(client_conf.block_size));
+
+        let storage_type = options.storage_type
+            .unwrap_or(mnt.storage_type.unwrap_or(client_conf.storage_type));
+
+        let ttl_ms = options.ttl_ms
+            .unwrap_or(mnt.ttl_ms.unwrap_or(0));
+
+        let ttl_action = options.ttl_action
+            .unwrap_or(mnt.ttl_action.unwrap_or(TtlAction::None));
+
+        let expire_time = Some(Utc::now() + chrono::Duration::milliseconds(conf.default_ttl_seconds as i64));
+        let now = Utc::now();
+        Self {
+            job_id,
             source_path,
             target_path,
             state: LoadState::Pending,
             message: None,
             total_size: 0,
             loaded_size: 0,
-            recursive,
             assigned_workers: Vec::new(),
             task_details: HashMap::new(),
             create_time: now,
             update_time: now,
-            expire_time: None,
+            expire_time,
+            replicas,
+            block_size,
+            storage_type,
+            ttl_ms,
+            ttl_action,
         }
     }
 
     /// Update task status
-    pub fn update_state(&mut self, state: LoadState, message: Option<String>) {
+    pub fn update_state(&mut self, state: LoadState, message: impl Into<String>) {
         self.state = state;
-        if let Some(msg) = message {
-            self.message = Some(msg);
-        }
+        let _ = self.message.insert(message.into());
         self.update_time = Utc::now();
 
         info!(
@@ -160,29 +216,9 @@ impl LoadJob {
     }
 
     /// Add subtasks
-    pub fn add_sub_task(
-        &mut self,
-        task_id: String,
-        path: String,
-        target_path: String,
-        worker_id: u32,
-    ) {
-        let now = Utc::now();
-        let task_detail = TaskDetail {
-            task_id: task_id.clone(),
-            path,
-            target_path,
-            state: LoadState::Pending,
-            message: None,
-            total_size: None,
-            loaded_size: None,
-            worker_id,
-            create_time: now,
-            update_time: now,
-        };
-
-        self.task_details.insert(task_id, task_detail);
-        self.update_time = now;
+    pub fn add_sub_task(&mut self, task_detail: TaskDetail, ) {
+        self.task_details.insert(task_detail.task_id.to_string(), task_detail);
+        self.update_time = Utc::now();
     }
 
     /// Update subtask status

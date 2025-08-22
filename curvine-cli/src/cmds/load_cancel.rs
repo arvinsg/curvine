@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use clap::Parser;
-use curvine_client::LoadClient;
+use curvine_client::JobMasterClient;
 use orpc::CommonResult;
 
 use crate::util::*;
@@ -27,7 +27,7 @@ pub struct CancelLoadCommand {
 }
 
 impl CancelLoadCommand {
-    pub async fn execute(&self, client: LoadClient) -> CommonResult<()> {
+    pub async fn execute(&self, client: JobMasterClient) -> CommonResult<()> {
         // Verify the task ID
         if self.job_id.trim().is_empty() {
             eprintln!("Error: Job ID cannot be empty");

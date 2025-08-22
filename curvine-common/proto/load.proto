@@ -16,14 +16,20 @@ enum LoadState {
   CANCELED = 4;
 }
 
+message LoadJobOptionsProto {
+  optional int32 replicas = 2;
+  optional int64 block_size = 3;
+  optional StorageTypeProto storage_type = 4;
+  optional int64 ttl_ms = 5;
+  optional TtlActionProto ttl_action = 6;
+}
+
 // Submit a load task request
 message LoadJobRequest {
   // External file path, which may be a folder, for example: s3://my-bucket/test.text
   required string path = 1;
   // Cache time, format: number + unit (s/m/h/d/w), for example: 10d means 10 days
-  optional string ttl = 2;
-  // Whether to load recursively (add new fields corresponding to client code)
-  optional bool recursive = 3 [default = false];
+  required LoadJobOptionsProto job_options = 2;
 }
 
 // Submit the load task response
@@ -99,8 +105,12 @@ message LoadTaskRequest {
   required string job_id = 1;
   required string source_path = 2;
   required string target_path = 3;
-  optional int64 ttl_ms = 4 [default = 0];
-  optional TtlActionProto ttl_action = 5 [default = TTL_ACTION_PROTO_NONE];
+
+  required int32 replicas = 4;
+  required int64 block_size = 5;
+  required StorageTypeProto storage_type = 6;
+  required int64 ttl_ms = 7;
+  required TtlActionProto ttl_action = 8;
 }
 
 // Worker responds to the LoadTaskRequest submitted by the Server side and allocates a task_id

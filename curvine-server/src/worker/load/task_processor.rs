@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::worker::load::load_task::{TaskExecutionConfig, TaskOperation, WorkerLoadError};
-use crate::worker::load::{LoadTask, UfsConnector};
+use crate::worker::load::{CurvineFsWriter, LoadTask, UfsConnector};
 use curvine_client::file::FsClient;
-use curvine_common::fs::RpcCode;
+use curvine_common::fs::{FileSystem, Path, Reader, RpcCode};
 use curvine_common::proto::{
     LoadMetrics, LoadState, LoadTaskReportRequest, LoadTaskReportResponse,
 };
@@ -29,6 +29,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
+use curvine_client::unified::UfsFileSystem;
+use crate::worker::load::ufs_connector::S3ReaderWrapper;
 
 /// Task processor structure responsible for managing and executing load tasks
 pub struct TaskProcessor {
@@ -222,28 +224,15 @@ async fn execute_load_task(
         return Err(WorkerLoadError::TaskNotFound(task.task_id.to_string()).into());
     }
 
-    // Create external storage connector
-    let mut external_client = UfsConnector::new(task.path.clone(), fs_client.clone()).await?;
+    let source_path = Path::from_str(&task.path)?;
+    let fs = UfsFileSystem::new(&source_path, task.ufs_conf.clone())?;
 
-    // Get file size from external storage
-    let file_size = match external_client.get_file_size().await {
-        Ok(size) => size,
-        Err(e) => {
-            update_task_failure(tasks, task, format!("Failed to get file size: {}", e));
-            return Err(
-                WorkerLoadError::LoadError(format!("Failed to get file size: {}", e)).into(),
-            );
-        }
-    };
-
-    // Update task with total file size
-    if let Some(mut task_ref) = tasks.get_mut(&task.task_id) {
-        task_ref.set_total_size(file_size);
-    }
 
     // Create reader from external storage
-    let reader = match external_client.create_reader().await {
-        Ok(reader) => reader,
+    let reader = match fs.open(&source_path).await {
+        Ok(reader) =>  {
+            Box::new(S3ReaderWrapper::new(reader, 0))
+        }
         Err(e) => {
             update_task_failure(tasks, task, format!("Failed to create reader: {}", e));
             return Err(
@@ -252,13 +241,13 @@ async fn execute_load_task(
         }
     };
 
-    // Create writer to Curvine filesystem
-    let mtime = reader.mtime();
-    let writer = match external_client
-        .create_curvine_writer(mtime, task.ttl_ms, task.ttl_action)
-        .await
-    {
-        Ok(writer) => writer,
+    // Update task with total file size
+    if let Some(mut task_ref) = tasks.get_mut(&task.task_id) {
+        task_ref.set_total_size(reader.len() as u64);
+    }
+
+    let writer = match CurvineFsWriter::new(fs_client, task).await {
+        Ok(writer) => Box::new(writer),
         Err(e) => {
             update_task_failure(tasks, task, format!("Failed to create writer: {}", e));
             return Err(

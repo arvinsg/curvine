@@ -14,8 +14,9 @@
 
 #![allow(unused)]
 
+use std::collections::HashMap;
 use chrono::{DateTime, Utc};
-use curvine_common::proto::LoadState;
+use curvine_common::proto::{LoadState, LoadTaskRequest};
 use orpc::io::IOError;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -40,39 +41,40 @@ pub struct LoadTask {
     pub total_size: u64,
     /// Loaded Size (Bytes)
     pub loaded_size: u64,
-    // TTL (ms)
-    pub ttl_ms: Option<i64>,
-    // TTL (ms)
-    pub ttl_action: Option<i32>,
     /// Creation time
     pub create_time: DateTime<Utc>,
     /// Updated time
     pub update_time: DateTime<Utc>,
+
+    pub replicas: i32,
+    pub block_size: i64,
+    pub storage_type: StorageType,
+    pub ttl_ms: i64,
+    pub ttl_action: TtlAction,
+
+    pub ufs_conf: HashMap<String, String>,
 }
 
 impl LoadTask {
     /// Create a new load task
-    pub fn new(
-        job_id: String,
-        path: String,
-        target_path: String,
-        ttl_ms: Option<i64>,
-        ttl_action: Option<i32>,
-    ) -> Self {
+    pub fn new(req: LoadTaskRequest) -> Self {
         let now = Utc::now();
         Self {
-            task_id: Uuid::new_v4().to_string(),
-            job_id,
-            path,
-            target_path,
+            task_id: format!("task-{}", req.source_path),
+            job_id: req.job_id,
+            path: req.source_path,
+            target_path: req.target_path,
             state: LoadState::Pending,
             message: String::new(),
             total_size: 0,
             loaded_size: 0,
-            ttl_ms,
-            ttl_action,
             create_time: now,
             update_time: now,
+            replicas: req.replicas,
+            block_size: req.block_size,
+            storage_type: req.storage_type.into(),
+            ttl_ms: req.ttl_ms,
+            ttl_action: req.ttl_action.into(),
         }
     }
 
@@ -128,7 +130,7 @@ pub(crate) enum TaskOperation {
 }
 
 use curvine_common::conf::ClusterConf;
-use curvine_common::state::TtlAction;
+use curvine_common::state::{StorageType, TtlAction};
 
 /// Task execution configuration
 #[derive(Debug, Clone, PartialEq)]

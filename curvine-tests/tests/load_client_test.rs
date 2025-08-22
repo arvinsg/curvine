@@ -16,7 +16,7 @@
 
 use bytes::BytesMut;
 use curvine_client::file::{CurvineFileSystem, FsClient, FsContext};
-use curvine_client::LoadClient;
+use curvine_client::JobMasterClient;
 use curvine_common::fs::{Path, Reader};
 use curvine_common::proto::LoadState;
 use curvine_common::state::MountOptions;
@@ -29,6 +29,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+// use minio test
+// start:
+// podman run -p 9000:9000 -p 9001:9001 \
+// -v /app/minio/data:/data:rw,Z --name minio \
+// -e "MINIO_ACCESS_KEY=minioadmin" -e "MINIO_SECRET_KEY=minioadmin"\
+// minio/minio server /data --console-address ":9001"
+// login：http://192.168.202.147:9001/login
+//
+// mount
 const UFS_PATH: &str =
     "s3://flink/savepoints/006810e8385c1eade44cfe618fb3ef72/savepoint-006810-6d218be90e9f";
 const TEST_FILE: &str = "s3://flink/savepoints/006810e8385c1eade44cfe618fb3ef72/savepoint-006810-6d218be90e9f/03754607-a9bd-4fe9-8938-214066c79525";
@@ -64,7 +73,7 @@ fn load_client_test() -> CommonResult<()> {
         assert!(mount_resp.is_ok(), "mount should success");
 
         // Create MasterClient for submitting load request
-        let client = LoadClient::new(Arc::new(client))?;
+        let client = JobMasterClient::new(client_rt, Duration::from_secs(30))?;
         let fs = CurvineFileSystem::with_rt(conf, rt_clone.clone())?;
         // Submit a load request
         info!("Submit a load request: {}", TEST_FILE);
@@ -141,7 +150,7 @@ async fn read(fs: &CurvineFileSystem, path_str: &str) -> CommonResult<i64> {
 
     Ok(len as i64)
 }
-async fn test_cancel_load(client: &LoadClient, file_path: &str) -> CommonResult<()> {
+async fn test_cancel_load(client: &JobMasterClient, file_path: &str) -> CommonResult<()> {
     info!("Start testing the unload task: {}", file_path);
 
     // Submit a loading task

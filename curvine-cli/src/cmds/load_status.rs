@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use clap::Parser;
-use curvine_client::LoadClient;
+use curvine_client::JobMasterClient;
 use curvine_common::proto::LoadState;
 use orpc::CommonResult;
 
@@ -34,7 +34,7 @@ pub struct LoadStatusCommand {
 }
 
 impl LoadStatusCommand {
-    pub async fn execute(&self, client: LoadClient) -> CommonResult<()> {
+    pub async fn execute(&self, client: JobMasterClient) -> CommonResult<()> {
         println!("\n Checking status for {}", self.job_id);
 
         if let Some(watch_interval) = &self.watch {
@@ -51,7 +51,7 @@ impl LoadStatusCommand {
     /// # Arguments
     /// * `client` - LoadClient Instance
     /// * `interval_str` - Example：5s, 1m
-    async fn watch_status(&self, client: LoadClient, interval_str: &str) -> CommonResult<()> {
+    async fn watch_status(&self, client: JobMasterClient, interval_str: &str) -> CommonResult<()> {
         // Resolution refresh interval
         let duration = parse_duration(interval_str).unwrap_or_else(|_| {
             eprintln!("❌ Error: Invalid watch interval format: {}", interval_str);

@@ -12,43 +12,52 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::file::FsClient;
+use std::time::Duration;
 use curvine_common::fs::{Path, RpcCode};
 use curvine_common::proto::{
     CancelLoadRequest, CancelLoadResponse, GetLoadStatusRequest, GetLoadStatusResponse,
     LoadJobRequest, LoadJobResponse,
 };
-use curvine_common::state::MountInfo;
+use curvine_common::state::LoadJobOptions;
 use orpc::CommonResult;
-use std::sync::Arc;
+use prost::Message as PMessage;
+use curvine_common::FsResult;
+use curvine_common::utils::{ProtoUtils, RpcUtils};
+use orpc::client::RpcClient;
 
-/// Master RPC client
-pub struct LoadClient {
-    // The underlying RPC client
-    rpc_client: Arc<FsClient>,
+/// Job master client
+#[derive(Clone)]
+pub struct JobMasterClient {
+    client: RpcClient,
+    timeout: Duration,
 }
 
-impl LoadClient {
-    pub fn new(rpc_client: Arc<FsClient>) -> CommonResult<Self> {
-        Ok(Self {
-            rpc_client: rpc_client.clone(),
-        })
+impl JobMasterClient {
+    pub fn new(client: RpcClient, timeout: Duration) -> Self {
+        Self { client, timeout}
+    }
+
+
+    pub async fn rpc<T, R>(&self, code: RpcCode, header: T) -> FsResult<R>
+        where
+            T: PMessage + Default,
+            R: PMessage + Default,
+    {
+        RpcUtils::proto_rpc(&self.client, self.timeout, code, header).await
     }
 
     // Submit loading task
     pub async fn submit_load(
         &self,
-        path: &str,
-        ttl: Option<String>,
-        recursive: Option<bool>,
-    ) -> CommonResult<LoadJobResponse> {
+        path: &Path,
+        opts: LoadJobOptions,
+    ) -> FsResult<LoadJobResponse> {
         // Create a request
         let req = LoadJobRequest {
-            path: path.to_string(),
-            ttl,
-            recursive,
+            path: path.encode_uri(),
+            job_options: ProtoUtils::job_options_to_pb(opts)
         };
-        let rep: LoadJobResponse = self.rpc_client.rpc(RpcCode::SubmitLoadJob, req).await?;
+        let rep: LoadJobResponse = self.rpc(RpcCode::SubmitLoadJob, req).await?;
         Ok(rep)
     }
 
@@ -61,7 +70,7 @@ impl LoadClient {
         };
 
         // Send a request
-        let rep: GetLoadStatusResponse = self.rpc_client.rpc(RpcCode::GetLoadStatus, req).await?;
+        let rep: GetLoadStatusResponse = self.rpc(RpcCode::GetLoadStatus, req).await?;
 
         Ok(rep)
     }
@@ -73,13 +82,8 @@ impl LoadClient {
             job_id: job_id.to_string(),
         };
 
-        let rep: CancelLoadResponse = self.rpc_client.rpc(RpcCode::CancelLoadJob, req).await?;
+        let rep: CancelLoadResponse = self.rpc(RpcCode::CancelLoadJob, req).await?;
 
-        Ok(rep)
-    }
-    pub async fn get_mount_point(&self, path: &str) -> CommonResult<Option<MountInfo>> {
-        let path = Path::from_str(path)?;
-        let rep = self.rpc_client.get_mount_info(&path).await?;
         Ok(rep)
     }
 }
