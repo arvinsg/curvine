@@ -82,7 +82,7 @@ impl TaskProcessor {
                 TaskOperation::Submit(task) => {
                     let task_id = task.task_id.clone();
                     let job_id = task.job_id.clone();
-                    let source_path = task.path.clone();
+                    let source_path = task.source_path.clone();
 
                     info!(
                         "Processing task: job_id={}, task_id={}, path={}",
@@ -214,7 +214,7 @@ async fn execute_load_task(
 ) -> CommonResult<()> {
     info!(
         "Starting load task: job_id={}, task_id={}, path={}",
-        task.job_id, task.task_id, task.path
+        task.job_id, task.task_id, task.source_path
     );
 
     // Update task state to Loading
@@ -224,7 +224,7 @@ async fn execute_load_task(
         return Err(WorkerLoadError::TaskNotFound(task.task_id.to_string()).into());
     }
 
-    let source_path = Path::from_str(&task.path)?;
+    let source_path = Path::from_str(&task.source_path)?;
     let fs = UfsFileSystem::new(&source_path, task.ufs_conf.clone())?;
 
 
@@ -328,7 +328,7 @@ where
 
             info!(
                 "Load task completed: job_id={}, task_id={}, path={}",
-                task.job_id, task.task_id, task.path
+                task.job_id, task.task_id, task.source_path
             );
             Ok(())
         }
@@ -349,7 +349,7 @@ where
 
             error!(
                 "Load task failed: job_id={}, task_id={}, path={}, error={}",
-                task.job_id, task.task_id, task.path, e
+                task.job_id, task.task_id, task.source_path, e
             );
             Err(WorkerLoadError::LoadError(format!("Failed to transfer file: {}", e)).into())
         }
@@ -407,21 +407,7 @@ fn create_progress_callback(
 /// Report task status to master node
 async fn report_task_status_to_master(fs_client: Arc<FsClient>, task: &LoadTask, worker_id: i32) {
     // Build metrics information
-    let metrics = Some(LoadMetrics {
-        job_id: task.job_id.clone(),
-        task_id: task.task_id.clone(),
-        path: task.path.clone(),
-        target_path: task.target_path.clone(),
-        total_size: if task.total_size > 0 {
-            Some(task.total_size as i64)
-        } else {
-            None
-        },
-        loaded_size: Some(task.loaded_size as i64),
-        create_time: Some(task.create_time.timestamp_millis()),
-        update_time: Some(task.update_time.timestamp_millis()),
-        expire_time: None,
-    });
+    let metrics = Some();
 
     // Build report request
     let report_request = LoadTaskReportRequest {

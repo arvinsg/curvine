@@ -171,7 +171,7 @@ pub struct CurvineFsWriter {
 
 impl CurvineFsWriter {
     pub async fn new(client: &FsClient, task: &LoadTask) -> FsResult<CurvineFsWriter> {
-        let path = Path::from_str(&task.path)?;
+        let path = Path::from_str(&task.source_path)?;
         let opts = CreateFileOptsBuilder::new()
             .replicas(task.replicas)
             .block_size(task.block_size)

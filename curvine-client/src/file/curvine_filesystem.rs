@@ -218,7 +218,7 @@ impl CurvineFileSystem {
         &self,
         path: &Path,
     ) -> FsResult<CacheJobResult> {
-        self.fs_client.async_cache(path).await
+        self.fs_client.async_cache(path, ttl, recursive).await
     }
 
     pub async fn get_mount_table(&self) -> FsResult<Vec<MountInfo>> {

@@ -25,26 +25,16 @@ use uuid::Uuid;
 /// A load task is a task that is loaded from an external storage to a local computer
 #[derive(Debug, Clone)]
 pub struct LoadTask {
-    /// Task ID (subtask ID)
     pub task_id: String,
-    /// The job ID to which the task belongs
     pub job_id: String,
-    /// Source path
-    pub path: String,
-    /// Destination path
+    pub source_path: String,
     pub target_path: String,
-    /// Task status
     pub state: LoadState,
-    /// Status messages, such as error messages
     pub message: String,
-    /// Total Size (Bytes)
     pub total_size: u64,
-    /// Loaded Size (Bytes)
     pub loaded_size: u64,
-    /// Creation time
-    pub create_time: DateTime<Utc>,
-    /// Updated time
-    pub update_time: DateTime<Utc>,
+    pub create_time: u64,
+    pub update_time: u64,
 
     pub replicas: i32,
     pub block_size: i64,
@@ -56,20 +46,18 @@ pub struct LoadTask {
 }
 
 impl LoadTask {
-    /// Create a new load task
     pub fn new(req: LoadTaskRequest) -> Self {
-        let now = Utc::now();
         Self {
             task_id: format!("task-{}", req.source_path),
             job_id: req.job_id,
-            path: req.source_path,
+            source_path: req.source_path,
             target_path: req.target_path,
             state: LoadState::Pending,
-            message: String::new(),
+            message: "".to_string(),
             total_size: 0,
             loaded_size: 0,
-            create_time: now,
-            update_time: now,
+            create_time: LocalTime::mills(),
+            update_time: LocalTime::mills(),
             replicas: req.replicas,
             block_size: req.block_size,
             storage_type: req.storage_type.into(),
@@ -79,27 +67,18 @@ impl LoadTask {
         }
     }
 
-    /// Update the task status
-    pub fn update_state(&mut self, state: LoadState, message: Option<String>) {
+    pub fn update_state(&mut self, state: LoadState, message: impl Into<String>) {
         self.state = state;
-        if let Some(msg) = message {
-            self.message = msg;
-        }
-        self.update_time = Utc::now();
+        self.message = message.into();
+        self.update_time = LocalTime::mills();
     }
 
-    /// Set the total size
-    pub fn set_total_size(&mut self, size: u64) {
-        self.total_size = size;
-        self.update_time = Utc::now();
-    }
-
-    /// Update progress
-    pub fn update_progress(&mut self, loaded_size: u64, message: Option<String>) {
+    pub fn update_progress(&mut self, loaded_size: u64, total_size: u64) {
         self.loaded_size = loaded_size;
-        self.update_time = Utc::now();
-        if self.total_size == self.loaded_size {
-            self.update_state(LoadState::Completed, message);
+        self.total_size = total_size;
+        self.update_time = LocalTime::mills();
+        if self.loaded_size >= self.total_size {
+            self.update_state(LoadState::Completed, "task completed successfully");
         }
     }
 }
@@ -132,6 +111,7 @@ pub(crate) enum TaskOperation {
 
 use curvine_common::conf::ClusterConf;
 use curvine_common::state::{StorageType, TtlAction};
+use orpc::common::LocalTime;
 
 /// Task execution configuration
 #[derive(Debug, Clone, PartialEq)]

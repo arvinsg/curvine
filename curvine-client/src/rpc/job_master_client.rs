@@ -12,38 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
 use std::time::Duration;
 use curvine_common::fs::{Path, RpcCode};
-use curvine_common::proto::{
-    CancelLoadRequest, CancelLoadResponse, GetLoadStatusRequest, GetLoadStatusResponse,
-    LoadJobRequest, LoadJobResponse,
-};
+use curvine_common::proto::{CancelLoadRequest, CancelLoadResponse, GetLoadStatusRequest, GetLoadStatusResponse, LoadJobRequest, LoadJobResponse, LoadMetrics, LoadTaskReportRequest, LoadTaskReportResponse};
 use curvine_common::state::LoadJobOptions;
 use orpc::CommonResult;
 use prost::Message as PMessage;
 use curvine_common::FsResult;
 use curvine_common::utils::{ProtoUtils, RpcUtils};
-use orpc::client::RpcClient;
+use crate::file::FsClient;
 
 /// Job master client
 #[derive(Clone)]
 pub struct JobMasterClient {
-    client: RpcClient,
-    timeout: Duration,
+    client: Arc<FsClient>,
 }
 
 impl JobMasterClient {
-    pub fn new(client: RpcClient, timeout: Duration) -> Self {
-        Self { client, timeout}
-    }
-
-
-    pub async fn rpc<T, R>(&self, code: RpcCode, header: T) -> FsResult<R>
-        where
-            T: PMessage + Default,
-            R: PMessage + Default,
-    {
-        RpcUtils::proto_rpc(&self.client, self.timeout, code, header).await
+    pub fn new(client: Arc<FsClient>) -> Self {
+        Self { client}
     }
 
     // Submit loading task
@@ -57,33 +45,35 @@ impl JobMasterClient {
             path: path.encode_uri(),
             job_options: ProtoUtils::job_options_to_pb(opts)
         };
-        let rep: LoadJobResponse = self.rpc(RpcCode::SubmitLoadJob, req).await?;
+        let rep: LoadJobResponse = self.client.rpc(RpcCode::SubmitLoadJob, req).await?;
         Ok(rep)
     }
 
     /// Get loading task status according to the path
     pub async fn get_load_status(&self, job_id: &str) -> CommonResult<GetLoadStatusResponse> {
-        // Create a request
         let req = GetLoadStatusRequest {
             job_id: job_id.to_string(),
             verbose: Option::from(false),
         };
 
-        // Send a request
-        let rep: GetLoadStatusResponse = self.rpc(RpcCode::GetLoadStatus, req).await?;
+        let rep: GetLoadStatusResponse = self.client.rpc(RpcCode::GetLoadStatus, req).await?;
 
         Ok(rep)
     }
 
     /// Cancel the loading task
     pub async fn cancel_load(&self, job_id: &str) -> CommonResult<CancelLoadResponse> {
-        // Create a request
         let req = CancelLoadRequest {
             job_id: job_id.to_string(),
         };
 
-        let rep: CancelLoadResponse = self.rpc(RpcCode::CancelLoadJob, req).await?;
+        let rep: CancelLoadResponse = self.client.rpc(RpcCode::CancelLoadJob, req).await?;
 
         Ok(rep)
+    }
+
+    pub async fn report_task_status(&self, request: LoadTaskReportRequest) -> FsResult<()> {
+        let _: LoadTaskReportResponse = self.client.rpc(RpcCode::ReportLoadTask, request).await?;
+        Ok(())
     }
 }
