@@ -74,7 +74,6 @@ jobs:
           ### Installation
           1. Download the binary package
           2. Extract: `tar -xzf curvine-*.tar.gz`
-          3. Navigate to the extracted directory
-          4. Follow the installation instructions in the package
+          3. Follow the [quick start](https://curvineio.github.io/docs/Deploy/quick-start/#download-release-binary-package) to deploy
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
