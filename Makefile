@@ -185,6 +185,6 @@ dist-only:
 		fi; \
 	fi; \
 	echo "Packaging as: $${DIST_NAME}.tar.gz"; \
-	cd build && tar -czf "../$${DIST_NAME}.tar.gz" dist/; \
+	cd build/dist && tar -czf "../../$${DIST_NAME}.tar.gz" . && cd ../..; \
 	echo "Distribution package created: $${DIST_NAME}.tar.gz"; \
-	ls -lh "../$${DIST_NAME}.tar.gz"
+	ls -lh "$${DIST_NAME}.tar.gz"
