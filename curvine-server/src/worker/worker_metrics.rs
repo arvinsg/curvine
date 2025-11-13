@@ -35,6 +35,8 @@ pub struct WorkerMetrics {
     pub(crate) fs_used: Gauge,
     pub(crate) storage_failed: Gauge,
     pub(crate) num_blocks: Gauge,
+    pub(crate) store_total_disks: Gauge,
+    pub(crate) num_blocks_to_delete: Gauge,
 
     pub(crate) used_memory_bytes: Gauge,
 }
@@ -44,21 +46,29 @@ impl WorkerMetrics {
         let wm = Self {
             store,
 
-            write_bytes: m::new_counter("write_bytes", "worker writes total bytes")?,
-            write_time_us: m::new_counter("write_time_us", "Milliseconds spent writing")?,
-            write_blocks: m::new_counter_vec("write_blocks", "write_blocks", &["type"])?,
+            write_bytes: m::new_counter("worker_write_bytes", "worker writes total bytes")?,
+            write_time_us: m::new_counter("worker_write_time_us", "Milliseconds spent writing")?,
+            write_blocks: m::new_counter_vec("worker_write_blocks", "write_blocks", &["type"])?,
 
-            read_bytes: m::new_counter("read_bytes", "worker read total bytes")?,
-            read_time_us: m::new_counter("read_time_us", "Milliseconds spent read")?,
-            read_blocks: m::new_counter_vec("read_blocks", "read_blocks", &["type"])?,
+            read_bytes: m::new_counter("worker_read_bytes", "worker read total bytes")?,
+            read_time_us: m::new_counter("worker_read_time_us", "Milliseconds spent read")?,
+            read_blocks: m::new_counter_vec("worker_read_blocks", "read_blocks", &["type"])?,
 
-            capacity: m::new_gauge("capacity", "Total storage capacity")?,
-            available: m::new_gauge("available", "Total available space")?,
-            fs_used: m::new_gauge("fs_used", "Space used by the file system")?,
-            storage_failed: m::new_gauge("storage_failed", "Abnormal storage number")?,
-            num_blocks: m::new_gauge("num_blocks", "The total number of blocks")?,
+            capacity: m::new_gauge("worker_store_capacity", "Total storage capacity")?,
+            available: m::new_gauge("worker_store_available", "Total available space")?,
+            fs_used: m::new_gauge("worker_store_fs_used", "Space used by the file system")?,
+            storage_failed: m::new_gauge("worker_store_failed_disks", "Abnormal storage number")?,
+            num_blocks: m::new_gauge("worker_store_num_blocks", "The total number of blocks")?,
+            store_total_disks: m::new_gauge(
+                "worker_store_total_disks",
+                "Total number of storage disks",
+            )?,
+            num_blocks_to_delete: m::new_gauge(
+                "worker_num_blocks_to_delete",
+                "Number of blocks pending deletion on the worker",
+            )?,
 
-            used_memory_bytes: m::new_gauge("used_memory_bytes", "Total memory used")?,
+            used_memory_bytes: m::new_gauge("worker_used_memory_bytes", "Total memory used")?,
         };
 
         Ok(wm)
@@ -71,6 +81,8 @@ impl WorkerMetrics {
         self.available.set(state.available());
         self.fs_used.set(state.fs_used());
         self.num_blocks.set(state.num_blocks() as i64);
+        self.num_blocks_to_delete
+            .set(state.num_blocks_to_delete() as i64);
 
         let mut storage_failed = 0;
         for item in state.dir_iter() {
@@ -80,6 +92,9 @@ impl WorkerMetrics {
         }
         self.storage_failed.set(storage_failed);
         self.used_memory_bytes.set(SysUtils::used_memory() as i64);
+
+        let total_disks = state.dir_iter().count();
+        self.store_total_disks.set(total_disks as i64);
 
         Metrics::text_output()
     }
