@@ -1,5 +1,6 @@
 mod blocks;
 mod cat;
+mod chmod;
 mod commands;
 mod common;
 mod content_summary;
