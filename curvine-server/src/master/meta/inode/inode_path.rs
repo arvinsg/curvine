@@ -12,10 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::master::meta::glob_utils::parse_glob_pattern;
 use crate::master::meta::inode::InodeView::{self, Dir, File, FileEntry};
-use crate::master::meta::inode::{InodeDir, InodeFile, InodePtr, PATH_SEPARATOR};
+use crate::master::meta::inode::{
+    InodeDir, InodeFile, InodePtr, EMPTY_PARENT_ID, PATH_SEPARATOR, ROOT_INODE_ID,
+};
 use crate::master::meta::store::InodeStore;
 use orpc::{err_box, try_option, CommonResult};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 #[derive(Clone)]
@@ -33,8 +37,8 @@ impl InodePath {
         store: &InodeStore,
     ) -> CommonResult<Self> {
         let components = InodeView::path_components(path.as_ref())?;
-
         let name = try_option!(components.last());
+
         if name.is_empty() {
             return err_box!("Path {} is invalid", path.as_ref());
         }
@@ -90,6 +94,148 @@ impl InodePath {
         };
 
         Ok(inode_path)
+    }
+
+    fn reconstruct_path_for_match(
+        curr_index: i64,
+        curr_node: &InodePtr,
+        components_length: i64,
+        parent_map: &HashMap<i64, (i64, i64)>,
+        store: &InodeStore,
+    ) -> CommonResult<Self> {
+        let mut path_inodes_rebuild = Vec::new();
+        let mut idx = curr_index;
+        let mut current_id = curr_node.as_ref().id();
+
+        // Leaf
+        match curr_node.as_ref() {
+            File(..) | Dir(..) => path_inodes_rebuild.push(curr_node.clone()),
+            FileEntry(name, id) => {
+                let resolved_leaf_node = match store.get_inode(*id, Some(name))? {
+                    Some(full_inode) => InodePtr::from_owned(full_inode),
+                    None => {
+                        return err_box!(
+                            "Failed to load parent inode {} from store",
+                            curr_node.as_ref().id()
+                        )
+                    }
+                };
+                path_inodes_rebuild.push(resolved_leaf_node);
+            }
+        }
+
+        // Parents
+        while idx != 0 {
+            if let Some((parent_idx, parent_id)) = parent_map.get(&current_id) {
+                if *parent_id == EMPTY_PARENT_ID {
+                    // Reached the root
+                    break;
+                }
+
+                let resolved_parent = match store.get_inode(*parent_id, None)? {
+                    Some(full_inode) => InodePtr::from_owned(full_inode),
+                    None => {
+                        return err_box!("Failed to load parent inode {} from store", parent_id)
+                    }
+                };
+
+                path_inodes_rebuild.push(resolved_parent);
+                idx = *parent_idx;
+                current_id = *parent_id;
+            } else {
+                return err_box!("No parent found for inode {}", current_id);
+            }
+        }
+        // Reverse to get correct order from root to leaf
+        path_inodes_rebuild.reverse();
+
+        let components_result: Vec<String> = path_inodes_rebuild
+            .iter()
+            .map(|node| node.as_ref().name().to_string())
+            .collect();
+
+        let path_str = components_result
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("/");
+
+        if path_inodes_rebuild.len() != components_length as usize {
+            return err_box!(
+                "Path length mismatch during inode rebuild: {} vs {}",
+                path_inodes_rebuild.len(),
+                components_length
+            );
+        }
+
+        Ok(Self {
+            path: path_str,
+            name: components_result.last().cloned().unwrap_or_else(|| {
+                format!(
+                    "Failed to load last name from path {:?}",
+                    path_inodes_rebuild
+                )
+            }),
+            components: components_result,
+            inodes: path_inodes_rebuild,
+        })
+    }
+
+    /// Resolve all paths matching glob pattern using BFS queue traversal
+    pub fn resolve_for_glob_pattern(
+        root: InodePtr,
+        pattern: &str,
+        store: &InodeStore,
+    ) -> CommonResult<Vec<Self>> {
+        let components = InodeView::path_components(pattern)?;
+        let components_length: i64 = components.len() as i64;
+        let mut results = Vec::new();
+        let mut queue: VecDeque<(i64, InodePtr)> = VecDeque::new(); // index + node!
+
+        // Parent map: current inode id -> (index, parent inode id) for path reconstruction
+        let mut parent_map: HashMap<i64, (i64, i64)> = HashMap::new();
+        parent_map.insert(ROOT_INODE_ID, (0, EMPTY_PARENT_ID)); // Root has no parent
+        queue.push_back((0, root)); // Start BFS
+
+        while let Some((curr_index, curr_node)) = queue.pop_front() {
+            if curr_index == components_length - 1 {
+                let inode_path_entry = Self::reconstruct_path_for_match(
+                    curr_index,
+                    &curr_node,
+                    components_length,
+                    &parent_map,
+                    store,
+                )?;
+                results.push(inode_path_entry);
+                continue;
+            }
+
+            // Expand to next level
+            if let Dir(_, d) = curr_node.as_mut() {
+                let next_name = components.get(curr_index as usize + 1).map(|s| s.as_str());
+                if let Some(child_name_str) = next_name {
+                    // Check the child node name is a glob pattern or not
+                    let (is_glob_pattern, glob_pattern) = parse_glob_pattern(child_name_str);
+                    if is_glob_pattern {
+                        if let Some(children) =
+                            d.get_child_ptr_by_glob_pattern(&glob_pattern.unwrap())
+                        {
+                            for child_ptr in children.iter() {
+                                parent_map.insert(
+                                    child_ptr.as_ref().id(),
+                                    (curr_index + 1, curr_node.id()),
+                                );
+                                queue.push_back((curr_index + 1, child_ptr.clone()));
+                            }
+                        }
+                    } else if let Some(child) = d.get_child_ptr(child_name_str) {
+                        parent_map.insert(child.id(), (curr_index + 1, curr_node.id()));
+                        queue.push_back((curr_index + 1, child));
+                    }
+                }
+            }
+        }
+        Ok(results)
     }
 
     pub fn is_root(&self) -> bool {

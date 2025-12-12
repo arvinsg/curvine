@@ -19,6 +19,7 @@ use crate::master::meta::inode::{
     ChildrenIter, Inode, InodeFile, InodePtr, InodeView, EMPTY_PARENT_ID,
 };
 use curvine_common::state::{MkdirOpts, StoragePolicy};
+use glob::Pattern;
 use orpc::CommonResult;
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +85,13 @@ impl InodeDir {
 
     pub fn get_child_ptr(&mut self, name: &str) -> Option<InodePtr> {
         self.children.get_child_ptr(name)
+    }
+
+    pub fn get_child_ptr_by_glob_pattern(
+        &mut self,
+        glob_pattern: &Pattern,
+    ) -> Option<Vec<InodePtr>> {
+        self.children.get_child_ptr_by_glob_pattern(glob_pattern)
     }
 
     pub fn update_mtime(&mut self, time: i64) {

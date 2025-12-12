@@ -307,17 +307,101 @@ fn get_file_info(fs: &MasterFilesystem) -> CommonResult<()> {
     Ok(())
 }
 
+fn list_status_with_glob(fs: &MasterFilesystem) -> CommonResult<()> {
+    // test 1
+    let list_1 = fs
+        .list_status("/*/*.log")
+        .expect("list_1 failed to get status");
+    assert_eq!(list_1.len(), 2, "Should find exactly 2 log files");
+
+    // Sort for consistent ordering (if order not guaranteed)
+    let mut sorted_list_1 = list_1.clone();
+    sorted_list_1.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Verify first file: /a/1.log
+    assert_eq!(sorted_list_1[0].path, "/a/b1.log", "file path mismatch");
+    assert_eq!(sorted_list_1[0].name, "b1.log", "file name mismatch");
+
+    // Verify second file: /a/2.log
+    assert_eq!(sorted_list_1[1].path, "/a/b2.log", "file path mismatch");
+    assert_eq!(sorted_list_1[1].name, "b2.log", "file name mismatch");
+
+    // test 2
+    let list_2 = fs
+        .list_status("/a/[ac]2.*")
+        .expect("list_2 failed to get status");
+    assert_eq!(list_2.len(), 1, "Should find exactly 1 log files");
+
+    // Sort for consistent ordering (if order not guaranteed)
+    let mut sorted_list_2 = list_2.clone();
+    sorted_list_2.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Verify second file: /a/c2.txt
+    assert_eq!(sorted_list_2[0].path, "/a/c2.txt", "file path mismatch");
+    assert_eq!(sorted_list_2[0].name, "c2.txt", "file name mismatch");
+
+    // test 3
+    let list_3 = fs.list_status("/a/*").expect("list_2 failed to get status");
+    assert_eq!(list_3.len(), 6, "Should find exactly 6 log files");
+    // Sort for consistent ordering (if order not guaranteed)
+    let mut sorted_list_3 = list_3.clone();
+    sorted_list_3.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Verify second file: /a/b/xx.log
+
+    assert_eq!(sorted_list_3[0].path, "/a/b/1.log", "file path mismatch");
+
+    // Verify second file: /a/b2.txt
+    assert_eq!(sorted_list_3[2].path, "/a/b2.log", "file path mismatch");
+    assert_eq!(sorted_list_3[2].name, "b2.log", "file name mismatch");
+
+    // Verify second file: /a/b/xx.log
+    assert_eq!(sorted_list_3[5].path, "/a/b/xx.log", "file path mismatch");
+    assert_eq!(sorted_list_3[5].name, "xx.log", "file name mismatch");
+
+    // test 4
+    assert!(fs.list_status("/a/[a").is_err());
+
+    let list_5 = fs.list_status("/*").expect("list_5 failed to get status");
+    assert_eq!(list_5.len(), 11, "should find exactly 11 log files");
+
+    Ok(())
+}
+
+fn list_status_without_glob(fs: &MasterFilesystem) -> CommonResult<()> {
+    // Verify directories exist after creation
+    assert!(fs.exists("/a1")?);
+    assert!(fs.exists("/a2")?);
+    assert!(fs.exists("/a3")?);
+    assert!(fs.exists("/a3/b")?);
+    assert!(fs.exists("/a3/b/c")?);
+
+    let list = fs.list_status("/")?;
+    assert_eq!(list.len(), 6);
+
+    Ok(())
+}
+
 fn list_status(fs: &MasterFilesystem) -> CommonResult<()> {
-    fs.create("/a/1.log", true)?;
+    fs.create("/a/b1.log", true)?;
+    fs.create("/a/b2.log", true)?;
+    fs.create("/a/c1.txt", true)?;
+    fs.create("/a/c2.txt", true)?;
 
     fs.mkdir("/a/d1", true)?;
     fs.mkdir("/a/d2", true)?;
 
-    let list = fs.list_status("/a")?;
-    println!("list = {:#?}", list);
+    assert!(fs.mkdir("/a/b", false).is_err());
+
+    fs.mkdir("/a1", true)?;
+    fs.mkdir("/a2", true)?;
+
+    assert!(fs.mkdir("/a3/b/c", true).is_ok());
 
     fs.print_tree();
 
+    let _ = list_status_with_glob(fs);
+    let _ = list_status_without_glob(fs);
     Ok(())
 }
 
@@ -571,6 +655,7 @@ fn rename_retry(handler: &mut MasterHandler) -> CommonResult<()> {
             },
         })
         .build();
+    println!("msg: {:?}", msg);
     let mut ctx = RpcContext::new(&msg);
     handler.mkdir(&mut ctx)?;
 
@@ -582,9 +667,11 @@ fn rename_retry(handler: &mut MasterHandler) -> CommonResult<()> {
     };
 
     let f1 = handler.rename0(id, req.clone())?;
+    println!("f1: {:?}", f1);
     assert!(f1);
 
     let f2 = handler.rename0(id, req.clone())?;
+    println!("f2: {:?}", f2);
     assert!(f2);
 
     Ok(())
