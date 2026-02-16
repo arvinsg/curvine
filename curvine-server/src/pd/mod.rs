@@ -12,8 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod common;
-pub mod master;
-pub mod pd;
-pub mod test;
-pub mod worker;
+pub mod config_handler;
+pub mod config_store;
+pub mod config_types;
+pub mod http_handler;
+pub mod pd_server;
+pub mod storage;
+
+pub use config_handler::ConfigHandler;
+pub use config_store::ConfigStore;
+pub use config_types::*;
+pub use http_handler::HttpConfigHandler;
+pub use pd_server::PdServer;
+pub use storage::PdAppStorage;

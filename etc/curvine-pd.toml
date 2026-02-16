@@ -1,0 +1,26 @@
+# Curvine PD Configuration
+
+cluster_id = "curvine"
+rpc_port = 2379
+web_port = 2380
+data_dir = "/data/pd/data"
+
+# PD Raft / Journal configuration
+[journal]
+group_name = "pd-raft-group"
+journal_dir = "/tmp/curvine-pd/raft"
+journal_addrs = [
+    { id = 1, hostname = "127.0.0.1", port = 2379 },
+    { id = 2, hostname = "127.0.0.1", port = 2389 },
+    { id = 3, hostname = "127.0.0.1", port = 2399 },
+]
+# Raft timing and limits
+raft_tick_interval_ms = 100
+raft_poll_interval_ms = 10
+raft_election_tick = 10
+raft_heartbeat_tick = 3
+raft_max_size_per_msg = 1048576
+raft_max_inflight_msgs = 256
+# Snapshot
+snapshot_interval = "30m"
+snapshot_entries = 100000

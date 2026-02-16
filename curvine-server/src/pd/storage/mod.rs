@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod common;
-pub mod master;
-pub mod pd;
-pub mod test;
-pub mod worker;
+pub mod pd_app_storage;
+
+pub use pd_app_storage::PdAppStorage;

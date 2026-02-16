@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use clap::Parser;
-use curvine_common::conf::ClusterConf;
+use curvine_common::conf::{ClusterConf, PdConf};
 use curvine_common::version;
 use curvine_server::master::Master;
+use curvine_server::pd::PdServer;
 use curvine_server::worker::Worker;
 use orpc::common::{LocalTime, Utils};
 use orpc::{err_box, CommonResult};
@@ -30,20 +31,28 @@ fn main() -> CommonResult<()> {
     );
 
     let service = args.get_service()?;
-    let mut conf = args.get_conf()?;
 
     Utils::set_panic_exit_hook();
 
     match service {
         ServiceType::Master => {
+            let mut conf = args.get_cluster_conf()?;
             conf.check_master_hostname()?;
             let master = Master::with_conf(conf)?;
             master.block_on_start();
         }
 
         ServiceType::Worker => {
+            let conf = args.get_cluster_conf()?;
             let worker = Worker::with_conf(conf)?;
             worker.block_on_start();
+        }
+
+        ServiceType::Pd => {
+            let conf = args.get_pd_conf()?;
+            conf.check()?;
+            let pd = PdServer::new(conf)?;
+            pd.block_on_start();
         }
     }
 
@@ -53,11 +62,9 @@ fn main() -> CommonResult<()> {
 #[derive(Debug, Parser, Clone)]
 #[command(version = version::VERSION)]
 pub struct ServerArgs {
-    // Start the worker or the master
     #[arg(long, default_value = "")]
     service: String,
 
-    // Configuration file path
     #[arg(long, default_value = "")]
     conf: String,
 }
@@ -68,16 +75,25 @@ impl ServerArgs {
         match service.as_str() {
             "master" => Ok(ServiceType::Master),
             "worker" => Ok(ServiceType::Worker),
+            "pd" => Ok(ServiceType::Pd),
             v => err_box!("Unsupported service type: {}", v),
         }
     }
 
-    pub fn get_conf(&self) -> CommonResult<ClusterConf> {
+    pub fn get_cluster_conf(&self) -> CommonResult<ClusterConf> {
         ClusterConf::from(&self.conf)
+    }
+
+    pub fn get_pd_conf(&self) -> CommonResult<PdConf> {
+        if self.conf.is_empty() {
+            return err_box!("Config file path required for PD service (--conf)");
+        }
+        PdConf::from(&self.conf)
     }
 }
 
 pub enum ServiceType {
     Master,
     Worker,
+    Pd,
 }
