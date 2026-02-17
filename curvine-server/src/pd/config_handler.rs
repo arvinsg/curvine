@@ -15,8 +15,9 @@
 use crate::pd::config_store::ConfigStore;
 use crate::pd::config_types::*;
 use crate::pd::storage::pd_app_storage::PdEntry;
+use curvine_common::error::FsError;
 use curvine_common::raft::RaftClient;
-use curvine_common::{FsError, FsResult};
+use curvine_common::FsResult;
 use log::info;
 use orpc::err_box;
 use std::sync::Arc;
@@ -59,8 +60,8 @@ impl ConfigHandler {
         }
 
         let entry = PdEntry::SetConfig(item.clone());
-        let data =
-            bincode::serialize(&entry).map_err(|e| FsError::from(format!("Failed to serialize entry: {}", e)))?;
+        let data = bincode::serialize(&entry)
+            .map_err(|e| FsError::from(format!("Failed to serialize entry: {}", e)))?;
 
         self.raft_client
             .send_propose(data)
@@ -93,8 +94,8 @@ impl ConfigHandler {
         }
 
         let entry = PdEntry::DeleteConfig(req.key.clone());
-        let data =
-            bincode::serialize(&entry).map_err(|e| FsError::from(format!("Failed to serialize entry: {}", e)))?;
+        let data = bincode::serialize(&entry)
+            .map_err(|e| FsError::from(format!("Failed to serialize entry: {}", e)))?;
 
         self.raft_client
             .send_propose(data)

@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use crate::pd::config_types::ConfigItem;
-use curvine_common::rocksdb::DBEngine;
-use curvine_common::{FsError, FsResult};
+use curvine_common::error::FsError;
+use curvine_common::rocksdb::{DBEngine, KVBytes};
+use curvine_common::FsResult;
 use log::info;
 use orpc::err_box;
 use std::sync::{Arc, Mutex};
@@ -50,7 +51,8 @@ impl ConfigStore {
     pub fn get(&self, key: &str) -> FsResult<Option<ConfigItem>> {
         let db_key = self.make_key(key);
         let db = self.db.lock().map_err(lock_error)?;
-        match db.get(db_key.as_bytes())? {
+        let opt: Option<Vec<u8>> = db.get(db_key.as_bytes())?;
+        match opt {
             Some(data) => {
                 let item: ConfigItem = bincode::deserialize(&data).map_err(deserialize_error)?;
                 Ok(Some(item))
@@ -88,8 +90,9 @@ impl ConfigStore {
             .map_err(|e| FsError::from(format!("Failed to create prefix iterator: {}", e)))?;
         let mut items = Vec::new();
         for item in iter {
-            let (_key, value) = item.map_err(FsError::from)?;
-            let config_item: ConfigItem = bincode::deserialize(&value).map_err(deserialize_error)?;
+            let (_key, value): KVBytes = item.map_err(|e| FsError::from(e.to_string()))?;
+            let config_item: ConfigItem =
+                bincode::deserialize(&value).map_err(deserialize_error)?;
             items.push(config_item);
             if items.len() >= limit {
                 break;
@@ -109,7 +112,7 @@ impl ConfigStore {
             Some(item) => item,
             None => return err_box!("Config key {} not found", key),
         };
-        
+
         item.update_value(value);
         self.set(&item)?;
         Ok(item)
@@ -150,9 +153,15 @@ mod tests {
         let db = DBEngine::new(db_conf, true).unwrap();
         let store = ConfigStore::new(Arc::new(Mutex::new(db)));
 
-        store.set(&ConfigItem::new("pd.test1".to_string(), b"v1".to_vec())).unwrap();
-        store.set(&ConfigItem::new("pd.test2".to_string(), b"v2".to_vec())).unwrap();
-        store.set(&ConfigItem::new("worker.test1".to_string(), b"v3".to_vec())).unwrap();
+        store
+            .set(&ConfigItem::new("pd.test1".to_string(), b"v1".to_vec()))
+            .unwrap();
+        store
+            .set(&ConfigItem::new("pd.test2".to_string(), b"v2".to_vec()))
+            .unwrap();
+        store
+            .set(&ConfigItem::new("worker.test1".to_string(), b"v3".to_vec()))
+            .unwrap();
 
         let pd_items = store.list("pd.", Some(10)).unwrap();
         assert_eq!(pd_items.len(), 2);
