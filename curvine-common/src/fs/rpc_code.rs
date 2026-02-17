@@ -73,6 +73,12 @@ pub enum RpcCode {
     ReadBlock = 81,
     WriteBlocksBatch = 82,
     WriteCommitsBatch = 83,
+
+    // pd config interface.
+    GetConfig = 101,
+    ListConfig = 102,
+    SetConfig = 103,
+    DeleteConfig = 104,
 }
 
 impl fmt::Display for RpcCode {

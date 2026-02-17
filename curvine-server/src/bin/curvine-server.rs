@@ -16,7 +16,7 @@ use clap::Parser;
 use curvine_common::conf::{ClusterConf, PdConf};
 use curvine_common::version;
 use curvine_server::master::Master;
-use curvine_server::pd::PdServer;
+use curvine_server::pd::Pd;
 use curvine_server::worker::Worker;
 use orpc::common::{LocalTime, Utils};
 use orpc::{err_box, CommonResult};
@@ -51,7 +51,7 @@ fn main() -> CommonResult<()> {
         ServiceType::Pd => {
             let conf = args.get_pd_conf()?;
             conf.check()?;
-            let pd = PdServer::new(conf)?;
+            let pd = Pd::new(conf)?;
             pd.block_on_start();
         }
     }

@@ -12,19 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod config;
-pub mod http;
+pub mod configs;
+mod error;
 pub mod http_handler;
-pub mod journal;
-pub mod mount;
-pub mod pd_server;
-mod rpc_context;
-pub mod rpc_handler;
+mod http_response;
+mod manager;
+mod store;
 
-pub use config::{ConfigInfo, ConfigManager};
-pub use http_handler::PdHttpHandler;
-pub use journal::{PdAppStorage, PdEntry};
-pub use mount::MountManager;
-pub use pd_server::Pd;
-pub use rpc_context::RpcContext;
-pub use rpc_handler::PdRpcHandler;
+pub use configs::{all_config_keys, config_description, is_valid_key};
+pub use curvine_common::state::ConfigInfo;
+pub use error::ConfigError;
+pub use http_response::ConfigListResponse;
+pub use manager::ConfigManager;

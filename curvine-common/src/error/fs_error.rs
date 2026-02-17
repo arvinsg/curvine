@@ -58,6 +58,8 @@ pub enum ErrorKind {
     Expired = 21,
     UnsupportedUfsRead = 22,
     JobNotFound = 23,
+    MountPathExists = 24,
+    MountPathConflict = 25,
 
     #[num_enum(default)]
     Common = 10000,
@@ -155,6 +157,14 @@ pub enum FsError {
     #[error("{0}")]
     JobNotFound(ErrorImpl<StringError>),
 
+    // Mount path already exists in mount table
+    #[error("{0}")]
+    MountPathExists(ErrorImpl<StringError>),
+
+    // Mount path conflict (e.g. prefix conflict with existing mount)
+    #[error("{0}")]
+    MountPathConflict(ErrorImpl<StringError>),
+
     // Other errors that are not defined.
     #[error("{0}")]
     Common(ErrorImpl<StringError>),
@@ -201,6 +211,15 @@ impl FsError {
     pub fn job_not_found(job_id: impl AsRef<str>) -> Self {
         let msg = format!("Job {} not found", job_id.as_ref());
         Self::JobNotFound(ErrorImpl::with_source(msg.into()))
+    }
+
+    pub fn mount_path_exists(path: impl AsRef<str>) -> Self {
+        let msg = format!("{} already exists in mount table", path.as_ref());
+        Self::MountPathExists(ErrorImpl::with_source(msg.into()))
+    }
+
+    pub fn mount_path_conflict(msg: impl Into<String>) -> Self {
+        Self::MountPathConflict(ErrorImpl::with_source(msg.into().into()))
     }
 
     pub fn file_exists(path: impl AsRef<str>) -> Self {
@@ -270,6 +289,8 @@ impl FsError {
             FsError::Expired(_) => ErrorKind::Expired,
             FsError::UnsupportedUfsRead(_) => ErrorKind::UnsupportedUfsRead,
             FsError::JobNotFound(_) => ErrorKind::JobNotFound,
+            FsError::MountPathExists(_) => ErrorKind::MountPathExists,
+            FsError::MountPathConflict(_) => ErrorKind::MountPathConflict,
             FsError::Common(_) => ErrorKind::Common,
         }
     }
@@ -384,6 +405,8 @@ impl ErrorExt for FsError {
             FsError::Expired(e) => FsError::Expired(e.ctx(ctx)),
             FsError::UnsupportedUfsRead(e) => FsError::UnsupportedUfsRead(e.ctx(ctx)),
             FsError::JobNotFound(e) => FsError::JobNotFound(e.ctx(ctx)),
+            FsError::MountPathExists(e) => FsError::MountPathExists(e.ctx(ctx)),
+            FsError::MountPathConflict(e) => FsError::MountPathConflict(e.ctx(ctx)),
             FsError::Common(e) => FsError::Common(e.ctx(ctx)),
         }
     }
@@ -413,6 +436,8 @@ impl ErrorExt for FsError {
             FsError::Expired(e) => e.encode(ErrorKind::Expired),
             FsError::UnsupportedUfsRead(e) => e.encode(ErrorKind::UnsupportedUfsRead),
             FsError::JobNotFound(e) => e.encode(ErrorKind::JobNotFound),
+            FsError::MountPathExists(e) => e.encode(ErrorKind::MountPathExists),
+            FsError::MountPathConflict(e) => e.encode(ErrorKind::MountPathConflict),
             FsError::Common(e) => e.encode(ErrorKind::Common),
         }
     }
@@ -445,6 +470,8 @@ impl ErrorExt for FsError {
             ErrorKind::Expired => FsError::Expired(de.into_string()),
             ErrorKind::UnsupportedUfsRead => FsError::UnsupportedUfsRead(de.into_string()),
             ErrorKind::JobNotFound => FsError::JobNotFound(de.into_string()),
+            ErrorKind::MountPathExists => FsError::MountPathExists(de.into_string()),
+            ErrorKind::MountPathConflict => FsError::MountPathConflict(de.into_string()),
             ErrorKind::Common => FsError::Common(de.into_string()),
         }
     }

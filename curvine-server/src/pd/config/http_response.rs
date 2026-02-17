@@ -12,19 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod config;
-pub mod http;
-pub mod http_handler;
-pub mod journal;
-pub mod mount;
-pub mod pd_server;
-mod rpc_context;
-pub mod rpc_handler;
+use curvine_common::state::ConfigInfo;
+use serde::Serialize;
 
-pub use config::{ConfigInfo, ConfigManager};
-pub use http_handler::PdHttpHandler;
-pub use journal::{PdAppStorage, PdEntry};
-pub use mount::MountManager;
-pub use pd_server::Pd;
-pub use rpc_context::RpcContext;
-pub use rpc_handler::PdRpcHandler;
+#[derive(Debug, Serialize, Default)]
+pub struct ConfigListResponse {
+    pub items: Vec<ConfigInfo>,
+    pub total: usize,
+}
+
+impl ConfigListResponse {
+    pub fn new(items: Vec<ConfigInfo>) -> Self {
+        let total = items.len();
+        Self { items, total }
+    }
+}
