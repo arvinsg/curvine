@@ -14,6 +14,7 @@
 
 use self::RaftError::*;
 use crate::raft::{NodeId, RaftGroup};
+use crate::FsError;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use orpc::error::{ErrorDecoder, ErrorExt, ErrorImpl, StringError};
 use orpc::io::IOError;
@@ -189,6 +190,12 @@ impl From<IOError> for RaftError {
 
 impl<T> From<SendError<T>> for RaftError {
     fn from(value: SendError<T>) -> Self {
+        Other(ErrorImpl::with_source(format!("{}", value).into()))
+    }
+}
+
+impl From<FsError> for RaftError {
+    fn from(value: FsError) -> Self {
         Other(ErrorImpl::with_source(format!("{}", value).into()))
     }
 }

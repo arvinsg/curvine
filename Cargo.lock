@@ -999,6 +999,7 @@ dependencies = [
 name = "curvine-server"
 version = "0.2.0"
 dependencies = [
+ "arc-swap",
  "axum 0.7.9",
  "bincode",
  "bytes",

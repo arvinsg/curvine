@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod pd_app_storage;
+pub mod app_storage;
+pub mod entry;
 
-pub use pd_app_storage::PdAppStorage;
+pub use app_storage::PdAppStorage;
+pub use entry::PdEntry;

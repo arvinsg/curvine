@@ -677,4 +677,28 @@ impl ProtoUtils {
             end: lock.end,
         }
     }
+
+    pub fn config_info_to_pb(item: &ConfigInfo) -> ConfigItemProto {
+        ConfigItemProto {
+            key: item.key.clone(),
+            value: item.value.clone(),
+            version: item.version,
+            mtime: item.mtime,
+        }
+    }
+
+    pub fn config_info_from_pb(pb: ConfigItemProto) -> ConfigInfo {
+        let mut item = ConfigInfo::new(pb.key, pb.value);
+        item.version = pb.version;
+        item.mtime = pb.mtime;
+        item
+    }
+
+    pub fn set_config_request_to_config_info(pb: SetConfigRequest) -> ConfigInfo {
+        ConfigInfo::new(pb.key, pb.value)
+    }
+
+    pub fn set_config_request_from_http(key: String, value: Vec<u8>) -> SetConfigRequest {
+        SetConfigRequest { key, value }
+    }
 }

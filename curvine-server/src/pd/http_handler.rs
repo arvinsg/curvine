@@ -12,177 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::pd::config_handler::ConfigHandler;
-use crate::pd::config_types::*;
-use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::{IntoResponse, Json, Response},
-    routing::{delete, get, put},
-    Router,
-};
-use serde::{Deserialize, Serialize};
+use crate::pd::config::http_handler::*;
+use crate::pd::config::ConfigManager;
+use crate::pd::mount::http_handler::*;
+use crate::pd::mount::MountManager;
+use axum::routing::{delete, get, post, put};
+use axum::{Extension, Router};
+use curvine_web::router::RouterHandler;
 use std::sync::Arc;
 
-pub struct HttpConfigHandler {
-    config_handler: Arc<ConfigHandler>,
+#[derive(Clone)]
+pub struct PdHttpHandler {
+    pub(crate) config_manager: Arc<ConfigManager>,
+    pub(crate) mount_manager: Arc<MountManager>,
 }
 
-impl HttpConfigHandler {
-    pub fn new(config_handler: Arc<ConfigHandler>) -> Self {
-        Self { config_handler }
+impl PdHttpHandler {
+    pub fn new(config_manager: Arc<ConfigManager>, mount_manager: Arc<MountManager>) -> Self {
+        Self {
+            config_manager,
+            mount_manager,
+        }
     }
+}
 
-    pub fn routes(&self) -> Router {
+impl RouterHandler for PdHttpHandler {
+    fn router(&self) -> Router {
+        let instance = Arc::new(self.clone());
         Router::new()
+            .route("/api/v1/config/set", put(set_config_by_query_handler))
             .route("/api/v1/config/:key", get(get_config_handler))
             .route("/api/v1/config/:key", put(set_config_handler))
-            .route("/api/v1/config/:key", delete(delete_config_handler))
-            .route("/api/v1/configs", get(list_configs_handler))
-            .with_state(self.config_handler.clone())
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct ApiResponse<T> {
-    success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<T>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    #[serde(skip)]
-    status_code: StatusCode,
-}
-
-impl<T> ApiResponse<T> {
-    fn success(data: T) -> Self {
-        Self {
-            success: true,
-            data: Some(data),
-            error: None,
-            status_code: StatusCode::OK,
-        }
-    }
-
-    fn error(message: String) -> Self
-    where
-        T: Default,
-    {
-        Self {
-            success: false,
-            data: None,
-            error: Some(message),
-            status_code: StatusCode::BAD_REQUEST,
-        }
-    }
-
-    fn error_with_status(message: String, status_code: StatusCode) -> Self
-    where
-        T: Default,
-    {
-        Self {
-            success: false,
-            data: None,
-            error: Some(message),
-            status_code,
-        }
-    }
-}
-
-impl<T: Serialize> IntoResponse for ApiResponse<T> {
-    fn into_response(self) -> Response {
-        (self.status_code, Json(self)).into_response()
-    }
-}
-
-fn status_code_for_error(err: &curvine_common::error::FsError) -> StatusCode {
-    let msg = err.to_string();
-    if msg.contains("Version mismatch") {
-        StatusCode::CONFLICT
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
-    }
-}
-
-async fn get_config_handler(
-    State(handler): State<Arc<ConfigHandler>>,
-    Path(key): Path<String>,
-) -> impl IntoResponse {
-    let req = GetConfigRequest { key };
-
-    match handler.get_config(req) {
-        Ok(resp) => match resp.item {
-            Some(item) => ApiResponse::success(item),
-            None => ApiResponse::error_with_status(
-                "Config not found".to_string(),
-                StatusCode::NOT_FOUND,
-            ),
-        },
-        Err(e) => ApiResponse::error_with_status(e.to_string(), status_code_for_error(&e)),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct SetConfigBody {
-    value: String,
-    scope: Option<ConfigScope>,
-}
-
-async fn set_config_handler(
-    State(handler): State<Arc<ConfigHandler>>,
-    Path(key): Path<String>,
-    Json(body): Json<SetConfigBody>,
-) -> impl IntoResponse {
-    let req = SetConfigRequest {
-        key,
-        value: body.value.into_bytes(),
-        scope: body.scope,
-    };
-
-    match handler.set_config(req).await {
-        Ok(resp) => ApiResponse::success(resp),
-        Err(e) => ApiResponse::error_with_status(e.to_string(), status_code_for_error(&e)),
-    }
-}
-
-async fn delete_config_handler(
-    State(handler): State<Arc<ConfigHandler>>,
-    Path(key): Path<String>,
-    Query(params): Query<DeleteConfigParams>,
-) -> impl IntoResponse {
-    let req = DeleteConfigRequest {
-        key,
-        prev_version: params.prev_version,
-    };
-
-    match handler.delete_config(req).await {
-        Ok(resp) => ApiResponse::success(resp),
-        Err(e) => ApiResponse::error_with_status(e.to_string(), status_code_for_error(&e)),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct DeleteConfigParams {
-    prev_version: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ListConfigsParams {
-    prefix: Option<String>,
-    limit: Option<u32>,
-}
-
-async fn list_configs_handler(
-    State(handler): State<Arc<ConfigHandler>>,
-    Query(params): Query<ListConfigsParams>,
-) -> impl IntoResponse {
-    let req = ListConfigRequest {
-        prefix: params.prefix.unwrap_or_default(),
-        limit: params.limit,
-    };
-
-    match handler.list_config(req) {
-        Ok(resp) => ApiResponse::success(resp),
-        Err(e) => ApiResponse::error_with_status(e.to_string(), status_code_for_error(&e)),
+            .route("/api/v1/config", get(list_configs_handler))
+            .route("/api/v1/mount", get(list_mounts_handler))
+            .route("/api/v1/mount", post(create_mount_handler))
+            .route("/api/v1/mount", delete(delete_mount_handler))
+            .route("/api/v1/mount/path", get(get_mount_by_path_handler))
+            .layer(Extension(instance))
     }
 }

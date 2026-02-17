@@ -12,20 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod config;
-pub mod http;
-pub mod http_handler;
-pub mod journal;
-pub mod mount;
-pub mod pd_server;
-mod rpc_context;
-pub mod rpc_handler;
-pub mod store;
+pub(crate) mod error;
+pub(crate) mod http_handler;
+pub(crate) mod http_response;
+mod index;
+mod manager;
+mod store;
 
-pub use config::{ConfigInfo, ConfigManager};
-pub use http_handler::PdHttpHandler;
-pub use journal::{PdAppStorage, PdEntry};
-pub use mount::MountManager;
-pub use pd_server::Pd;
-pub use rpc_context::RpcContext;
-pub use rpc_handler::PdRpcHandler;
+pub use error::MountError;
+pub use http_response::MountListResponse;
+pub use manager::MountManager;
