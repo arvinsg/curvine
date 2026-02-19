@@ -14,25 +14,26 @@
 
 use crate::conf::JournalConf;
 use crate::rocksdb::DBConf;
+use crate::version;
+use log::info;
+use orpc::common::{DurationUnit, Utils};
 use orpc::io::net::InetAddr;
 use orpc::server::ServerConf;
-use log::info;
 use orpc::{err_box, try_err, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::fs::read_to_string;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PdConf {
-    #[serde(default = "default_cluster_id")]
     pub cluster_id: String,
-
-    #[serde(default = "default_rpc_port")]
+    pub hostname: String,
     pub rpc_port: u16,
-
-    #[serde(default = "default_web_port")]
     pub web_port: u16,
+    pub io_threads: usize,
+    pub worker_threads: usize,
+    pub io_timeout: String,
+    pub io_close_idle: bool,
 
-    #[serde(default = "default_data_dir")]
     pub data_dir: String,
 
     #[serde(default)]
@@ -42,9 +43,15 @@ pub struct PdConf {
 impl Default for PdConf {
     fn default() -> Self {
         Self {
-            cluster_id: default_cluster_id(),
-            rpc_port: default_rpc_port(),
-            web_port: default_web_port(),
+            cluster_id: PdConf::DEFAULT_CLUSTER_ID.to_string(),
+            hostname: PdConf::DEFAULT_HOSTNAME.to_string(),
+            rpc_port: PdConf::DEFAULT_RPC_PORT,
+            web_port: PdConf::DEFAULT_WEB_PORT,
+            io_threads: 32,
+            worker_threads: Utils::worker_threads(32),
+            io_timeout: "10m".to_string(),
+            io_close_idle: true,
+
             data_dir: default_data_dir(),
             journal: JournalConf::default(),
         }
@@ -52,7 +59,11 @@ impl Default for PdConf {
 }
 
 impl PdConf {
-    /// Load PD config from a file path (same pattern as `ClusterConf::from`).
+    pub const DEFAULT_HOSTNAME: &'static str = "localhost";
+    pub const DEFAULT_CLUSTER_ID: &'static str = "curvine";
+    pub const DEFAULT_RPC_PORT: u16 = 2379;
+    pub const DEFAULT_WEB_PORT: u16 = 2380;
+
     pub fn from<T: AsRef<str>>(path: T) -> CommonResult<Self> {
         let path = path.as_ref();
         let s = try_err!(read_to_string(path));
@@ -62,9 +73,6 @@ impl PdConf {
 
     /// Validate required fields so startup fails fast with a clear error.
     pub fn check(&self) -> CommonResult<()> {
-        if self.cluster_id.is_empty() {
-            return err_box!("PD config: cluster_id must not be empty");
-        }
         if self.data_dir.is_empty() {
             return err_box!("PD config: data_dir must not be empty");
         }
@@ -80,8 +88,21 @@ impl PdConf {
     }
 
     pub fn pd_server_conf(&self) -> ServerConf {
-        let mut conf = ServerConf::default();
-        conf.port = self.rpc_port;
+        let mut conf = ServerConf::with_hostname(&self.hostname, self.rpc_port);
+        conf.name = format!("{}-pd", self.cluster_id);
+        conf.io_threads = self.io_threads;
+        conf.worker_threads = self.worker_threads;
+        conf.close_idle = self.io_close_idle;
+        conf.timeout_ms = self.io_timeout_ms();
+
+        conf
+    }
+
+    pub fn pd_web_conf(&self) -> ServerConf {
+        let mut conf = ServerConf::with_hostname(&self.hostname, self.web_port);
+        conf.name = format!("{}-pd", self.cluster_id);
+        conf.io_threads = self.io_threads;
+        conf.worker_threads = self.worker_threads;
         conf
     }
 
@@ -89,29 +110,24 @@ impl PdConf {
         DBConf::new(&self.data_dir)
     }
 
+    pub fn io_timeout_ms(&self) -> u64 {
+        let dur = DurationUnit::from_str(&self.io_timeout).unwrap();
+        dur.as_millis()
+    }
+
     pub fn local_addr(&self) -> InetAddr {
         self.journal.local_addr()
     }
 
-    pub fn print(&self) {
-        info!("PD Configuration:");
-        info!("  cluster_id: {}", self.cluster_id);
-        info!("  rpc_port: {}", self.rpc_port);
-        info!("  web_port: {}", self.web_port);
-        info!("  data_dir: {}", self.data_dir);
+    pub fn to_pretty_toml(&self) -> CommonResult<String> {
+        Ok(toml::to_string_pretty(self)?)
     }
-}
 
-fn default_cluster_id() -> String {
-    "curvine".to_string()
-}
-
-fn default_rpc_port() -> u16 {
-    2379
-}
-
-fn default_web_port() -> u16 {
-    2380
+    pub fn print(&self) {
+        let conf = self.to_pretty_toml().unwrap();
+        info!("git version: {}", version::GIT_VERSION);
+        info!("cluster conf start: \n{}\n", conf);
+    }
 }
 
 fn default_data_dir() -> String {

@@ -12,8 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod app_storage;
-pub mod entry;
+pub mod configs;
+pub mod http_handler;
+mod manager;
+mod pb_convert;
+mod store;
 
-pub use app_storage::PdAppStorage;
-pub use entry::PdEntry;
+pub use configs::{all_config_keys, config_description, is_valid_key};
+pub use manager::ConfigManager;
+pub use store::{ConfigItem, ConfigScope, ConfigStore};

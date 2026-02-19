@@ -12,35 +12,62 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::pd::config_handler::ConfigHandler;
-use crate::pd::http_handler::HttpConfigHandler;
+use crate::pd::config::{ConfigManager, ConfigStore};
+use crate::pd::router_handler::PdRouterHandler;
+use crate::pd::rpc_handler::PdHandler;
 use crate::pd::storage::PdAppStorage;
 use curvine_common::conf::PdConf;
 use curvine_common::raft::storage::{LogStorage, RocksLogStorage};
-use curvine_common::raft::{RaftClient, RaftNode, RoleMonitor};
+use curvine_common::raft::{RaftClient, RaftJournal, RoleMonitor};
 use curvine_common::rocksdb::DBEngine;
 use curvine_common::FsResult;
+use curvine_web::server::{WebHandlerService, WebServer};
 use log::info;
 use orpc::common::FileUtils;
-use orpc::runtime::RpcRuntime;
+use orpc::handler::HandlerService;
+use orpc::io::net::ConnState;
+use orpc::runtime::{RpcRuntime, Runtime};
+use orpc::server::{RpcServer, ServerStateListener};
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
-pub struct PdServer {
+type PdRaftJournal = RaftJournal<RocksLogStorage, PdAppStorage>;
+
+/// PD service: implements HandlerService (RPC) and WebHandlerService (HTTP via curvine_web).
+#[derive(Clone)]
+struct PdService {
     conf: PdConf,
-    raft_node: RaftNode<RocksLogStorage, PdAppStorage>,
-    config_handler: Arc<ConfigHandler>,
-    http_handler: Arc<HttpConfigHandler>,
+    config_manager: Arc<ConfigManager>,
+    rt: Arc<Runtime>,
 }
 
-impl PdServer {
+impl HandlerService for PdService {
+    type Item = PdHandler;
+
+    fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
+        PdHandler::new(self.config_manager.clone(), self.rt.clone())
+    }
+}
+
+impl WebHandlerService for PdService {
+    type Item = PdRouterHandler;
+
+    fn get_handler(&self) -> Self::Item {
+        PdRouterHandler::new(self.config_manager.clone())
+    }
+}
+
+pub struct Pd {
+    raft_journal: PdRaftJournal,
+    service: PdService,
+    rpc_server: RpcServer<PdService>,
+    web_server: WebServer<PdService>,
+}
+
+impl Pd {
     pub fn new(conf: PdConf) -> FsResult<Self> {
         conf.print();
 
-        let rt = conf.journal.create_runtime();
-
         let log_store = RocksLogStorage::from_conf(&conf.journal, false);
-
         let db_conf = conf.pd_rocks_conf();
         if log_store.has_snapshot() {
             info!(
@@ -55,83 +82,84 @@ impl PdServer {
         let snapshot_dir = format!("{}/snapshots", conf.data_dir);
         FileUtils::create_dir(&snapshot_dir, true)?;
 
+        let journal_rt: Arc<Runtime> = conf.journal.create_runtime();
         let app_store = PdAppStorage::new(db, snapshot_dir);
-        let config_store = app_store.config_store();
+        let config_store: Arc<ConfigStore> = app_store.config_store();
+
+        let raft_client = RaftClient::from_conf(journal_rt.clone(), &conf.journal);
+        let config_manager = Arc::new(ConfigManager::new(config_store, raft_client));
 
         let role_monitor = RoleMonitor::new();
-        let (sender, receiver) = mpsc::channel(1024);
+        let raft_journal = PdRaftJournal::new(
+            journal_rt,
+            log_store,
+            app_store,
+            conf.journal.clone(),
+            role_monitor,
+        );
 
-        let raft_client = RaftClient::from_conf(rt.clone(), &conf.journal);
-
-        let config_handler = Arc::new(ConfigHandler::new(config_store, raft_client));
-        let http_handler = Arc::new(HttpConfigHandler::new(config_handler.clone()));
-
-        // RaftNode requires a slog::Logger; use Discard to suppress Raft internal logs.
-        let logger = slog::Logger::root(slog::Discard, slog::o!());
-
-        let raft_node = rt.block_on(async {
-            RaftNode::new_candidate(
-                rt.clone(),
-                &conf.journal,
-                log_store,
-                app_store,
-                role_monitor,
-                receiver,
-                sender,
-                &logger,
-            )
-            .await
-        })?;
-
-        info!("PD Server initialized successfully with config management");
+        let rpc_conf = conf.pd_server_conf();
+        let rt: Arc<Runtime> = Arc::new(rpc_conf.create_runtime());
+        let service = PdService {
+            conf: conf.clone(),
+            config_manager: config_manager.clone(),
+            rt: rt.clone(),
+        };
+        let rpc_server = RpcServer::with_rt(rt.clone(), rpc_conf, service.clone());
+        let web_server = WebServer::with_rt(rt.clone(), conf.pd_web_conf(), service.clone());
 
         Ok(Self {
-            conf,
-            raft_node,
-            config_handler,
-            http_handler,
+            raft_journal,
+            service,
+            rpc_server,
+            web_server,
         })
     }
 
-    pub async fn start(&mut self) -> FsResult<()> {
-        info!("Starting PD Server on port {}...", self.conf.rpc_port);
+    pub async fn start(self) -> FsResult<ServerStateListener> {
+        info!("Starting PD on RPC port {}...", self.service.conf.rpc_port);
 
-        let http_routes = self.http_handler.routes();
-        let http_addr = format!("0.0.0.0:{}", self.conf.web_port);
+        // Step 1: start raft (RaftServer + RaftNode via RaftJournal)
+        let _raft_listener = self
+            .raft_journal
+            .run()
+            .await
+            .map_err(|e| curvine_common::error::FsError::from(e.to_string()))?;
 
-        info!("Starting HTTP server on {}", http_addr);
-        let listener = tokio::net::TcpListener::bind(&http_addr).await?;
+        // Step 2: start RPC server
+        let mut rpc_status = self.rpc_server.start();
+        rpc_status
+            .wait_running()
+            .await
+            .map_err(|e| curvine_common::error::FsError::from(e.to_string()))?;
 
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, http_routes).await {
-                log::error!("PD HTTP server error: {}", e);
-            }
-        });
+        // Step 3: start web server
+        self.web_server.start();
 
-        info!("PD Server started successfully");
-        info!("  RPC Port: {}", self.conf.rpc_port);
-        info!("  HTTP Port: {}", self.conf.web_port);
-        info!("  Config API: http://localhost:{}/api/v1/config", self.conf.web_port);
-
-        Ok(())
+        Ok(rpc_status)
     }
 
-    pub fn block_on_start(mut self) {
-        let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+    pub fn config_manager(&self) -> Arc<ConfigManager> {
+        self.service.config_manager.clone()
+    }
+
+    pub fn block_on_start(self) {
+        let rt = self.rpc_server.clone_rt();
         rt.block_on(async move {
-            if let Err(e) = self.start().await {
-                log::error!("PD Server start failed: {}", e);
-                return;
-            }
+            let mut status = match self.start().await {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("PD start failed: {}", e);
+                    return;
+                }
+            };
+
             if let Err(e) = tokio::signal::ctrl_c().await {
                 log::error!("Failed to wait for Ctrl-C: {}", e);
                 return;
             }
-            info!("Received Ctrl-C, shutting down PD Server...");
+            info!("Received Ctrl-C, shutting down PD...");
+            let _ = status.wait_stop().await;
         });
-    }
-
-    pub fn config_handler(&self) -> Arc<ConfigHandler> {
-        self.config_handler.clone()
     }
 }

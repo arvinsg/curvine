@@ -12,23 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::pd::config_store::ConfigStore;
-use crate::pd::config_types::ConfigItem;
+use crate::pd::config::ConfigStore;
+use crate::pd::storage::entry::PdEntry;
 use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::AppStorage;
 use curvine_common::raft::{RaftError, RaftResult, RaftUtils};
 use curvine_common::rocksdb::DBEngine;
 use log::info;
 use orpc::common::FileUtils;
-use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum PdEntry {
-    Noop,
-    SetConfig(ConfigItem),
-    DeleteConfig(String),
-}
 
 #[derive(Clone)]
 pub struct PdAppStorage {
@@ -95,16 +87,16 @@ impl AppStorage for PdAppStorage {
 
     fn create_snapshot(&self, node_id: u64, last_applied: u64) -> RaftResult<SnapshotData> {
         let checkpoint_dir = format!("{}/checkpoint_{}", self.snapshot_dir, last_applied);
-        
+
         FileUtils::create_dir(&checkpoint_dir, true)?;
-        
+
         let data = RaftUtils::create_file_snapshot(&checkpoint_dir, node_id, last_applied)?;
-        
+
         info!(
             "Created snapshot at {} for node {} with snapshot_id {}",
             checkpoint_dir, node_id, last_applied
         );
-        
+
         Ok(data)
     }
 

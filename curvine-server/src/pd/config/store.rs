@@ -12,13 +12,55 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::pd::config_types::ConfigItem;
 use curvine_common::error::FsError;
 use curvine_common::rocksdb::{DBEngine, KVBytes};
 use curvine_common::FsResult;
 use log::info;
 use orpc::err_box;
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ConfigScope {
+    Cluster,
+    Node(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ConfigItem {
+    pub key: String,
+    pub value: Vec<u8>,
+    pub version: u64,
+    pub scope: Option<ConfigScope>,
+    pub mtime: u64,
+}
+
+impl ConfigItem {
+    pub fn new(key: String, value: Vec<u8>) -> Self {
+        Self {
+            key,
+            value,
+            version: 1,
+            scope: None,
+            mtime: orpc::common::LocalTime::mills(),
+        }
+    }
+
+    pub fn with_scope(mut self, scope: ConfigScope) -> Self {
+        self.scope = Some(scope);
+        self
+    }
+
+    pub fn value_as_string(&self) -> Result<String, std::string::FromUtf8Error> {
+        String::from_utf8(self.value.clone())
+    }
+
+    pub fn update_value(&mut self, value: Vec<u8>) {
+        self.value = value;
+        self.version += 1;
+        self.mtime = orpc::common::LocalTime::mills();
+    }
+}
 
 const CONFIG_CF: &str = "default";
 const CONFIG_PREFIX: &str = "cfg:item:";
@@ -51,7 +93,7 @@ impl ConfigStore {
     pub fn get(&self, key: &str) -> FsResult<Option<ConfigItem>> {
         let db_key = self.make_key(key);
         let db = self.db.lock().map_err(lock_error)?;
-        let opt: Option<Vec<u8>> = db.get(db_key.as_bytes())?;
+        let opt: Option<Vec<u8>> = db.get(db_key.as_bytes()).map_err(FsError::from)?;
         match opt {
             Some(data) => {
                 let item: ConfigItem = bincode::deserialize(&data).map_err(deserialize_error)?;
@@ -65,7 +107,7 @@ impl ConfigStore {
         let db_key = self.make_key(&item.key);
         let data = bincode::serialize(item).map_err(serialize_error)?;
         let db = self.db.lock().map_err(lock_error)?;
-        db.put(db_key.as_bytes(), &data)?;
+        db.put(db_key.as_bytes(), &data).map_err(FsError::from)?;
         info!("Set config: {} (version: {})", item.key, item.version);
         Ok(())
     }
@@ -73,10 +115,10 @@ impl ConfigStore {
     pub fn delete(&self, key: &str) -> FsResult<bool> {
         let db_key = self.make_key(key);
         let db = self.db.lock().map_err(lock_error)?;
-        if db.get(db_key.as_bytes())?.is_none() {
+        if db.get(db_key.as_bytes()).map_err(FsError::from)?.is_none() {
             return Ok(false);
         }
-        db.delete(db_key.as_bytes())?;
+        db.delete(db_key.as_bytes()).map_err(FsError::from)?;
         info!("Deleted config: {}", key);
         Ok(true)
     }
@@ -104,7 +146,7 @@ impl ConfigStore {
     pub fn exists(&self, key: &str) -> FsResult<bool> {
         let db_key = self.make_key(key);
         let db = self.db.lock().map_err(lock_error)?;
-        Ok(db.get(db_key.as_bytes())?.is_some())
+        Ok(db.get(db_key.as_bytes()).map_err(FsError::from)?.is_some())
     }
 
     pub fn update(&self, key: &str, value: Vec<u8>) -> FsResult<ConfigItem> {
@@ -112,7 +154,6 @@ impl ConfigStore {
             Some(item) => item,
             None => return err_box!("Config key {} not found", key),
         };
-
         item.update_value(value);
         self.set(&item)?;
         Ok(item)

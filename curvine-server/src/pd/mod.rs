@@ -12,16 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod config_handler;
-pub mod config_store;
-pub mod config_types;
-pub mod http_handler;
+pub mod config;
+pub mod http;
 pub mod pd_server;
+pub mod router_handler;
+pub mod rpc_handler;
 pub mod storage;
 
-pub use config_handler::ConfigHandler;
-pub use config_store::ConfigStore;
-pub use config_types::*;
-pub use http_handler::HttpConfigHandler;
-pub use pd_server::PdServer;
-pub use storage::PdAppStorage;
+pub use config::{ConfigItem, ConfigManager, ConfigScope, ConfigStore};
+pub use pd_server::Pd;
+pub use router_handler::PdRouterHandler;
+pub use rpc_handler::PdHandler;
+pub use storage::{PdAppStorage, PdEntry};

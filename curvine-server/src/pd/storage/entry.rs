@@ -12,8 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod app_storage;
-pub mod entry;
+use crate::pd::config::ConfigItem;
+use serde::{Deserialize, Serialize};
 
-pub use app_storage::PdAppStorage;
-pub use entry::PdEntry;
+/// Raft log entry for PD config mutations. Proposed by ConfigManager, applied by PdAppStorage.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum PdEntry {
+    Noop,
+    SetConfig(ConfigItem),
+    DeleteConfig(String),
+}
