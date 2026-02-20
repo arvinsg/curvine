@@ -123,7 +123,7 @@ pub async fn set_config_by_query_handler(
 }
 
 #[derive(Debug, Deserialize)]
-struct DeleteConfigParams {
+pub struct DeleteConfigParams {
     prev_version: Option<u64>,
 }
 
@@ -143,7 +143,7 @@ pub async fn delete_config_handler(
 }
 
 #[derive(Debug, Deserialize)]
-struct ListConfigsParams {
+pub struct ListConfigsParams {
     prefix: Option<String>,
     limit: Option<u32>,
 }

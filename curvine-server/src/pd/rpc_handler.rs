@@ -37,7 +37,7 @@ impl MessageHandler for PdHandler {
     type Error = FsError;
 
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
-        let mut ctx = RpcContext::new(msg);
+        let ctx = RpcContext::new(msg);
 
         let response = match ctx.code {
             RpcCode::GetConfig => {
