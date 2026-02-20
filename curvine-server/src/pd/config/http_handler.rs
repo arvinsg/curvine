@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Config HTTP handlers: accept JSON (path/query/body), build pb request, call ConfigManager, return JSON (pb has serde).
-
 use super::pb_convert::set_config_request_from_http;
 use super::store::ConfigScope;
 use super::ConfigManager;
@@ -51,7 +49,6 @@ pub struct SetConfigBody {
     scope: Option<ConfigScope>,
 }
 
-/// Query params for set config via URL: ?value=xx&scope=cluster (key from path) or ?key=xx&value=xx&scope=cluster.
 #[derive(Debug, Deserialize)]
 pub struct SetConfigQueryParams {
     pub key: Option<String>,
@@ -66,15 +63,14 @@ fn parse_scope_from_str(s: &str) -> ConfigScope {
     }
 }
 
-/// PUT /api/v1/config/:key — body (JSON) or query (?value=xx&scope=cluster).
 pub async fn set_config_handler(
     State(manager): State<Arc<ConfigManager>>,
     Path(key): Path<String>,
-    body: Option<Json<SetConfigBody>>,
     Query(params): Query<SetConfigQueryParams>,
+    body: Option<Json<SetConfigBody>>,
 ) -> impl IntoResponse {
     let (value, scope) = match body {
-        Some(b) => (b.value.into_bytes(), b.scope),
+        Some(b) => (b.value.clone().into_bytes(), b.scope.clone()),
         None => {
             let value = match params.value {
                 Some(v) => v.into_bytes(),
@@ -96,7 +92,6 @@ pub async fn set_config_handler(
     }
 }
 
-/// PUT /api/v1/config/set — key and value required in query: ?key=xxx&value=xx&scope=cluster
 pub async fn set_config_by_query_handler(
     State(manager): State<Arc<ConfigManager>>,
     Query(params): Query<SetConfigQueryParams>,

@@ -16,11 +16,13 @@ pub mod config;
 pub mod http;
 pub mod pd_server;
 pub mod router_handler;
+mod rpc_context;
 pub mod rpc_handler;
 pub mod storage;
 
 pub use config::{ConfigItem, ConfigManager, ConfigScope, ConfigStore};
 pub use pd_server::Pd;
 pub use router_handler::PdRouterHandler;
+pub use rpc_context::RpcContext;
 pub use rpc_handler::PdHandler;
 pub use storage::{PdAppStorage, PdEntry};

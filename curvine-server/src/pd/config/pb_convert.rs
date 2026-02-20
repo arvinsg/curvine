@@ -21,8 +21,8 @@ use curvine_common::proto::{
 
 pub fn config_item_to_pb(item: &ConfigItem) -> ConfigItemProto {
     let scope = match &item.scope {
-        Some(ConfigScope::Cluster) => Some(ConfigScopeProto::Cluster),
-        Some(ConfigScope::Node(_)) => Some(ConfigScopeProto::Node),
+        Some(ConfigScope::Cluster) => Some(ConfigScopeProto::Cluster as i32),
+        Some(ConfigScope::Node(_)) => Some(ConfigScopeProto::Node as i32),
         None => None,
     };
     ConfigItemProto {
@@ -57,8 +57,8 @@ pub fn set_config_request_from_http(
     scope: Option<ConfigScope>,
 ) -> PbSetConfigRequest {
     let scope = match scope {
-        Some(ConfigScope::Cluster) => Some(ConfigScopeProto::Cluster),
-        Some(ConfigScope::Node(_)) => Some(ConfigScopeProto::Node),
+        Some(ConfigScope::Cluster) => Some(ConfigScopeProto::Cluster as i32),
+        Some(ConfigScope::Node(_)) => Some(ConfigScopeProto::Node as i32),
         None => None,
     };
     PbSetConfigRequest { key, value, scope }
