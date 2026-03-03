@@ -20,6 +20,7 @@ pub mod mount;
 pub mod pd_server;
 mod rpc_context;
 pub mod rpc_handler;
+pub mod store;
 
 pub use config::{ConfigInfo, ConfigManager};
 pub use http_handler::PdHttpHandler;

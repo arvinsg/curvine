@@ -16,9 +16,9 @@ use super::index::MountTableIndex;
 use super::store::MountStore;
 use crate::pd::journal::entry::MountEntry;
 use crate::pd::journal::PdEntry;
+use crate::pd::store::KvStore;
 use curvine_common::fs::Path;
 use curvine_common::raft::RaftClient;
-use curvine_common::rocksdb::DBEngine;
 use curvine_common::state::{MountInfo, MountOptions};
 use curvine_common::utils::SerdeUtils as Serde;
 use curvine_common::{FsError, FsResult};
@@ -35,8 +35,8 @@ pub struct MountManager {
 }
 
 impl MountManager {
-    pub fn new(db: Arc<RwLock<DBEngine>>, raft_client: RaftClient) -> Self {
-        let store = Arc::new(MountStore::new(db));
+    pub fn new(store: Arc<dyn KvStore>, raft_client: RaftClient) -> Self {
+        let store = Arc::new(MountStore::new(store));
         Self {
             index: Arc::new(RwLock::new(MountTableIndex::new())),
             store,

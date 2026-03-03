@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::pd::config::{ConfigError, ConfigListResponse};
+use crate::pd::config::{ConfigError, ConfigInfo, ConfigListResponse};
 use crate::pd::http::ApiResponse;
 use crate::pd::http_handler::PdHttpHandler;
 use axum::{
@@ -38,7 +38,7 @@ pub async fn get_config_handler(
         },
         Err(e) => {
             let err = ConfigError::internal_error(e);
-            ApiResponse::error(err.code().into(), err.to_string(), err.status_code())
+            ApiResponse::<ConfigInfo>::error(err.code().into(), err.to_string(), err.status_code())
         }
     }
 }
@@ -66,7 +66,7 @@ pub async fn set_config_handler(
             Some(v) => v.into_bytes(),
             None => {
                 let err = ConfigError::missing_value();
-                return ApiResponse::error(
+                return ApiResponse::<()>::error(
                     err.code().into(),
                     err.to_string(),
                     err.status_code(),
@@ -76,10 +76,10 @@ pub async fn set_config_handler(
     };
     let req = ProtoUtils::set_config_request_from_http(key, value);
     match instance.config_manager.set_config(req) {
-        Ok(_) => ApiResponse::success(None),
+        Ok(_) => ApiResponse::<()>::success_with_status_code(StatusCode::OK),
         Err(e) => {
             let err = ConfigError::internal_error(e);
-            ApiResponse::error(err.code().into(), err.to_string(), err.status_code())
+            ApiResponse::<()>::error(err.code().into(), err.to_string(), err.status_code())
         }
     }
 }
@@ -92,22 +92,22 @@ pub async fn set_config_by_query_handler(
         Some(k) => k,
         None => {
             let err = ConfigError::missing_key();
-            return ApiResponse::error(err.code().into(), err.to_string(), err.status_code());
+            return ApiResponse::<()>::error(err.code().into(), err.to_string(), err.status_code());
         }
     };
     let value = match params.value {
         Some(v) => v.into_bytes(),
         None => {
             let err = ConfigError::missing_value();
-            return ApiResponse::error(err.code().into(), err.to_string(), err.status_code());
+            return ApiResponse::<()>::error(err.code().into(), err.to_string(), err.status_code());
         }
     };
     let req = ProtoUtils::set_config_request_from_http(key, value);
     match instance.config_manager.set_config(req) {
-        Ok(_) => ApiResponse::success(None),
+        Ok(_) => ApiResponse::<()>::success_with_status_code(StatusCode::OK),
         Err(e) => {
             let err = ConfigError::internal_error(e);
-            ApiResponse::error(err.code().into(), err.to_string(), err.status_code())
+            ApiResponse::<()>::error(err.code().into(), err.to_string(), err.status_code())
         }
     }
 }
@@ -127,10 +127,10 @@ pub async fn delete_config_handler(
         prev_version: params.prev_version,
     };
     match instance.config_manager.delete_config(req) {
-        Ok(_) => ApiResponse::success_with_status_code(StatusCode::NO_CONTENT),
+        Ok(_) => ApiResponse::<()>::success_with_status_code(StatusCode::NO_CONTENT),
         Err(e) => {
             let err = ConfigError::internal_error(e);
-            ApiResponse::error(err.code().into(), err.to_string(), err.status_code())
+            ApiResponse::<()>::error(err.code().into(), err.to_string(), err.status_code())
         }
     }
 }

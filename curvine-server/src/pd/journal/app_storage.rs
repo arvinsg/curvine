@@ -15,18 +15,18 @@
 use crate::pd::config::ConfigManager;
 use crate::pd::journal::entry::PdEntry;
 use crate::pd::mount::MountManager;
+use crate::pd::store::KvEngine;
 use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::AppStorage;
 use curvine_common::raft::{RaftError, RaftResult, RaftUtils};
-use curvine_common::rocksdb::DBEngine;
 use curvine_common::utils::SerdeUtils as Serde;
 use log::info;
 use orpc::common::FileUtils;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct PdAppStorage {
-    db: Arc<RwLock<DBEngine>>,
+    engine: Arc<dyn KvEngine>,
     snapshot_dir: String,
     config_manager: Arc<ConfigManager>,
     mount_manager: Arc<MountManager>,
@@ -34,13 +34,13 @@ pub struct PdAppStorage {
 
 impl PdAppStorage {
     pub fn new(
-        db: Arc<RwLock<DBEngine>>,
+        engine: Arc<dyn KvEngine>,
         snapshot_dir: String,
         config_manager: Arc<ConfigManager>,
         mount_manager: Arc<MountManager>,
     ) -> Self {
         Self {
-            db,
+            engine,
             snapshot_dir,
             config_manager,
             mount_manager,
@@ -57,10 +57,22 @@ impl PdAppStorage {
             PdEntry::Noop => {
                 info!("Apply noop entry");
             }
-            PdEntry::SetConfig(entry) => self.config_manager.apply_set_config(&entry.info)?,
-            PdEntry::DeleteConfig(key) => self.config_manager.apply_delete_config(&key)?,
-            PdEntry::Mount(entry) => self.mount_manager.apply_mount(entry.info)?,
-            PdEntry::Unmount(mount_id) => self.mount_manager.apply_unmount(mount_id)?,
+            PdEntry::SetConfig(entry) => self
+                .config_manager
+                .apply_set_config(&entry.info)
+                .map_err(|e| RaftError::from(e.to_string()))?,
+            PdEntry::DeleteConfig(key) => self
+                .config_manager
+                .apply_delete_config(&key)
+                .map_err(|e| RaftError::from(e.to_string()))?,
+            PdEntry::Mount(entry) => self
+                .mount_manager
+                .apply_mount(entry.info)
+                .map_err(|e| RaftError::from(e.to_string()))?,
+            PdEntry::Unmount(mount_id) => self
+                .mount_manager
+                .apply_unmount(mount_id)
+                .map_err(|e| RaftError::from(e.to_string()))?,
         }
 
         Ok(())
@@ -73,14 +85,16 @@ impl AppStorage for PdAppStorage {
     }
 
     fn create_snapshot(&self, node_id: u64, last_applied: u64) -> RaftResult<SnapshotData> {
-        let checkpoint_dir = self.snapshot_dir(last_applied)?;
-        FileUtils::create_dir(&checkpoint_dir, true)?;
+        let dir = self
+            .engine
+            .create_checkpoint(last_applied)
+            .map_err(|e| RaftError::from(format!("Create checkpoint failed: {}", e)))?;
 
-        let data = RaftUtils::create_file_snapshot(&checkpoint_dir, node_id, last_applied)?;
+        let data = RaftUtils::create_file_snapshot(&dir, node_id, last_applied)?;
 
         info!(
             "Created snapshot at {} for node {} with snapshot_id {}",
-            checkpoint_dir, node_id, last_applied
+            dir, node_id, last_applied
         );
 
         Ok(data)
@@ -97,12 +111,14 @@ impl AppStorage for PdAppStorage {
             .as_ref()
             .ok_or_else(|| RaftError::from("Snapshot has no files_data".to_string()))?;
 
-        let mut db = self.db.write().unwrap();
-        RaftUtils::apply_rocks_snapshot(&mut *db, files)?;
-        info!("Restored RocksDB from snapshot checkpoint {}", files.dir);
-        drop(db);
+        self.engine
+            .restore_from_checkpoint(&files.dir)
+            .map_err(|e| RaftError::from(format!("Restore from checkpoint failed: {}", e)))?;
+        info!("Restored store from snapshot checkpoint {}", files.dir);
 
-        self.mount_manager.restore()?;
+        self.mount_manager
+            .restore()
+            .map_err(|e| RaftError::from(e.to_string()))?;
         Ok(())
     }
 

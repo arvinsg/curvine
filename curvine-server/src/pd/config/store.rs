@@ -12,34 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::rocksdb::{DBEngine, KVBytes};
+use crate::pd::store::KvStore;
 use curvine_common::state::ConfigInfo;
 use curvine_common::utils::SerdeUtils as Serde;
 use log::info;
 use orpc::{err_box, CommonResult};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
-const CONFIG_CF: &str = "config";
 const CONFIG_PREFIX: u8 = 0x01;
 
 pub struct ConfigStore {
-    db: Arc<RwLock<DBEngine>>,
+    store: Arc<dyn KvStore>,
 }
 
 impl ConfigStore {
-    pub fn new(db: Arc<RwLock<DBEngine>>) -> Self {
-        Self { db }
+    pub fn new(store: Arc<dyn KvStore>) -> Self {
+        Self { store }
     }
 
-    fn make_key(&self, key: &str) -> String {
-        format!("{}{}", CONFIG_PREFIX, key)
+    fn make_key(&self, key: &str) -> Vec<u8> {
+        let mut buf = vec![CONFIG_PREFIX];
+        buf.extend_from_slice(key.as_bytes());
+        buf
     }
 
     pub fn get(&self, key: &str) -> CommonResult<Option<ConfigInfo>> {
         let db_key = self.make_key(key);
-        let db = self.db.read().unwrap();
-        let opt: Option<Vec<u8>> = db.get(db_key.as_bytes())?;
-        match opt {
+        match self.store.get(&db_key)? {
             Some(data) => {
                 let item: ConfigInfo = Serde::deserialize(&data)?;
                 Ok(Some(item))
@@ -51,19 +50,17 @@ impl ConfigStore {
     pub fn set(&self, item: &ConfigInfo) -> CommonResult<()> {
         let db_key = self.make_key(&item.key);
         let data = Serde::serialize(item)?;
-        let db = self.db.write().unwrap();
-        db.put(db_key.as_bytes(), &data)?;
+        self.store.put(&db_key, &data)?;
         info!("Set config: {} (version: {})", item.key, item.version);
         Ok(())
     }
 
     pub fn delete(&self, key: &str) -> CommonResult<bool> {
         let db_key = self.make_key(key);
-        let db = self.db.write().unwrap();
-        if db.get(db_key.as_bytes())?.is_none() {
+        if !self.store.exists(&db_key)? {
             return Ok(false);
         }
-        db.delete(db_key.as_bytes())?;
+        self.store.delete(&db_key)?;
         info!("Deleted config: {}", key);
         Ok(true)
     }
@@ -71,11 +68,9 @@ impl ConfigStore {
     pub fn list(&self, prefix: &str, limit: Option<u32>) -> CommonResult<Vec<ConfigInfo>> {
         let search_prefix = self.make_key(prefix);
         let limit = limit.unwrap_or(1000).min(10000) as usize;
-        let db = self.db.read().unwrap();
-        let iter = db.prefix_scan(CONFIG_CF, search_prefix.as_bytes())?;
-        let mut items = Vec::new();
-        for item in iter {
-            let (_key, value): KVBytes = item?;
+        let pairs = self.store.scan_prefix(&search_prefix)?;
+        let mut items = Vec::with_capacity(pairs.len().min(limit));
+        for (_key, value) in pairs {
             let config_item: ConfigInfo = Serde::deserialize(&value)?;
             items.push(config_item);
             if items.len() >= limit {
@@ -87,8 +82,7 @@ impl ConfigStore {
 
     pub fn exists(&self, key: &str) -> CommonResult<bool> {
         let db_key = self.make_key(key);
-        let db = self.db.read().unwrap();
-        Ok(db.get(db_key.as_bytes())?.is_some())
+        self.store.exists(&db_key)
     }
 
     pub fn update(&self, key: &str, value: Vec<u8>) -> CommonResult<ConfigInfo> {
@@ -105,15 +99,13 @@ impl ConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-use curvine_common::rocksdb::DBConf;
-use tempfile::TempDir;
+    use crate::pd::store::memory_kv_engine::MemoryKvEngine;
+    use crate::pd::store::KvEngine;
 
     #[test]
     fn test_config_store() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_conf = DBConf::new(temp_dir.path().to_str().unwrap());
-        let db = DBEngine::new(db_conf, true).unwrap();
-        let store = ConfigStore::new(Arc::new(RwLock::new(db)));
+        let engine = MemoryKvEngine::new();
+        let store = ConfigStore::new(engine.open_store("config"));
 
         let item = ConfigInfo::new("test.key".to_string(), b"test_value".to_vec());
         store.set(&item).unwrap();
@@ -131,10 +123,8 @@ use tempfile::TempDir;
 
     #[test]
     fn test_list_configs() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_conf = DBConf::new(temp_dir.path().to_str().unwrap());
-        let db = DBEngine::new(db_conf, true).unwrap();
-        let store = ConfigStore::new(Arc::new(RwLock::new(db)));
+        let engine = MemoryKvEngine::new();
+        let store = ConfigStore::new(engine.open_store("config"));
 
         store
             .set(&ConfigInfo::new("pd.test1".to_string(), b"v1".to_vec()))

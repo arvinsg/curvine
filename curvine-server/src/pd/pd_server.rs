@@ -13,25 +13,26 @@
 // limitations under the License.
 
 use crate::pd::config::ConfigManager;
-use crate::pd::mount::MountManager;
 use crate::pd::http_handler::PdHttpHandler;
-use crate::pd::rpc_handler::PdRpcHandler;
 use crate::pd::journal::PdAppStorage;
+use crate::pd::mount::MountManager;
+use crate::pd::store::{KvEngine, RocksKvEngine};
 use curvine_common::conf::PdConf;
 use curvine_common::raft::storage::{LogStorage, RocksLogStorage};
 use curvine_common::raft::{RaftClient, RaftJournal, RoleMonitor};
 use curvine_common::rocksdb::DBEngine;
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::info;
-use orpc::runtime::RpcRuntime;
 use orpc::common::FileUtils;
 use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
+use orpc::runtime::RpcRuntime;
 use orpc::runtime::Runtime;
 use orpc::server::{RpcServer, ServerStateListener};
 use orpc::CommonResult;
 use std::sync::Arc;
-use std::sync::RwLock;
+
+use crate::pd::rpc_handler::PdRpcHandler;
 
 type PdRaftJournal = RaftJournal<RocksLogStorage, PdAppStorage>;
 
@@ -70,7 +71,7 @@ impl Pd {
         conf.print();
 
         let log_store = RocksLogStorage::from_conf(&conf.journal, false);
-        let db_conf = conf.pd_rocks_conf();
+        let mut db_conf = conf.pd_rocks_conf();
         if log_store.has_snapshot() {
             info!(
                 "There is a snapshot currently, the original data directory {} will be \
@@ -79,19 +80,26 @@ impl Pd {
             );
             FileUtils::delete_path(&db_conf.data_dir, true)?;
         }
-        let db = Arc::new(RwLock::new(DBEngine::new(db_conf, false)?));
+
+        db_conf = db_conf.add_cf("config").add_cf("mount");
+        let db = DBEngine::new(db_conf, false)?;
+        let engine: Arc<dyn KvEngine> = Arc::new(RocksKvEngine::new(db));
+
         let snapshot_dir = format!("{}/snapshots", conf.data_dir);
         FileUtils::create_dir(&snapshot_dir, true)?;
 
         let journal_rt: Arc<Runtime> = conf.journal.create_runtime();
         let raft_client = RaftClient::from_conf(journal_rt.clone(), &conf.journal);
 
-        let config_manager = Arc::new(ConfigManager::new(db.clone(), raft_client.clone()));
-        let mount_manager = Arc::new(MountManager::new(db.clone(), raft_client));
+        let config_store = engine.open_store("config");
+        let mount_store = engine.open_store("mount");
+
+        let config_manager = Arc::new(ConfigManager::new(config_store, raft_client.clone()));
+        let mount_manager = Arc::new(MountManager::new(mount_store, raft_client));
         mount_manager.restore()?;
 
         let app_store = PdAppStorage::new(
-            db,
+            engine,
             snapshot_dir,
             config_manager.clone(),
             mount_manager.clone(),

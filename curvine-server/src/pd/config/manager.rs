@@ -16,15 +16,15 @@ use super::configs::{is_valid_key, unknown_key_error};
 use super::store::ConfigStore;
 use crate::pd::journal::entry::ConfigEntry;
 use crate::pd::journal::PdEntry;
+use crate::pd::store::KvStore;
 use curvine_common::proto::*;
 use curvine_common::raft::RaftClient;
-use curvine_common::rocksdb::DBEngine;
 use curvine_common::state::ConfigInfo;
 use curvine_common::utils::{ProtoUtils, SerdeUtils as Serde};
 use curvine_common::{FsError, FsResult};
 use log::{info, warn};
 use orpc::common::LocalTime;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 pub struct ConfigManager {
     config_store: Arc<ConfigStore>,
@@ -32,8 +32,8 @@ pub struct ConfigManager {
 }
 
 impl ConfigManager {
-    pub fn new(db: Arc<RwLock<DBEngine>>, raft_client: RaftClient) -> Self {
-        let config_store = Arc::new(ConfigStore::new(db));
+    pub fn new(store: Arc<dyn KvStore>, raft_client: RaftClient) -> Self {
+        let config_store = Arc::new(ConfigStore::new(store));
         Self {
             config_store,
             raft_client,

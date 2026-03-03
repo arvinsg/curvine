@@ -17,7 +17,7 @@ use crate::pd::http_handler::PdHttpHandler;
 use crate::pd::mount::{MountError, MountListResponse};
 use axum::{extract::Query, http::StatusCode, response::IntoResponse, Extension, Json};
 use curvine_common::fs::Path;
-use curvine_common::state;
+use curvine_common::state::{self, MountInfo};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -50,7 +50,7 @@ pub async fn create_mount_handler(
 ) -> impl IntoResponse {
     if body.cv_path.is_empty() || body.ufs_path.is_empty() {
         let err = MountError::cv_ufs_required();
-        return ApiResponse::error(err.code().into(), err.to_string(), err.status_code());
+        return ApiResponse::<()>::error(err.code().into(), err.to_string(), err.status_code());
     }
 
     let mut builder = state::MountOptionsBuilder::new();
@@ -93,10 +93,10 @@ pub async fn create_mount_handler(
         .mount_manager
         .mount(None, &body.cv_path, &body.ufs_path, &mnt_opt)
     {
-        Ok(()) => ApiResponse::success(None),
+        Ok(()) => ApiResponse::<()>::success_with_status_code(StatusCode::OK),
         Err(e) => {
             let err = MountError::from_fs_error(e);
-            ApiResponse::error(err.code().into(), err.to_string(), err.status_code())
+            ApiResponse::<()>::error(err.code().into(), err.to_string(), err.status_code())
         }
     }
 }
@@ -129,7 +129,11 @@ pub async fn list_mounts_handler(
         }
         Err(e) => {
             let err = MountError::from_fs_error(e);
-            ApiResponse::error(err.code().into(), err.to_string(), err.status_code())
+            ApiResponse::<MountListResponse>::error(
+                err.code().into(),
+                err.to_string(),
+                err.status_code(),
+            )
         }
     }
 }
@@ -147,7 +151,11 @@ pub async fn get_mount_by_path_handler(
         Some(p) if !p.is_empty() => p.clone(),
         _ => {
             let err = MountError::path_query_required();
-            return ApiResponse::error(err.code().into(), err.to_string(), err.status_code());
+            return ApiResponse::<MountInfo>::error(
+                err.code().into(),
+                err.to_string(),
+                err.status_code(),
+            );
         }
     };
 
@@ -155,16 +163,20 @@ pub async fn get_mount_by_path_handler(
         Ok(p) => p,
         Err(e) => {
             let err = MountError::invalid_path(e);
-            return ApiResponse::error(err.code().into(), err.to_string(), err.status_code());
+            return ApiResponse::<MountInfo>::error(
+                err.code().into(),
+                err.to_string(),
+                err.status_code(),
+            );
         }
     };
 
     match instance.mount_manager.get_mount_info(&path) {
         Ok(Some(info)) => ApiResponse::success(info),
-        Ok(None) => ApiResponse::success_with_status_code(StatusCode::NOT_FOUND),
+        Ok(None) => ApiResponse::<MountInfo>::success_with_status_code(StatusCode::NOT_FOUND),
         Err(e) => {
             let err = MountError::from_fs_error(e);
-            ApiResponse::error(err.code().into(), err.to_string(), err.status_code())
+            ApiResponse::<MountInfo>::error(err.code().into(), err.to_string(), err.status_code())
         }
     }
 }
@@ -182,15 +194,15 @@ pub async fn delete_mount_handler(
         Some(p) if !p.is_empty() => p.clone(),
         _ => {
             let err = MountError::path_query_required();
-            return ApiResponse::error(err.code().into(), err.to_string(), err.status_code());
+            return ApiResponse::<()>::error(err.code().into(), err.to_string(), err.status_code());
         }
     };
 
     match instance.mount_manager.umount(&cv_path) {
-        Ok(()) => ApiResponse::success_with_status_code(StatusCode::NO_CONTENT),
+        Ok(()) => ApiResponse::<()>::success_with_status_code(StatusCode::NO_CONTENT),
         Err(e) => {
             let err = MountError::from_fs_error(e);
-            ApiResponse::error(err.code().into(), err.to_string(), err.status_code())
+            ApiResponse::<()>::error(err.code().into(), err.to_string(), err.status_code())
         }
     }
 }
