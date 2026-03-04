@@ -21,7 +21,7 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
-use curvine_common::proto::{DeleteConfigRequest, GetConfigRequest, ListConfigRequest};
+use curvine_common::proto::{GetConfigRequest, ListConfigRequest};
 use curvine_common::utils::ProtoUtils;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -34,7 +34,7 @@ pub async fn get_config_handler(
     match instance.config_manager.get_config(req) {
         Ok(resp) => match resp.item {
             Some(item) => ApiResponse::success(ProtoUtils::config_info_from_pb(item)),
-            None => ApiResponse::success_with_status_code(StatusCode::NOT_FOUND),
+            None => ApiResponse::<ConfigInfo>::success_with_status_code(StatusCode::NOT_FOUND),
         },
         Err(e) => {
             let err = ConfigError::internal_error(e);
@@ -113,29 +113,6 @@ pub async fn set_config_by_query_handler(
 }
 
 #[derive(Debug, Deserialize)]
-pub struct DeleteConfigParams {
-    prev_version: Option<u64>,
-}
-
-pub async fn delete_config_handler(
-    Extension(instance): Extension<Arc<PdHttpHandler>>,
-    Path(key): Path<String>,
-    Query(params): Query<DeleteConfigParams>,
-) -> impl IntoResponse {
-    let req = DeleteConfigRequest {
-        key,
-        prev_version: params.prev_version,
-    };
-    match instance.config_manager.delete_config(req) {
-        Ok(_) => ApiResponse::<()>::success_with_status_code(StatusCode::NO_CONTENT),
-        Err(e) => {
-            let err = ConfigError::internal_error(e);
-            ApiResponse::<()>::error(err.code().into(), err.to_string(), err.status_code())
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
 pub struct ListConfigsParams {
     prefix: Option<String>,
     limit: Option<u32>,
@@ -160,7 +137,11 @@ pub async fn list_configs_handler(
         }
         Err(e) => {
             let err = ConfigError::internal_error(e);
-            ApiResponse::error(err.code().into(), err.to_string(), err.status_code())
+            ApiResponse::<ConfigListResponse>::error(
+                err.code().into(),
+                err.to_string(),
+                err.status_code(),
+            )
         }
     }
 }

@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod configs;
+mod configs;
 mod error;
 pub mod http_handler;
 mod http_response;
 mod manager;
+#[cfg(test)]
+mod manager_tests;
 mod store;
 
-pub use configs::{all_config_keys, config_description, is_valid_key};
 pub use curvine_common::state::ConfigInfo;
 pub use error::ConfigError;
 pub use http_response::ConfigListResponse;

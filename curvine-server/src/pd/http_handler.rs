@@ -43,7 +43,6 @@ impl RouterHandler for PdHttpHandler {
             .route("/api/v1/config/set", put(set_config_by_query_handler))
             .route("/api/v1/config/:key", get(get_config_handler))
             .route("/api/v1/config/:key", put(set_config_handler))
-            .route("/api/v1/config/:key", delete(delete_config_handler))
             .route("/api/v1/config", get(list_configs_handler))
             .route("/api/v1/mount", get(list_mounts_handler))
             .route("/api/v1/mount", post(create_mount_handler))

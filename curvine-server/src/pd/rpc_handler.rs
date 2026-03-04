@@ -61,11 +61,6 @@ impl MessageHandler for PdRpcHandler {
                 let resp = self.config_manager.set_config(req)?;
                 ctx.response(resp)?
             }
-            RpcCode::DeleteConfig => {
-                let req = ctx.parse_header()?;
-                let resp = self.config_manager.delete_config(req)?;
-                ctx.response(resp)?
-            }
             RpcCode::Mount => {
                 let req: MountRequest = ctx.parse_header()?;
                 let mnt_opt = ProtoUtils::mount_options_from_pb(req.mount_options);

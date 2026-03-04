@@ -94,7 +94,11 @@ impl Pd {
         let config_store = engine.open_store("config");
         let mount_store = engine.open_store("mount");
 
-        let config_manager = Arc::new(ConfigManager::new(config_store, raft_client.clone()));
+        let config_manager = Arc::new(ConfigManager::new(
+            config_store,
+            raft_client.clone(),
+            conf.dynamic_config.clone(),
+        ));
         let mount_manager = Arc::new(MountManager::new(mount_store, raft_client));
         mount_manager.restore()?;
 

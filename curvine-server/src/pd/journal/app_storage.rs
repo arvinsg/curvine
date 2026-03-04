@@ -21,7 +21,6 @@ use curvine_common::raft::storage::AppStorage;
 use curvine_common::raft::{RaftError, RaftResult, RaftUtils};
 use curvine_common::utils::SerdeUtils as Serde;
 use log::info;
-use orpc::common::FileUtils;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -60,10 +59,6 @@ impl PdAppStorage {
             PdEntry::SetConfig(entry) => self
                 .config_manager
                 .apply_set_config(&entry.info)
-                .map_err(|e| RaftError::from(e.to_string()))?,
-            PdEntry::DeleteConfig(key) => self
-                .config_manager
-                .apply_delete_config(&key)
                 .map_err(|e| RaftError::from(e.to_string()))?,
             PdEntry::Mount(entry) => self
                 .mount_manager

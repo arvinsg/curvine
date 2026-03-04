@@ -21,6 +21,7 @@ use orpc::io::net::InetAddr;
 use orpc::server::ServerConf;
 use orpc::{err_box, try_err, CommonResult};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::read_to_string;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -38,6 +39,13 @@ pub struct PdConf {
 
     #[serde(default)]
     pub journal: JournalConf,
+
+    /// Dynamic config defaults. key → default_value (String).
+    /// Only keys present in this map can be set via the config API.
+    /// When reading a config, the KV store is checked first; if absent,
+    /// the value from this map is returned as the default (version = 0).
+    #[serde(default)]
+    pub dynamic_config: HashMap<String, String>,
 }
 
 impl Default for PdConf {
@@ -54,6 +62,7 @@ impl Default for PdConf {
 
             data_dir: default_data_dir(),
             journal: JournalConf::default(),
+            dynamic_config: HashMap::new(),
         }
     }
 }

@@ -40,7 +40,6 @@ pub struct ConfigEntry {
 pub enum PdEntry {
     Noop,
     SetConfig(ConfigEntry),
-    DeleteConfig(String),
     Mount(MountEntry),
     Unmount(u32),
 }

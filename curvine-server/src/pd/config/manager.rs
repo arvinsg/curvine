@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::configs::{is_valid_key, unknown_key_error};
+use super::configs::unknown_key_error;
 use super::store::ConfigStore;
 use crate::pd::journal::entry::ConfigEntry;
 use crate::pd::journal::PdEntry;
@@ -24,21 +24,45 @@ use curvine_common::utils::{ProtoUtils, SerdeUtils as Serde};
 use curvine_common::{FsError, FsResult};
 use log::{info, warn};
 use orpc::common::LocalTime;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub struct ConfigManager {
     config_store: Arc<ConfigStore>,
     raft_client: RaftClient,
+    dynamic_config: HashMap<String, String>,
 }
 
 impl ConfigManager {
-    pub fn new(store: Arc<dyn KvStore>, raft_client: RaftClient) -> Self {
+    pub fn new(
+        store: Arc<dyn KvStore>,
+        raft_client: RaftClient,
+        dynamic_config: HashMap<String, String>,
+    ) -> Self {
         let config_store = Arc::new(ConfigStore::new(store));
         Self {
             config_store,
             raft_client,
+            dynamic_config,
         }
     }
+
+    fn is_valid_key(&self, key: &str) -> bool {
+        self.dynamic_config.contains_key(key)
+    }
+
+    fn default_config_info(&self, key: &str) -> Option<ConfigInfo> {
+        self.dynamic_config
+            .get(key)
+            .map(|default_value| ConfigInfo {
+                key: key.to_string(),
+                value: default_value.as_bytes().to_vec(),
+                version: 0,
+                mtime: 0,
+            })
+    }
+
+    // -- Raft apply callbacks (called by PdAppStorage) -----------------------
 
     pub fn apply_set_config(&self, item: &ConfigInfo) -> FsResult<()> {
         if let Some(existing) = self.config_store.get(&item.key)? {
@@ -55,11 +79,7 @@ impl ConfigManager {
         Ok(())
     }
 
-    pub fn apply_delete_config(&self, key: &str) -> FsResult<()> {
-        info!("Apply delete config: {}", key);
-        self.config_store.delete(key)?;
-        Ok(())
-    }
+    // -- Public API ----------------------------------------------------------
 
     fn propose(&self, entry: PdEntry) -> FsResult<()> {
         let data = Serde::serialize(&entry)?;
@@ -69,23 +89,56 @@ impl ConfigManager {
 
     pub fn get_config(&self, req: GetConfigRequest) -> FsResult<GetConfigResponse> {
         info!("Get config: {}", req.key);
-        let item = self.config_store.get(&req.key)?;
+
+        if let Some(item) = self.config_store.get(&req.key)? {
+            return Ok(GetConfigResponse {
+                item: Some(ProtoUtils::config_info_to_pb(&item)),
+            });
+        }
+
         Ok(GetConfigResponse {
-            item: item.map(|i| ProtoUtils::config_info_to_pb(&i)),
+            item: self
+                .default_config_info(&req.key)
+                .map(|i| ProtoUtils::config_info_to_pb(&i)),
         })
     }
 
     pub fn list_config(&self, req: ListConfigRequest) -> FsResult<ListConfigResponse> {
         info!("List config with prefix: {}", req.prefix);
-        let items = self.config_store.list(&req.prefix, req.limit)?;
+        let limit = req.limit.unwrap_or(1000).min(10000) as usize;
+
+        let persisted = self.config_store.list(&req.prefix, Some(limit as u32))?;
+        let persisted_keys: std::collections::HashSet<String> =
+            persisted.iter().map(|i| i.key.clone()).collect();
+
+        let mut items = persisted;
+
+        for (key, default_value) in &self.dynamic_config {
+            if items.len() >= limit {
+                break;
+            }
+            if !key.starts_with(&req.prefix) {
+                continue;
+            }
+            if persisted_keys.contains(key) {
+                continue;
+            }
+            items.push(ConfigInfo {
+                key: key.clone(),
+                value: default_value.as_bytes().to_vec(),
+                version: 0,
+                mtime: 0,
+            });
+        }
+
         Ok(ListConfigResponse {
             items: items.iter().map(ProtoUtils::config_info_to_pb).collect(),
         })
     }
 
     pub fn set_config(&self, req: SetConfigRequest) -> FsResult<SetConfigResponse> {
-        if !is_valid_key(&req.key) {
-            return Err(FsError::common(unknown_key_error(&req.key, "set")));
+        if !self.is_valid_key(&req.key) {
+            return Err(FsError::common(unknown_key_error(&req.key)));
         }
         info!("Set config: {}", req.key);
 
@@ -104,31 +157,5 @@ impl ConfigManager {
             success: true,
             version: item.version,
         })
-    }
-
-    pub fn delete_config(&self, req: DeleteConfigRequest) -> FsResult<DeleteConfigResponse> {
-        if !is_valid_key(&req.key) {
-            return Err(FsError::common(unknown_key_error(&req.key, "deleted")));
-        }
-        info!("Delete config: {}", req.key);
-
-        if let Some(prev_version) = req.prev_version {
-            if let Some(item) = self.config_store.get(&req.key)? {
-                if item.version != prev_version {
-                    return Err(FsError::common(format!(
-                        "Version mismatch: expected {}, got {}",
-                        prev_version, item.version
-                    )));
-                }
-            }
-        }
-
-        if !self.config_store.exists(&req.key)? {
-            return Ok(DeleteConfigResponse { success: false });
-        }
-
-        self.propose(PdEntry::DeleteConfig(req.key.clone()))?;
-
-        Ok(DeleteConfigResponse { success: true })
     }
 }

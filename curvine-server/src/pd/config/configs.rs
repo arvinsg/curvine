@@ -12,40 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
-use std::sync::OnceLock;
-
-fn build_all_configs_keys() -> HashMap<&'static str, &'static str> {
-    [(
-        "pd.scheduler.max_inflight_moves",
-        "max inflight moves for pd scheduler",
-    )]
-    .into_iter()
-    .collect()
-}
-
-static ALL_CONFIGS_KEYS: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
-
-fn all_configs_keys() -> &'static HashMap<&'static str, &'static str> {
-    ALL_CONFIGS_KEYS.get_or_init(build_all_configs_keys)
-}
-
-#[inline]
-pub fn is_valid_key(key: &str) -> bool {
-    all_configs_keys().contains_key(key)
-}
-
-pub fn config_description(key: &str) -> Option<&'static str> {
-    all_configs_keys().get(key).copied()
-}
-
-pub fn all_config_keys() -> Vec<&'static str> {
-    all_configs_keys().keys().copied().collect()
-}
-
-pub fn unknown_key_error(key: &str, action: &str) -> String {
+pub fn unknown_key_error(key: &str) -> String {
     format!(
-        "unknown config key: {} (only known keys can be {})",
-        key, action
+        "unknown config key: {} (only keys registered in dynamic_config can be set)",
+        key
     )
 }
