@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::{ConfigInfo, MountInfo};
+use curvine_common::state::{BlockGroupInfo, ConfigInfo, MountInfo, NodeInfo, NodeState};
 use serde::{Deserialize, Serialize};
 
 // mount
@@ -36,10 +36,53 @@ pub struct ConfigEntry {
     pub(crate) info: ConfigInfo,
 }
 
+/// Node registration entry (Raft log)
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct NodeEntry {
+    pub op_ms: u64,
+    pub info: NodeInfo,
+    pub new_epoch: u64,
+}
+
+/// Node state change entry (Raft log)
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct NodeStateEntry {
+    pub op_ms: u64,
+    pub node_id: u32,
+    pub old_state: NodeState,
+    pub new_state: NodeState,
+    pub new_epoch: Option<u64>,
+}
+
+/// BG create entry (Raft log)
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct BGEntry {
+    pub op_ms: u64,
+    pub info: BlockGroupInfo,
+}
+
+/// BG update entry (Raft log)
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct BGUpdateEntry {
+    pub op_ms: u64,
+    pub bg_id: u32,
+    pub state: Option<curvine_common::state::BGState>,
+    pub replica_set: Option<Vec<u32>>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum PdEntry {
     Noop,
     SetConfig(ConfigEntry),
     Mount(MountEntry),
     Unmount(u32),
+
+    // Node management
+    RegisterNode(NodeEntry),
+    UpdateNodeState(NodeStateEntry),
+
+    // BG management
+    CreateBG(BGEntry),
+    UpdateBG(BGUpdateEntry),
+    DeleteBG(u32),
 }

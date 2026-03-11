@@ -16,6 +16,8 @@ use crate::pd::config::ConfigManager;
 use crate::pd::http_handler::PdHttpHandler;
 use crate::pd::journal::PdAppStorage;
 use crate::pd::mount::MountManager;
+use crate::pd::node::NodeManager;
+use crate::pd::node::NodeStore;
 use crate::pd::store::{KvStore, RocksKvEngine};
 use curvine_common::conf::PdConf;
 use curvine_common::raft::storage::{LogStorage, RocksLogStorage};
@@ -97,14 +99,19 @@ impl Pd {
             raft_client.clone(),
             conf.dynamic_config.clone(),
         ));
-        let mount_manager = Arc::new(MountManager::new(store, raft_client));
+        let mount_manager = Arc::new(MountManager::new(store.clone(), raft_client.clone()));
         mount_manager.restore()?;
+
+        let node_store = Arc::new(NodeStore::new(store));
+        let node_manager = Arc::new(NodeManager::new(node_store, config_manager.clone()));
+        node_manager.restore()?;
 
         let app_store = PdAppStorage::new(
             engine,
             snapshot_dir,
             config_manager.clone(),
             mount_manager.clone(),
+            Some(node_manager),
         );
 
         let role_monitor = RoleMonitor::new();

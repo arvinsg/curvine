@@ -15,6 +15,7 @@
 use crate::pd::config::ConfigManager;
 use crate::pd::journal::entry::PdEntry;
 use crate::pd::mount::MountManager;
+use crate::pd::node::NodeManager;
 use crate::pd::store::RocksKvEngine;
 use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::AppStorage;
@@ -30,6 +31,7 @@ pub struct PdAppStorage {
     snapshot_dir: String,
     config_manager: Arc<ConfigManager>,
     mount_manager: Arc<MountManager>,
+    node_manager: Option<Arc<NodeManager>>,
 }
 
 impl PdAppStorage {
@@ -38,12 +40,14 @@ impl PdAppStorage {
         snapshot_dir: String,
         config_manager: Arc<ConfigManager>,
         mount_manager: Arc<MountManager>,
+        node_manager: Option<Arc<NodeManager>>,
     ) -> Self {
         Self {
             engine,
             snapshot_dir,
             config_manager,
             mount_manager,
+            node_manager,
         }
     }
 
@@ -60,6 +64,37 @@ impl PdAppStorage {
             PdEntry::SetConfig(entry) => self.config_manager.apply_set_config(&entry.info)?,
             PdEntry::Mount(entry) => self.mount_manager.apply_mount(entry.info)?,
             PdEntry::Unmount(mount_id) => self.mount_manager.apply_unmount(mount_id)?,
+            PdEntry::RegisterNode(entry) => {
+                info!(
+                    "Apply RegisterNode node_id:{}, address:{}",
+                    entry.info.base.node_id, entry.info.base.address
+                );
+                if let Some(ref nm) = self.node_manager {
+                    nm.apply_register_node(&entry)
+                        .map_err(|e| RaftError::from(e.to_string()))?;
+                }
+            }
+            PdEntry::UpdateNodeState(entry) => {
+                info!(
+                    "Apply UpdateNodeState node_id:{} {:?} -> {:?}",
+                    entry.node_id, entry.old_state, entry.new_state
+                );
+                if let Some(ref nm) = self.node_manager {
+                    nm.apply_update_state(&entry)?;
+                }
+            }
+            PdEntry::CreateBG(entry) => {
+                info!("Apply CreateBG bg_id={}", entry.info.bg_id);
+                // BGManager.apply_create_bg will be wired when BG module is integrated
+            }
+            PdEntry::UpdateBG(entry) => {
+                info!("Apply UpdateBG bg_id={}", entry.bg_id);
+                // BGManager.apply_update_bg will be wired when BG module is integrated
+            }
+            PdEntry::DeleteBG(bg_id) => {
+                info!("Apply DeleteBG bg_id={}", bg_id);
+                // BGManager.apply_delete_bg will be wired when BG module is integrated
+            }
         }
 
         Ok(())
@@ -100,6 +135,9 @@ impl AppStorage for PdAppStorage {
         self.mount_manager
             .restore()
             .map_err(|e| RaftError::from(e.to_string()))?;
+        if let Some(ref nm) = self.node_manager {
+            nm.restore().map_err(|e| RaftError::from(e.to_string()))?;
+        }
         Ok(())
     }
 
