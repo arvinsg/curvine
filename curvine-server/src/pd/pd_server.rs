@@ -18,6 +18,8 @@ use crate::pd::journal::PdAppStorage;
 use crate::pd::mount::MountManager;
 use crate::pd::node::NodeManager;
 use crate::pd::node::NodeStore;
+use crate::pd::bg::{BGManager, BGStore};
+use crate::pd::pool::{PoolManager, PoolStore};
 use crate::pd::store::{KvStore, RocksKvEngine};
 use curvine_common::conf::PdConf;
 use curvine_common::raft::storage::{LogStorage, RocksLogStorage};
@@ -83,7 +85,12 @@ impl Pd {
             FileUtils::delete_path(&db_conf.data_dir, true)?;
         }
 
-        db_conf = db_conf.add_cf("config").add_cf("mount");
+        db_conf = db_conf
+            .add_cf("config")
+            .add_cf("mount")
+            .add_cf("node")
+            .add_cf("pool")
+            .add_cf("bg");
         let db = DBEngine::new(db_conf, false)?;
         let engine = Arc::new(RocksKvEngine::new(db));
         let store: Arc<dyn KvStore> = engine.clone();
@@ -102,9 +109,17 @@ impl Pd {
         let mount_manager = Arc::new(MountManager::new(store.clone(), raft_client.clone()));
         mount_manager.restore()?;
 
-        let node_store = Arc::new(NodeStore::new(store));
+        let node_store = Arc::new(NodeStore::new(store.clone()));
         let node_manager = Arc::new(NodeManager::new(node_store, config_manager.clone()));
         node_manager.restore()?;
+
+        let pool_store = Arc::new(PoolStore::new(store.clone()));
+        let pool_manager = Arc::new(PoolManager::new(pool_store, node_manager.clone()));
+        pool_manager.restore()?;
+
+        let bg_store = Arc::new(BGStore::new(store.clone()));
+        let bg_manager = Arc::new(BGManager::new(bg_store, pool_manager.clone()));
+        bg_manager.restore()?;
 
         let app_store = PdAppStorage::new(
             engine,
@@ -112,6 +127,7 @@ impl Pd {
             config_manager.clone(),
             mount_manager.clone(),
             Some(node_manager),
+            Some(bg_manager),
         );
 
         let role_monitor = RoleMonitor::new();

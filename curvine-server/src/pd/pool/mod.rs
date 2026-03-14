@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod index;
+mod manager;
 mod store;
 
+#[cfg(test)]
+mod manager_tests;
+
+pub use manager::{PoolManager, POOL_ID_HDD, POOL_ID_MEM, POOL_ID_SSD};
 pub use store::PoolStore;

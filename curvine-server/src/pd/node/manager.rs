@@ -152,6 +152,29 @@ impl NodeManager {
         index.get_by_id(node_id).cloned()
     }
 
+    /// Expand BlockGroupInfo to view (replica_set with address and state).
+    pub fn block_group_info_to_view(&self, bg: &BlockGroupInfo) -> BlockGroupInfoView {
+        let replica_set: Vec<ReplicaInfo> = bg
+            .replica_set
+            .iter()
+            .filter_map(|&node_id| {
+                self.get_node(node_id).map(|node| ReplicaInfo {
+                    node_id,
+                    address: node.base.address.clone(),
+                    state: node.state,
+                })
+            })
+            .collect();
+        BlockGroupInfoView {
+            bg_id: bg.bg_id,
+            table_id: bg.table_id,
+            epoch: bg.epoch,
+            replica_set,
+            state: bg.state,
+            lease_owner: bg.lease_owner.clone(),
+        }
+    }
+
     /// Get nodes by type.
     pub fn get_nodes_by_type(&self, node_type: NodeType) -> Vec<NodeInfo> {
         let index = self.index.read().unwrap();

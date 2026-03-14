@@ -20,7 +20,6 @@ use std::sync::Arc;
 
 const NS: &str = "pool";
 const POOL_INFO_PREFIX: u8 = 0x01;
-const POOL_WORKER_PREFIX: u8 = 0x02;
 
 pub struct PoolStore {
     store: Arc<dyn KvStore>,

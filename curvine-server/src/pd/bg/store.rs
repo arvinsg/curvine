@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::table::BGTable;
 use crate::pd::store::KvStore;
 use curvine_common::state::BlockGroupInfo;
 use curvine_common::utils::SerdeUtils as Serde;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 const NS: &str = "bg";
 const BG_INFO_PREFIX: u8 = 0x01;
 const BG_NEXT_ID_KEY: &[u8] = &[0x02];
+const BG_TABLE_PREFIX: u8 = 0x03;
 
 pub struct BGStore {
     store: Arc<dyn KvStore>,
@@ -86,5 +88,40 @@ impl BGStore {
         let value = Serde::serialize(&next_id)?;
         self.store.put(NS, BG_NEXT_ID_KEY, &value)?;
         Ok(())
+    }
+
+    fn table_key(&self, table_id: u32) -> [u8; 5] {
+        let mut k = [0u8; 5];
+        k[0] = BG_TABLE_PREFIX;
+        k[1..5].copy_from_slice(&table_id.to_be_bytes());
+        k
+    }
+
+    pub fn put_table(&self, table: &BGTable) -> CommonResult<()> {
+        let key = self.table_key(table.table_id);
+        let value = Serde::serialize(table)?;
+        self.store.put(NS, &key, &value)?;
+        Ok(())
+    }
+
+    pub fn get_table(&self, table_id: u32) -> CommonResult<Option<BGTable>> {
+        let key = self.table_key(table_id);
+        match self.store.get(NS, &key)? {
+            Some(data) => {
+                let table: BGTable = Serde::deserialize(&data)?;
+                Ok(Some(table))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_tables(&self) -> CommonResult<Vec<BGTable>> {
+        let pairs = self.store.scan_prefix(NS, &[BG_TABLE_PREFIX])?;
+        let mut out = Vec::with_capacity(pairs.len());
+        for (_key, value) in pairs {
+            let table: BGTable = Serde::deserialize(&value)?;
+            out.push(table);
+        }
+        Ok(out)
     }
 }

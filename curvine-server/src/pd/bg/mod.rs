@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod manager;
 mod store;
+mod table;
 
+pub use manager::BGManager;
 pub use store::BGStore;
+pub use table::BGTable;
+pub use curvine_common::state::BGTableSummary;

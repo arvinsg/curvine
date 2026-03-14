@@ -93,6 +93,9 @@ pub use self::node_state::*;
 mod blockgroup_info;
 pub use self::blockgroup_info::*;
 
+mod bg_table;
+pub use self::bg_table::*;
+
 mod worker_node_info;
 pub use self::worker_node_info::*;
 

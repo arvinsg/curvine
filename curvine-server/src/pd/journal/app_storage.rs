@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::pd::bg::BGManager;
 use crate::pd::config::ConfigManager;
 use crate::pd::journal::entry::PdEntry;
 use crate::pd::mount::MountManager;
@@ -32,6 +33,7 @@ pub struct PdAppStorage {
     config_manager: Arc<ConfigManager>,
     mount_manager: Arc<MountManager>,
     node_manager: Option<Arc<NodeManager>>,
+    bg_manager: Option<Arc<BGManager>>,
 }
 
 impl PdAppStorage {
@@ -41,6 +43,7 @@ impl PdAppStorage {
         config_manager: Arc<ConfigManager>,
         mount_manager: Arc<MountManager>,
         node_manager: Option<Arc<NodeManager>>,
+        bg_manager: Option<Arc<BGManager>>,
     ) -> Self {
         Self {
             engine,
@@ -48,6 +51,7 @@ impl PdAppStorage {
             config_manager,
             mount_manager,
             node_manager,
+            bg_manager,
         }
     }
 
@@ -80,20 +84,30 @@ impl PdAppStorage {
                     entry.node_id, entry.old_state, entry.new_state
                 );
                 if let Some(ref nm) = self.node_manager {
-                    nm.apply_update_state(&entry)?;
+                    nm.apply_update_state(&entry)
+                        .map_err(|e| RaftError::from(e.to_string()))?;
                 }
             }
             PdEntry::CreateBG(entry) => {
                 info!("Apply CreateBG bg_id={}", entry.info.bg_id);
-                // BGManager.apply_create_bg will be wired when BG module is integrated
+                if let Some(ref bm) = self.bg_manager {
+                    bm.apply_create_bg(&entry)
+                        .map_err(|e| RaftError::from(e.to_string()))?;
+                }
             }
             PdEntry::UpdateBG(entry) => {
                 info!("Apply UpdateBG bg_id={}", entry.bg_id);
-                // BGManager.apply_update_bg will be wired when BG module is integrated
+                if let Some(ref bm) = self.bg_manager {
+                    bm.apply_update_bg(&entry)
+                        .map_err(|e| RaftError::from(e.to_string()))?;
+                }
             }
             PdEntry::DeleteBG(bg_id) => {
                 info!("Apply DeleteBG bg_id={}", bg_id);
-                // BGManager.apply_delete_bg will be wired when BG module is integrated
+                if let Some(ref bm) = self.bg_manager {
+                    bm.apply_delete_bg(bg_id)
+                        .map_err(|e| RaftError::from(e.to_string()))?;
+                }
             }
         }
 
@@ -137,6 +151,9 @@ impl AppStorage for PdAppStorage {
             .map_err(|e| RaftError::from(e.to_string()))?;
         if let Some(ref nm) = self.node_manager {
             nm.restore().map_err(|e| RaftError::from(e.to_string()))?;
+        }
+        if let Some(ref bm) = self.bg_manager {
+            bm.restore().map_err(|e| RaftError::from(e.to_string()))?;
         }
         Ok(())
     }
