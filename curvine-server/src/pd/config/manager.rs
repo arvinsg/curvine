@@ -87,6 +87,38 @@ impl ConfigManager {
         Ok(())
     }
 
+    /// Propose an arbitrary PD entry (e.g. UpdateNodeState). Used by schedule/cluster.
+    pub fn propose_pd_entry(&self, entry: PdEntry) -> FsResult<()> {
+        self.propose(entry)
+    }
+
+    /// Get config value as u32; returns default if key missing or parse fails.
+    pub fn get_u32(&self, key: &str, default: u32) -> u32 {
+        self.config_value_str(key)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
+    }
+
+    /// Get config value as u64; returns default if key missing or parse fails.
+    pub fn get_u64(&self, key: &str, default: u64) -> u64 {
+        self.config_value_str(key)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
+    }
+
+    /// Get config value as bool; "true"/"1" => true, else false.
+    pub fn get_bool(&self, key: &str, default: bool) -> bool {
+        self.config_value_str(key)
+            .map(|s| s == "true" || s == "1")
+            .unwrap_or(default)
+    }
+
+    fn config_value_str(&self, key: &str) -> Option<String> {
+        let item = self.config_store.get(key).ok().flatten();
+        let item = item.or_else(|| self.default_config_info(key));
+        item.and_then(|i| String::from_utf8(i.value).ok())
+    }
+
     pub fn get_config(&self, req: GetConfigRequest) -> FsResult<GetConfigResponse> {
         info!("Get config: {}", req.key);
 

@@ -16,16 +16,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Node type: Worker、Meta...
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum NodeType {
+    #[default]
     Worker,
     Meta,
 }
 
 /// Node state in PD
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum NodeState {
     /// Starting, registered but not yet initialized
+    #[default]
     Starting,
     /// Running, heartbeat normal
     Live,
@@ -49,7 +51,7 @@ pub struct NodeAddress {
 }
 
 /// Common node fields shared by RegisterRequest and NodeInfo
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeBase {
     pub node_id: u32,
     pub node_type: NodeType,

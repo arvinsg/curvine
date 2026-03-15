@@ -129,6 +129,15 @@ impl PoolManager {
             .unwrap_or_default()
     }
 
+    /// Get pool IDs that contain this worker (for schedule/coordinator).
+    pub fn get_pools_by_worker(&self, worker_id: u32) -> Vec<u16> {
+        let index = self.index.read().unwrap();
+        index
+            .get_pools_by_worker(worker_id)
+            .map(|s: &std::collections::HashSet<u16>| s.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
     /// Update pool stats (in-memory only). For use by Scheduler to periodically refresh.
     pub fn update_pool_stats(&self, pool_id: u16, stats: PoolStats) -> FsResult<()> {
         let mut index = self.index.write().unwrap();
@@ -166,7 +175,7 @@ impl PoolManager {
         Ok(())
     }
 
-    /// TODO: Select workers for BG replica set (only from Live workers in pool, excluding given set).
+    /// TODO:Select workers for BG replica set (only from Live workers in pool, excluding given set).
     pub fn select_workers_for_bg(
         &self,
         pool_id: u16,

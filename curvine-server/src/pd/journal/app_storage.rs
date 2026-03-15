@@ -17,6 +17,7 @@ use crate::pd::config::ConfigManager;
 use crate::pd::journal::entry::PdEntry;
 use crate::pd::mount::MountManager;
 use crate::pd::node::NodeManager;
+use crate::pd::meta::MetaManager;
 use crate::pd::store::RocksKvEngine;
 use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::AppStorage;
@@ -34,6 +35,7 @@ pub struct PdAppStorage {
     mount_manager: Arc<MountManager>,
     node_manager: Option<Arc<NodeManager>>,
     bg_manager: Option<Arc<BGManager>>,
+    meta_manager: Option<Arc<MetaManager>>,
 }
 
 impl PdAppStorage {
@@ -44,6 +46,7 @@ impl PdAppStorage {
         mount_manager: Arc<MountManager>,
         node_manager: Option<Arc<NodeManager>>,
         bg_manager: Option<Arc<BGManager>>,
+        meta_manager: Option<Arc<MetaManager>>,
     ) -> Self {
         Self {
             engine,
@@ -52,6 +55,7 @@ impl PdAppStorage {
             mount_manager,
             node_manager,
             bg_manager,
+            meta_manager,
         }
     }
 
@@ -70,7 +74,7 @@ impl PdAppStorage {
             PdEntry::Unmount(mount_id) => self.mount_manager.apply_unmount(mount_id)?,
             PdEntry::RegisterNode(entry) => {
                 info!(
-                    "Apply RegisterNode node_id:{}, address:{}",
+                    "Apply RegisterNode node_id:{}, address:{:?}",
                     entry.info.base.node_id, entry.info.base.address
                 );
                 if let Some(ref nm) = self.node_manager {
@@ -106,6 +110,20 @@ impl PdAppStorage {
                 info!("Apply DeleteBG bg_id={}", bg_id);
                 if let Some(ref bm) = self.bg_manager {
                     bm.apply_delete_bg(bg_id)
+                        .map_err(|e| RaftError::from(e.to_string()))?;
+                }
+            }
+            PdEntry::AddPathRoute(ref entry) => {
+                info!("Apply AddPathRoute path={}", entry.path);
+                if let Some(ref pt) = self.meta_manager {
+                    pt.apply_add_route(entry)
+                        .map_err(|e| RaftError::from(e.to_string()))?;
+                }
+            }
+            PdEntry::RemovePathRoute(ref path) => {
+                info!("Apply RemovePathRoute path={}", path);
+                if let Some(ref pt) = self.meta_manager {
+                    pt.apply_remove_route(path)
                         .map_err(|e| RaftError::from(e.to_string()))?;
                 }
             }
@@ -154,6 +172,9 @@ impl AppStorage for PdAppStorage {
         }
         if let Some(ref bm) = self.bg_manager {
             bm.restore().map_err(|e| RaftError::from(e.to_string()))?;
+        }
+        if let Some(ref mm) = self.meta_manager {
+            mm.restore().map_err(|e| RaftError::from(e.to_string()))?;
         }
         Ok(())
     }

@@ -9,16 +9,22 @@ pub mod rpc_handler;
 pub mod store;
 
 pub mod node;
+pub mod meta;
 pub mod pool;
 pub mod bg;
+pub mod schedule;
+pub mod cluster;
 
 pub use config::{ConfigInfo, ConfigManager};
 pub use http_handler::PdHttpHandler;
 pub use journal::{PdAppStorage, PdEntry};
 pub use mount::MountManager;
 pub use node::{NodeManager, NodeStore};
+pub use meta::MetaManager;
 pub use pd_server::Pd;
 pub use pool::{PoolManager, PoolStore};
 pub use bg::{BGManager, BGStore, BGTable, BGTableSummary};
+pub use cluster::ClusterManager;
+pub use schedule::{Coordinator, CoordinatorContext, BGCommands, OperatorController};
 pub use rpc_context::RpcContext;
 pub use rpc_handler::PdRpcHandler;

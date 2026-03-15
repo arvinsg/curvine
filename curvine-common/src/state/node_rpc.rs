@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::state::meta_node_info::{InodesStats, NodeGroupInfo};
+use crate::state::meta_node_mode::PathRouteEntry;
 use crate::state::node_info::{NodePayload, SystemStats};
 use crate::state::node_state::{NodeAddress, NodeBase, NodeType};
 use crate::state::worker_node_info::StorageStats;
@@ -88,17 +89,6 @@ pub struct WorkerHeartbeatResponse {
     pub add_bgs: Vec<BlockGroupInfo>,
     pub remove_bgs: Vec<u32>,
     pub update_bgs: Vec<BlockGroupInfo>,
-}
-
-// ---------- Meta heartbeat response (route & group updates) ----------
-
-/// Path route entry (static path -> group_id)
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PathRouteEntry {
-    pub path: String,
-    pub group_id: u64,
-    pub create_time_ms: u64,
-    pub update_time_ms: u64,
 }
 
 /// Route update action (full sync or incremental)

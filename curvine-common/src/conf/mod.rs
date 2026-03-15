@@ -31,7 +31,7 @@ mod journal_conf;
 pub use self::journal_conf::JournalConf;
 
 mod pd_conf;
-pub use self::pd_conf::PdConf;
+pub use self::pd_conf::{MetaNodeConf, PdConf};
 
 mod size_string;
 pub use self::size_string::SizeString;

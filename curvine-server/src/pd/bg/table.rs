@@ -16,7 +16,6 @@ use curvine_common::state::{table_id_pool_id, table_id_replica_count, BlockGroup
 use orpc::common::Utils;
 use serde::{Deserialize, Serialize};
 
-/// BGTable: consistent hash ring (buckets hold bg_id). Lives in PD bg module.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BGTable {
     pub table_id: u32,

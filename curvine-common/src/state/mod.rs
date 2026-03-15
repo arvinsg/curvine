@@ -105,6 +105,9 @@ pub use self::meta_node_info::*;
 mod node_rpc;
 pub use self::node_rpc::*;
 
+mod meta_node_mode;
+pub use self::meta_node_mode::*;
+
 mod node_info;
 pub use self::node_info::*;
 

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod heartbeat;
+pub(crate) mod http_handler;
 mod index;
 mod manager;
 mod registry;

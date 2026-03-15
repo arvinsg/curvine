@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::state_machine;
 use super::{BGStore, BGTable};
 use crate::pd::journal::entry::{BGEntry, BGUpdateEntry};
 use crate::pd::node::NodeManager;
@@ -26,7 +27,6 @@ pub struct BGManager {
     tables: RwLock<HashMap<u32, BGTable>>,
     bgs: RwLock<HashMap<u32, BlockGroupInfo>>,
     store: Arc<BGStore>,
-    #[allow(dead_code)] // Phase 5+: select_workers_for_bg when creating BGTable
     pool_manager: Arc<PoolManager>,
 }
 
@@ -41,8 +41,8 @@ impl BGManager {
     }
 
     pub fn restore(&self) -> FsResult<()> {
-        let tables = self.store.list_tables().map_err(FsError::from)?;
-        let bgs = self.store.list_all().map_err(FsError::from)?;
+        let tables = self.store.list_tables()?;
+        let bgs = self.store.list_all()?;
         let mut t = self.tables.write().unwrap();
         let mut b = self.bgs.write().unwrap();
         t.clear();
@@ -70,10 +70,14 @@ impl BGManager {
             .cloned()
             .ok_or_else(|| FsError::common(format!("bg {} not found for update", entry.bg_id)))?;
         if let Some(s) = entry.state {
+            state_machine::validate_transition(info.state, s)?;
             info.state = s;
         }
         if let Some(ref rs) = entry.replica_set {
             info.replica_set = rs.clone();
+        }
+        if let Some(ref lease) = entry.lease_owner {
+            info.lease_owner = lease.clone();
         }
         self.store.put(&info)?;
         bgs.insert(entry.bg_id, info.clone());
@@ -96,7 +100,7 @@ impl BGManager {
         let mut tables = self.tables.write().unwrap();
         if let Some(table) = tables.get_mut(&table_id) {
             table.inc_epoch();
-            self.store.put_table(table).map_err(FsError::from)?;
+            self.store.put_table(table)?;
         }
         Ok(())
     }
@@ -126,6 +130,41 @@ impl BGManager {
         self.bgs.read().unwrap().values().cloned().collect()
     }
 
+    /// BGs that have this worker in replica_set (for schedule/checkers).
+    pub fn get_bgs_on_worker(&self, worker_id: u32) -> Vec<BlockGroupInfo> {
+        self.bgs
+            .read()
+            .unwrap()
+            .values()
+            .filter(|bg| bg.replica_set.contains(&worker_id))
+            .cloned()
+            .collect()
+    }
+
+    /// BGs in the given state.
+    pub fn get_bgs_by_state(&self, state: curvine_common::state::BGState) -> Vec<BlockGroupInfo> {
+        self.bgs
+            .read()
+            .unwrap()
+            .values()
+            .filter(|bg| bg.state == state)
+            .cloned()
+            .collect()
+    }
+
+    /// BGs whose lease has expired at the given time (for LeaseChecker).
+    pub fn get_bgs_with_expired_lease(&self, now_ms: u64) -> Vec<BlockGroupInfo> {
+        self.bgs
+            .read()
+            .unwrap()
+            .values()
+            .filter(|bg| {
+                bg.lease_owner.expire_time_ms > 0 && bg.lease_owner.expire_time_ms < now_ms
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Build client-facing summary (buckets as BlockGroupInfoView) for the given table.
     pub fn build_table_summary(
         &self,
@@ -149,14 +188,97 @@ impl BGManager {
             bucket_count: table.bucket_count,
             epoch: table.epoch,
             buckets,
+            last_rebuild_ms: table.last_rebuild_ms,
         })
     }
 
-    /// Rebuild table buckets (reassign BGs to buckets). Epoch is incremented and persisted.
-    /// TODO: use pool_manager to recalculate which BG is in which bucket (e.g. after node change).
-    #[allow(dead_code)]
-    pub fn rebuild_table(&self, _table_id: u32) -> FsResult<()> {
-        // TODO: get table, recalculate buckets via pool_manager.select_workers_for_bg etc., update table, inc_epoch, put_table
+    /// TODO: Rebuild table buckets: for each bucket, verify the BG's replica_set workers are still alive.
+    /// If any BG has insufficient replicas, attempt to select new workers via PoolManager.
+    /// Epoch is incremented and persisted after any change.
+    pub fn rebuild_table(&self, table_id: u32) -> FsResult<()> {
+        let table = {
+            let tables = self.tables.read().unwrap();
+            tables
+                .get(&table_id)
+                .cloned()
+                .ok_or_else(|| FsError::common(format!("table {} not found", table_id)))?
+        };
+
+        // Collect BGs that need replica repair (snapshot under read lock)
+        let repair_list: Vec<(u32, Vec<u32>, Vec<u32>)> = {
+            let bgs = self.bgs.read().unwrap();
+            table
+                .buckets
+                .iter()
+                .filter_map(|&bg_id| {
+                    if bg_id == 0 {
+                        return None;
+                    }
+                    let bg = bgs.get(&bg_id)?;
+                    let alive: Vec<u32> = bg
+                        .replica_set
+                        .iter()
+                        .filter(|w| self.pool_manager.is_worker_available(**w))
+                        .copied()
+                        .collect();
+                    let desired = table.replica_count() as usize;
+                    if alive.len() < desired && !alive.is_empty() {
+                        Some((bg_id, alive, bg.replica_set.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        if repair_list.is_empty() {
+            return Ok(());
+        }
+
+        let mut changed = false;
+        for (bg_id, alive, old_replica_set) in &repair_list {
+            let needed = table.replica_count() as u16 - alive.len() as u16;
+            let new_workers = match self.pool_manager.select_workers_for_bg(
+                table.pool_id(),
+                needed,
+                table.policy.placement,
+                old_replica_set,
+            ) {
+                Ok(w) => w,
+                Err(_) => continue,
+            };
+            if new_workers.is_empty() {
+                continue;
+            }
+            let mut new_replicas = alive.clone();
+            new_replicas.extend(new_workers);
+
+            let mut bgs_w = self.bgs.write().unwrap();
+            if let Some(bg_mut) = bgs_w.get_mut(bg_id) {
+                bg_mut.replica_set = new_replicas;
+                bg_mut.epoch += 1;
+                let _ = self.store.put(bg_mut);
+                changed = true;
+            }
+        }
+
+        if changed {
+            self.bump_table_epoch(table_id)?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild all tables for a pool (e.g. after node join/remove). Calls rebuild_table for each table in the pool.
+    pub fn rebuild_tables_for_pool(&self, pool_id: u16) -> FsResult<()> {
+        let table_ids: Vec<u32> = self
+            .list_tables()
+            .into_iter()
+            .filter(|t| t.pool_id() == pool_id)
+            .map(|t| t.table_id)
+            .collect();
+        for table_id in table_ids {
+            let _ = self.rebuild_table(table_id);
+        }
         Ok(())
     }
 }
@@ -228,6 +350,7 @@ mod tests {
             bg_id: 2,
             state: Some(BGState::Degraded),
             replica_set: None,
+            lease_owner: None,
         })
         .unwrap();
         let got = mgr.get_bg(2).unwrap();
@@ -244,10 +367,32 @@ mod tests {
             bg_id: 3,
             state: None,
             replica_set: Some(vec![301, 302]),
+            lease_owner: None,
         })
         .unwrap();
         let got = mgr.get_bg(3).unwrap();
         assert_eq!(got.replica_set, vec![301, 302]);
+    }
+
+    #[test]
+    fn apply_update_bg_lease_owner() {
+        let mgr = test_manager();
+        let info = make_bg(5, 10, vec![500, 501]);
+        mgr.apply_create_bg(&BGEntry { op_ms: 0, info }).unwrap();
+        mgr.apply_update_bg(&BGUpdateEntry {
+            op_ms: 1,
+            bg_id: 5,
+            state: None,
+            replica_set: None,
+            lease_owner: Some(BGLease {
+                node_id: 501,
+                expire_time_ms: 99_000,
+            }),
+        })
+        .unwrap();
+        let got = mgr.get_bg(5).unwrap();
+        assert_eq!(got.lease_owner.node_id, 501);
+        assert_eq!(got.lease_owner.expire_time_ms, 99_000);
     }
 
     #[test]

@@ -25,7 +25,7 @@ pub struct PoolStats {
 }
 
 /// Pool info
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PoolInfo {
     pub pool_id: u16,
     pub name: String,

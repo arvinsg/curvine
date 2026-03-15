@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub(crate) mod http_handler;
 mod index;
 mod manager;
 mod store;
@@ -19,5 +20,6 @@ mod store;
 #[cfg(test)]
 mod manager_tests;
 
+pub use index::PoolIndex;
 pub use manager::{PoolManager, POOL_ID_HDD, POOL_ID_MEM, POOL_ID_SSD};
 pub use store::PoolStore;

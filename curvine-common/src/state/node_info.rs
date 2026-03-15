@@ -30,8 +30,14 @@ pub struct SystemStats {
     pub memory_usage: f32,
 }
 
+impl Default for NodePayload {
+    fn default() -> Self {
+        NodePayload::Worker(WorkerNodePayload::default())
+    }
+}
+
 /// Node info
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeInfo {
     #[serde(flatten)]
     pub base: NodeBase,

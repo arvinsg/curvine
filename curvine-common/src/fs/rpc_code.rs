@@ -78,6 +78,9 @@ pub enum RpcCode {
     GetConfig = 101,
     ListConfig = 102,
     SetConfig = 103,
+
+    // pd meta route.
+    GetMetaRouteSummary = 104,
 }
 
 impl fmt::Display for RpcCode {

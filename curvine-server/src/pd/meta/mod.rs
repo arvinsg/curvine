@@ -12,13 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod error;
 pub(crate) mod http_handler;
 mod manager;
-pub mod state_machine;
 mod store;
-mod table;
 
-pub use manager::BGManager;
-pub use store::BGStore;
-pub use table::BGTable;
-pub use curvine_common::state::BGTableSummary;
+pub use error::MetaError;
+pub use manager::MetaManager;
+pub use store::RouteStore;

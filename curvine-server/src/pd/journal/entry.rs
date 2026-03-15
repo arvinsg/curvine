@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::{BlockGroupInfo, ConfigInfo, MountInfo, NodeInfo, NodeState};
+use curvine_common::state::BGLease;
+use curvine_common::state::{
+    BlockGroupInfo, ConfigInfo, MountInfo, NodeInfo, NodeState, PathRouteEntry,
+};
 use serde::{Deserialize, Serialize};
 
 // mount
@@ -68,6 +71,7 @@ pub struct BGUpdateEntry {
     pub bg_id: u32,
     pub state: Option<curvine_common::state::BGState>,
     pub replica_set: Option<Vec<u32>>,
+    pub lease_owner: Option<BGLease>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -85,4 +89,8 @@ pub enum PdEntry {
     CreateBG(BGEntry),
     UpdateBG(BGUpdateEntry),
     DeleteBG(u32),
+
+    // Path route (MetaNode Federation static mode)
+    AddPathRoute(PathRouteEntry),
+    RemovePathRoute(String),
 }

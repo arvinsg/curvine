@@ -15,7 +15,7 @@
 use curvine_common::state::{PoolInfo, PoolStats, StorageType};
 use std::collections::{HashMap, HashSet};
 
-/// In-memory index for pools and worker->pools mapping.
+/// In-memory index for pools and worker->pools mapping
 pub struct PoolIndex {
     pools: HashMap<u16, PoolInfo>,
     by_media: HashMap<StorageType, u16>,
@@ -68,7 +68,9 @@ impl PoolIndex {
     }
 
     pub fn get_pool_by_media(&self, media: StorageType) -> Option<&PoolInfo> {
-        self.by_media.get(&media).and_then(|&id| self.pools.get(&id))
+        self.by_media
+            .get(&media)
+            .and_then(|&id| self.pools.get(&id))
     }
 
     pub fn get_pools_by_worker(&self, worker_id: u32) -> Option<&HashSet<u16>> {
@@ -105,7 +107,10 @@ impl PoolIndex {
         self.worker_to_pools
             .get(&worker_id)
             .and_then(|pool_ids| {
-                pool_ids.iter().find_map(|&pid| self.pools.get(&pid)).map(|p| p.media == storage_type)
+                pool_ids
+                    .iter()
+                    .find_map(|&pid| self.pools.get(&pid))
+                    .map(|p| p.media == storage_type)
             })
             .unwrap_or(false)
     }
@@ -206,7 +211,14 @@ mod tests {
         use curvine_common::state::PoolStats;
         let mut idx = PoolIndex::new();
         idx.insert_pool(pool_info(2, "ssd", StorageType::Ssd));
-        idx.update_pool_stats(2, PoolStats { capacity_bytes: 1000, available_bytes: 500, used_bytes: 500 });
+        idx.update_pool_stats(
+            2,
+            PoolStats {
+                capacity_bytes: 1000,
+                available_bytes: 500,
+                used_bytes: 500,
+            },
+        );
         let p = idx.get_pool(2).unwrap();
         assert_eq!(p.stats.capacity_bytes, 1000);
         assert_eq!(p.stats.available_bytes, 500);

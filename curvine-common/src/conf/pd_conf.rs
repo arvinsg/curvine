@@ -24,6 +24,32 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::read_to_string;
 
+/// MetaNode-related config: service mode and federation routing. Grouped for clarity.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct MetaNodeConf {
+    /// Service mode: "proxy" | "shard" | "federation". Only federation is implemented.
+    #[serde(default)]
+    pub mode: String,
+
+    /// Federation route mode: "static" or "hash". Used when mode = "federation".
+    #[serde(default)]
+    pub route_mode: String,
+
+    /// Federation hash level (1-based path component). Used when route_mode = "hash".
+    #[serde(default)]
+    pub hash_level: u8,
+}
+
+impl Default for MetaNodeConf {
+    fn default() -> Self {
+        Self {
+            mode: "federation".to_string(),
+            route_mode: "hash".to_string(),
+            hash_level: 2,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PdConf {
     pub cluster_id: String,
@@ -39,6 +65,10 @@ pub struct PdConf {
 
     #[serde(default)]
     pub journal: JournalConf,
+
+    /// MetaNode mode and federation routing (see [metanode] section in TOML).
+    #[serde(default)]
+    pub metanode: MetaNodeConf,
 
     /// Dynamic config defaults. key → default_value (String).
     #[serde(default)]
@@ -59,6 +89,7 @@ impl Default for PdConf {
 
             data_dir: default_data_dir(),
             journal: JournalConf::default(),
+            metanode: MetaNodeConf::default(),
             dynamic_config: HashMap::new(),
         }
     }

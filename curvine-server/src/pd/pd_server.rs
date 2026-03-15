@@ -12,19 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::pd::bg::{BGManager, BGStore};
+use crate::pd::cluster::ClusterManager;
 use crate::pd::config::ConfigManager;
 use crate::pd::http_handler::PdHttpHandler;
 use crate::pd::journal::PdAppStorage;
+use crate::pd::meta::{MetaManager, RouteStore};
 use crate::pd::mount::MountManager;
 use crate::pd::node::NodeManager;
 use crate::pd::node::NodeStore;
-use crate::pd::bg::{BGManager, BGStore};
 use crate::pd::pool::{PoolManager, PoolStore};
 use crate::pd::store::{KvStore, RocksKvEngine};
 use curvine_common::conf::PdConf;
 use curvine_common::raft::storage::{LogStorage, RocksLogStorage};
 use curvine_common::raft::{RaftClient, RaftJournal, RoleMonitor};
 use curvine_common::rocksdb::DBEngine;
+use curvine_common::state::{FederationRouteMode, MetaNodeMode};
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::info;
 use orpc::common::FileUtils;
@@ -38,6 +41,21 @@ use std::sync::Arc;
 
 use crate::pd::rpc_handler::PdRpcHandler;
 
+fn parse_metanode_mode(s: &str) -> MetaNodeMode {
+    match s.to_lowercase().as_str() {
+        "proxy" => MetaNodeMode::Proxy,
+        "shard" => MetaNodeMode::Shard,
+        _ => MetaNodeMode::Federation,
+    }
+}
+
+fn parse_federation_route_mode(s: &str) -> FederationRouteMode {
+    match s.to_lowercase().as_str() {
+        "static" => FederationRouteMode::Static,
+        _ => FederationRouteMode::Hash,
+    }
+}
+
 type PdRaftJournal = RaftJournal<RocksLogStorage, PdAppStorage>;
 
 #[derive(Clone)]
@@ -45,13 +63,18 @@ struct PdService {
     conf: PdConf,
     config_manager: Arc<ConfigManager>,
     mount_manager: Arc<MountManager>,
+    cluster_manager: Arc<ClusterManager>,
 }
 
 impl HandlerService for PdService {
     type Item = PdRpcHandler;
 
     fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
-        PdRpcHandler::new(self.config_manager.clone(), self.mount_manager.clone())
+        PdRpcHandler::new(
+            self.config_manager.clone(),
+            self.mount_manager.clone(),
+            self.cluster_manager.clone(),
+        )
     }
 }
 
@@ -59,7 +82,11 @@ impl WebHandlerService for PdService {
     type Item = PdHttpHandler;
 
     fn get_handler(&self) -> Self::Item {
-        PdHttpHandler::new(self.config_manager.clone(), self.mount_manager.clone())
+        PdHttpHandler::new(
+            self.config_manager.clone(),
+            self.mount_manager.clone(),
+            self.cluster_manager.clone(),
+        )
     }
 }
 
@@ -85,12 +112,14 @@ impl Pd {
             FileUtils::delete_path(&db_conf.data_dir, true)?;
         }
 
+        // TODO:
         db_conf = db_conf
             .add_cf("config")
             .add_cf("mount")
             .add_cf("node")
             .add_cf("pool")
-            .add_cf("bg");
+            .add_cf("bg")
+            .add_cf("meta");
         let db = DBEngine::new(db_conf, false)?;
         let engine = Arc::new(RocksKvEngine::new(db));
         let store: Arc<dyn KvStore> = engine.clone();
@@ -121,14 +150,37 @@ impl Pd {
         let bg_manager = Arc::new(BGManager::new(bg_store, pool_manager.clone()));
         bg_manager.restore()?;
 
+        let metanode_mode = parse_metanode_mode(&conf.metanode.mode);
+        let federation_route_mode = Some(parse_federation_route_mode(&conf.metanode.route_mode));
+        let route_store = Arc::new(RouteStore::new(store.clone()));
+        let meta_manager = Arc::new(MetaManager::new(
+            metanode_mode,
+            federation_route_mode,
+            conf.metanode.hash_level,
+            node_manager.clone(),
+            route_store,
+            config_manager.clone(),
+        ));
+        meta_manager.restore()?;
+
         let app_store = PdAppStorage::new(
             engine,
             snapshot_dir,
             config_manager.clone(),
             mount_manager.clone(),
-            Some(node_manager),
-            Some(bg_manager),
+            Some(node_manager.clone()),
+            Some(bg_manager.clone()),
+            Some(meta_manager.clone()),
         );
+
+        let cluster_manager = Arc::new(ClusterManager::new(
+            node_manager,
+            pool_manager,
+            bg_manager,
+            config_manager.clone(),
+            mount_manager.clone(),
+            Some(meta_manager),
+        ));
 
         let role_monitor = RoleMonitor::new();
         let raft_journal = PdRaftJournal::new(
@@ -145,6 +197,7 @@ impl Pd {
             conf: conf.clone(),
             config_manager,
             mount_manager,
+            cluster_manager: cluster_manager,
         };
         let rpc_server = RpcServer::with_rt(rt.clone(), rpc_conf, service.clone());
         let web_server = WebServer::with_rt(rt.clone(), conf.pd_web_conf(), service.clone());

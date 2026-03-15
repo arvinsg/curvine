@@ -27,11 +27,12 @@ pub fn table_id_pool_id(table_id: u32) -> u16 {
 }
 
 /// Built by PD from BGTable + NodeManager; used by client SDK.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BGTableSummary {
     pub table_id: u32,
     pub bucket_count: u32,
     pub epoch: u64,
+    pub last_rebuild_ms: u64,
     pub buckets: Vec<super::BlockGroupInfoView>,
 }
 
@@ -87,6 +88,7 @@ mod tests {
             table_id: (2 << 16) | 3,
             bucket_count: 4,
             epoch: 1,
+            last_rebuild_ms: 0,
             buckets: vec![
                 sample_view(1, 0),
                 sample_view(2, 0),
@@ -104,6 +106,7 @@ mod tests {
             table_id: 1,
             bucket_count: 4,
             epoch: 0,
+            last_rebuild_ms: 0,
             buckets: vec![
                 sample_view(10, 1),
                 sample_view(20, 1),
@@ -123,6 +126,7 @@ mod tests {
             table_id: 1,
             bucket_count: 0,
             epoch: 0,
+            last_rebuild_ms: 0,
             buckets: vec![],
         };
         assert!(s.lookup(b"x").is_none());
