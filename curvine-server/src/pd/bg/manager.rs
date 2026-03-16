@@ -17,11 +17,36 @@ use super::{BGStore, BGTable};
 use crate::pd::journal::entry::{BGEntry, BGUpdateEntry};
 use crate::pd::node::NodeManager;
 use crate::pd::pool::PoolManager;
-use curvine_common::state::{BGTableSummary, BlockGroupInfo};
+use curvine_common::state::{
+    BlockGroupInfo, BlockGroupInfoView, ReplicaInfo, BGTableSummary,
+};
 use curvine_common::{FsError, FsResult};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock;
+
+/// Expand BlockGroupInfo to view (replica_set with address and state). BG module owns this; node module stays agnostic of pool/BG.
+fn block_group_info_to_view(bg: &BlockGroupInfo, node_manager: &NodeManager) -> BlockGroupInfoView {
+    let replica_set: Vec<ReplicaInfo> = bg
+        .replica_set
+        .iter()
+        .filter_map(|&node_id| {
+            node_manager.get_node(node_id).map(|node| ReplicaInfo {
+                node_id,
+                address: node.base.address.clone(),
+                state: node.state,
+            })
+        })
+        .collect();
+    BlockGroupInfoView {
+        bg_id: bg.bg_id,
+        table_id: bg.table_id,
+        epoch: bg.epoch,
+        replica_set,
+        state: bg.state,
+        lease_owner: bg.lease_owner.clone(),
+    }
+}
 
 pub struct BGManager {
     tables: RwLock<HashMap<u32, BGTable>>,
@@ -177,7 +202,7 @@ impl BGManager {
             .buckets
             .iter()
             .filter_map(|&bg_id| bgs.get(&bg_id).cloned())
-            .map(|bg| node_manager.block_group_info_to_view(&bg))
+            .map(|bg| block_group_info_to_view(bg, node_manager))
             .collect();
         drop(bgs);
         if buckets.len() != table.buckets.len() {

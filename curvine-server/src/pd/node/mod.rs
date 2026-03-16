@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod error;
 mod heartbeat;
 pub(crate) mod http_handler;
 mod index;
@@ -21,6 +22,7 @@ mod store;
 mod worker_handler;
 mod meta_handler;
 
+pub use error::NodeError;
 pub use heartbeat::HeartbeatHandler;
 pub use index::NodeIndex;
 pub use manager::NodeManager;

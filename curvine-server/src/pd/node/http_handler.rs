@@ -14,14 +14,9 @@
 
 use crate::pd::http::ApiResponse;
 use crate::pd::http_handler::PdHttpHandler;
-use axum::{
-    extract::Path as PathParam,
-    http::StatusCode,
-    response::IntoResponse,
-    Extension, Json,
-};
-use curvine_common::state::{NodeInfo, NodeState, NodeType};
-use serde::Deserialize;
+use crate::pd::node::NodeError;
+use axum::{extract::Path as PathParam, response::IntoResponse, Extension};
+use curvine_common::state::{NodeInfo, NodeType};
 use std::sync::Arc;
 
 /// GET /api/v1/node/:node_type — list nodes by type ("worker" or "meta").
@@ -34,10 +29,11 @@ pub async fn list_nodes_by_type_handler(
         "worker" => NodeType::Worker,
         "meta" => NodeType::Meta,
         _ => {
+            let err = NodeError::invalid_node_type(node_type);
             return ApiResponse::<Vec<NodeInfo>>::error(
-                "INVALID_INPUT".to_string(),
-                format!("unknown node type: {}, expected worker or meta", node_type),
-                StatusCode::BAD_REQUEST,
+                err.code().into(),
+                err.to_string(),
+                err.status_code(),
             );
         }
     };
@@ -53,33 +49,9 @@ pub async fn get_node_detail_handler(
     let cluster = &instance.cluster_manager;
     match cluster.node_manager().get_node(node_id) {
         Some(node) => ApiResponse::success(node),
-        None => ApiResponse::<NodeInfo>::error(
-            "NOT_FOUND".to_string(),
-            format!("node {} not found", node_id),
-            StatusCode::NOT_FOUND,
-        ),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct DecommissionBody {
-    pub node_id: u32,
-    #[serde(default)]
-    pub wait_migration: bool,
-}
-
-/// POST /api/v1/node/decommission — decommission a node.
-pub async fn decommission_node_handler(
-    Extension(instance): Extension<Arc<PdHttpHandler>>,
-    Json(body): Json<DecommissionBody>,
-) -> impl IntoResponse {
-    let cluster = &instance.cluster_manager;
-    match cluster.handle_decommission(body.node_id, body.wait_migration) {
-        Ok(state) => ApiResponse::success(state),
-        Err(e) => ApiResponse::<NodeState>::error(
-            "DECOMMISSION_ERROR".to_string(),
-            e.to_string(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-        ),
+        None => {
+            let err = NodeError::node_not_found(node_id);
+            ApiResponse::<NodeInfo>::error(err.code().into(), err.to_string(), err.status_code())
+        }
     }
 }

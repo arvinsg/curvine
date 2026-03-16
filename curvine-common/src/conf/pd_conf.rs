@@ -90,6 +90,7 @@ impl Default for PdConf {
             data_dir: default_data_dir(),
             journal: JournalConf::default(),
             metanode: MetaNodeConf::default(),
+            // dynamic_config is populated from pd config file (if any).
             dynamic_config: HashMap::new(),
         }
     }

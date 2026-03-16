@@ -34,8 +34,9 @@ impl HandlerRegistry {
         self.handlers.insert(node_type, handler);
     }
 
-    pub fn get(&self, node_type: NodeType) -> Option<Arc<dyn HeartbeatHandler>> {
-        self.handlers.get(&node_type).cloned()
+    /// Get handler by node type as a trait object reference.
+    pub fn get(&self, node_type: NodeType) -> Option<&(dyn HeartbeatHandler + 'static)> {
+        self.handlers.get(&node_type).map(|h| h.as_ref())
     }
 
     pub fn supports(&self, node_type: NodeType) -> bool {

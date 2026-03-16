@@ -16,8 +16,8 @@ use super::{HandlerRegistry, HeartbeatHandler, MetaHeartbeatHandler, WorkerHeart
 use crate::pd::config::ConfigManager;
 use crate::pd::journal::entry::{NodeEntry, NodeStateEntry};
 use curvine_common::state::{
-    BlockGroupInfo, BlockGroupInfoView, HeartbeatPayload, HeartbeatRequest, HeartbeatResponse,
-    NodeInfo, NodePayload, NodeState, NodeType, ReplicaInfo, RegisterRequest,
+    HeartbeatPayload, HeartbeatRequest, HeartbeatResponse, NodeInfo, NodePayload, NodeState,
+    NodeType, RegisterRequest,
 };
 use curvine_common::{FsError, FsResult};
 use std::sync::Arc;
@@ -50,12 +50,13 @@ impl NodeManager {
         self.handler_registry.register(handler);
     }
 
-    fn get_handler(&self, node_type: NodeType) -> FsResult<Arc<dyn HeartbeatHandler>> {
-        self.handler_registry.get(node_type).ok_or_else(|| {
-            FsError::common(format!("unsupported node type: {:?}", node_type))
-        })
+    fn get_handler(&self, node_type: NodeType) -> FsResult<&(dyn HeartbeatHandler + 'static)> {
+        self.handler_registry
+            .get(node_type)
+            .ok_or_else(|| FsError::common(format!("unsupported node type: {:?}", node_type)))
     }
 
+    //////////////////////////////////////////////////////////////////////////////////////////////////////
     /// Builds NodeInfo and new_epoch for registration. Caller is responsible for proposing PdEntry::RegisterNode.
     pub fn prepare_register(&self, req: RegisterRequest) -> FsResult<(NodeInfo, u64)> {
         let handler = self.get_handler(req.base.node_type)?;
@@ -83,9 +84,9 @@ impl NodeManager {
     pub fn handle_heartbeat(&self, req: HeartbeatRequest) -> FsResult<HeartbeatResponse> {
         let handler = self.get_handler(req.node_type)?;
         let mut index = self.index.write().unwrap();
-        let node = index.get_by_id_mut(req.node_id).ok_or_else(|| {
-            FsError::common(format!("node {} not found", req.node_id))
-        })?;
+        let node = index
+            .get_by_id_mut(req.node_id)
+            .ok_or_else(|| FsError::common(format!("node {} not found", req.node_id)))?;
         handler.validate_consistency(node, &req)?;
         node.last_heartbeat_ms = req.timestamp_ms;
         match &req.payload {
@@ -130,6 +131,7 @@ impl NodeManager {
         }
         Ok(())
     }
+    //////////////////////////////////////////////////////////////////////////////////////////////
 
     /// Restore in-memory index from store (call on startup).
     pub fn restore(&self) -> FsResult<()> {
@@ -147,29 +149,6 @@ impl NodeManager {
         index.get_by_id(node_id).cloned()
     }
 
-    /// Expand BlockGroupInfo to view (replica_set with address and state).
-    pub fn block_group_info_to_view(&self, bg: &BlockGroupInfo) -> BlockGroupInfoView {
-        let replica_set: Vec<ReplicaInfo> = bg
-            .replica_set
-            .iter()
-            .filter_map(|&node_id| {
-                self.get_node(node_id).map(|node| ReplicaInfo {
-                    node_id,
-                    address: node.base.address.clone(),
-                    state: node.state,
-                })
-            })
-            .collect();
-        BlockGroupInfoView {
-            bg_id: bg.bg_id,
-            table_id: bg.table_id,
-            epoch: bg.epoch,
-            replica_set,
-            state: bg.state,
-            lease_owner: bg.lease_owner.clone(),
-        }
-    }
-
     /// Get nodes by type.
     pub fn get_nodes_by_type(&self, node_type: NodeType) -> Vec<NodeInfo> {
         let index = self.index.read().unwrap();
@@ -182,16 +161,7 @@ impl NodeManager {
         index.get_by_state(state).into_iter().cloned().collect()
     }
 
-    /// Get Worker nodes in the given state (for schedule checkers).
-    pub fn get_workers_by_state(&self, state: NodeState) -> Vec<NodeInfo> {
-        self.get_nodes_by_type(NodeType::Worker)
-            .into_iter()
-            .filter(|n| n.state == state)
-            .collect()
-    }
-
     /// Mark nodes that have not heartbeaten within timeout as Lost (in-memory only).
-    /// Call periodically; actual Raft propose for UpdateNodeState can be done by caller.
     pub fn check_heartbeat_timeout(&self, now_ms: u64, timeout_ms: u64) -> Vec<u32> {
         let mut index = self.index.write().unwrap();
         let mut marked = Vec::new();
