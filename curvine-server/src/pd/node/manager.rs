@@ -30,7 +30,6 @@ pub struct NodeManager {
     index: Arc<RwLock<NodeIndex>>,
     store: Arc<NodeStore>,
     handler_registry: HandlerRegistry,
-    #[allow(dead_code)] // TODO: used for pd.node.heartbeat_timeout_ms etc.
     config_manager: Arc<ConfigManager>,
 }
 
@@ -104,11 +103,7 @@ impl NodeManager {
             }
         }
         drop(index);
-        let mut resp = handler.handle_heartbeat(req)?;
-        // Fill versions when config/mount managers expose get_version()
-        resp.config_version = 0;
-        resp.mount_version = 0;
-        Ok(resp)
+        handler.handle_heartbeat(req)
     }
 
     /// Apply RegisterNode entry (called from PdAppStorage when Raft applies).
@@ -187,9 +182,16 @@ impl NodeManager {
         index.get_by_state(state).into_iter().cloned().collect()
     }
 
+    /// Get Worker nodes in the given state (for schedule checkers).
+    pub fn get_workers_by_state(&self, state: NodeState) -> Vec<NodeInfo> {
+        self.get_nodes_by_type(NodeType::Worker)
+            .into_iter()
+            .filter(|n| n.state == state)
+            .collect()
+    }
+
     /// Mark nodes that have not heartbeaten within timeout as Lost (in-memory only).
     /// Call periodically; actual Raft propose for UpdateNodeState can be done by caller.
-    /// TODO:
     pub fn check_heartbeat_timeout(&self, now_ms: u64, timeout_ms: u64) -> Vec<u32> {
         let mut index = self.index.write().unwrap();
         let mut marked = Vec::new();
@@ -207,10 +209,9 @@ impl NodeManager {
         marked
     }
 
-    /// Returns heartbeat timeout in ms (from config or default).
-    #[allow(dead_code)] // TODO: used when check_heartbeat_timeout is wired to a timer
-    fn heartbeat_timeout_ms(&self) -> u64 {
-        // TODO: read from config_manager pd.node.heartbeat_timeout_ms
-        60_000
+    /// Returns heartbeat timeout in ms (from config or default 60s).
+    pub fn heartbeat_timeout_ms(&self) -> u64 {
+        self.config_manager
+            .get_u64("pd.node.heartbeat_timeout_ms", 60_000)
     }
 }

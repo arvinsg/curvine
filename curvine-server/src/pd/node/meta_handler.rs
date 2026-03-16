@@ -14,13 +14,11 @@
 
 use super::HeartbeatHandler;
 use curvine_common::state::{
-    HeartbeatRequest, HeartbeatResponse, HeartbeatResponsePayload, MetaHeartbeatResponse,
-    MetaNodePayload, NodeInfo, NodePayload, NodeState, NodeType, RegisterRequest,
-    RegisterRequestPayload,
+    HeartbeatRequest, HeartbeatResponse, HeartbeatResponsePayload, MetaHeartbeatResponse, NodeInfo,
+    NodePayload, NodeState, NodeType, RegisterRequest,
 };
 use curvine_common::FsResult;
 
-/// Heartbeat handler for Meta nodes.
 pub struct MetaHeartbeatHandler;
 
 impl MetaHeartbeatHandler {
@@ -40,24 +38,23 @@ impl HeartbeatHandler for MetaHeartbeatHandler {
         NodeType::Meta
     }
 
-    // TODO
+    // TODO: 1. 没有校验节点的信息，或更新节点的信息 2. 返回的信息也有误
     fn handle_register(&self, req: RegisterRequest) -> FsResult<NodeInfo> {
         let payload = match &req.payload {
-            RegisterRequestPayload::Meta(p) => p.clone(),
+            NodePayload::Meta(p) => p.clone(),
             _ => return Err(curvine_common::FsError::common("expected Meta payload")),
         };
-        let info = NodeInfo {
+        Ok(NodeInfo {
             base: req.base.clone(),
             epoch: 0,
             state: NodeState::Starting,
             last_heartbeat_ms: 0,
             sys_stats: Default::default(),
             payload: NodePayload::Meta(payload),
-        };
-        Ok(info)
+        })
     }
 
-    // TODO
+    // TODO: 1. 没有针对 metanode 特点做针对校验
     fn handle_heartbeat(&self, req: HeartbeatRequest) -> FsResult<HeartbeatResponse> {
         Ok(HeartbeatResponse {
             error: None,
@@ -72,6 +69,7 @@ impl HeartbeatHandler for MetaHeartbeatHandler {
         })
     }
 
+    // TODO: 1. 必要性待确定
     fn validate_consistency(&self, node: &NodeInfo, req: &HeartbeatRequest) -> FsResult<()> {
         if node.epoch != req.epoch {
             return Err(curvine_common::FsError::common(format!(

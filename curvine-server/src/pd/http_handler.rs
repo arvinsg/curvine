@@ -73,14 +73,12 @@ impl RouterHandler for PdHttpHandler {
             .route("/api/v1/bg/table/:table_id", get(get_bg_table_handler))
             .route("/api/v1/bg/rebuild", post(rebuild_bg_handler))
             // Meta
-            .route("/api/v1/meta/route", get(get_meta_route_handler))
-            .route("/api/v1/meta/route", post(post_meta_route_handler))
-            .route("/api/v1/meta/route", put(put_meta_route_handler))
-            .route("/api/v1/meta/route", delete(delete_meta_route_handler))
+            .route("/api/v1/meta/route", get(get_path_route_handler))
+            .route("/api/v1/meta/route", post(post_path_route_handler))
+            .route("/api/v1/meta/route", put(put_path_route_handler))
+            .route("/api/v1/meta/route", delete(delete_path_route_handler))
             .route("/api/v1/meta/group", get(list_meta_groups_handler))
             .route("/api/v1/meta/group/:group_id", get(get_meta_group_handler))
-            .route("/api/v1/meta/node", get(list_meta_nodes_handler))
-            .route("/api/v1/meta/node/:node_id", get(get_meta_node_handler))
             .layer(Extension(instance))
     }
 }

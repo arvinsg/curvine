@@ -15,11 +15,10 @@
 use super::HeartbeatHandler;
 use curvine_common::state::{
     HeartbeatRequest, HeartbeatResponse, HeartbeatResponsePayload, NodeInfo, NodePayload,
-    NodeState, NodeType, RegisterRequest, RegisterRequestPayload, WorkerHeartbeatResponse,
+    NodeState, NodeType, RegisterRequest, WorkerHeartbeatResponse,
 };
 use curvine_common::FsResult;
 
-/// Heartbeat handler for Worker nodes.
 pub struct WorkerHeartbeatHandler;
 
 impl WorkerHeartbeatHandler {
@@ -39,26 +38,24 @@ impl HeartbeatHandler for WorkerHeartbeatHandler {
         NodeType::Worker
     }
 
-    // TODO
+    // TODO: 和 MetaNode 存在同样的问题
     fn handle_register(&self, req: RegisterRequest) -> FsResult<NodeInfo> {
         let payload = match &req.payload {
-            RegisterRequestPayload::Worker(p) => p.clone(),
+            NodePayload::Worker(p) => p.clone(),
             _ => return Err(curvine_common::FsError::common("expected Worker payload")),
         };
-        let info = NodeInfo {
+        Ok(NodeInfo {
             base: req.base.clone(),
-            epoch: 0, // NodeManager sets actual epoch
+            epoch: 0,
             state: NodeState::Starting,
             last_heartbeat_ms: 0,
             sys_stats: Default::default(),
             payload: NodePayload::Worker(payload),
-        };
-        Ok(info)
+        })
     }
 
-    // TODO
+    // TODO: 和 MetaNode 存在同样的问题
     fn handle_heartbeat(&self, req: HeartbeatRequest) -> FsResult<HeartbeatResponse> {
-        // Stub: return empty BG lists; real implementation will use index/config_manager
         Ok(HeartbeatResponse {
             error: None,
             epoch: req.epoch,
@@ -69,6 +66,7 @@ impl HeartbeatHandler for WorkerHeartbeatHandler {
         })
     }
 
+    // TODO: 和 MetaNode 存在同样的问题
     fn validate_consistency(&self, node: &NodeInfo, req: &HeartbeatRequest) -> FsResult<()> {
         if node.epoch != req.epoch {
             return Err(curvine_common::FsError::common(format!(
