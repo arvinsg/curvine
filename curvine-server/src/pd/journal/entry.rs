@@ -13,9 +13,7 @@
 // limitations under the License.
 
 use curvine_common::state::BGLease;
-use curvine_common::state::{
-    BlockGroupInfo, ConfigInfo, MountInfo, NodeInfo, NodeState, PathRouteEntry,
-};
+use curvine_common::state::{BlockGroupInfo, ConfigInfo, MountInfo, NodeInfo, PathRouteEntry};
 use serde::{Deserialize, Serialize};
 
 // mount
@@ -39,22 +37,11 @@ pub struct ConfigEntry {
     pub(crate) info: ConfigInfo,
 }
 
-/// Node registration entry (Raft log)
+/// Node entry (Raft log) — used for both registration and periodic save
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct NodeEntry {
     pub op_ms: u64,
     pub info: NodeInfo,
-    pub new_epoch: u64,
-}
-
-/// Node state change entry (Raft log)
-#[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct NodeStateEntry {
-    pub op_ms: u64,
-    pub node_id: u32,
-    pub old_state: NodeState,
-    pub new_state: NodeState,
-    pub new_epoch: Option<u64>,
 }
 
 /// BG create entry (Raft log)
@@ -83,7 +70,7 @@ pub enum PdEntry {
 
     // Node management
     RegisterNode(NodeEntry),
-    UpdateNodeState(NodeStateEntry),
+    SaveNode(NodeEntry),
 
     // BG management
     CreateBG(BGEntry),

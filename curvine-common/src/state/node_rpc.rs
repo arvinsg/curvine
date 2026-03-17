@@ -21,6 +21,8 @@ use crate::state::BlockGroupInfo;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use super::{PeerInfo, RwPolicy};
+
 /// Node register request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
@@ -59,8 +61,11 @@ pub struct WorkerHeartbeatPayload {
 /// Meta heartbeat payload (is_leader, group_epoch, stats)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MetaHeartbeatPayload {
-    pub is_leader: bool,
+    pub group_id: u32,
     pub group_epoch: u64,
+    pub is_leader: bool,
+    pub peers: Vec<PeerInfo>,
+    pub rw_policy: RwPolicy,
     pub inodes_stats: InodesStats,
     pub sys_stats: SystemStats,
 }

@@ -16,7 +16,7 @@ use crate::pd::bg::{BGManager, BGStore};
 use crate::pd::cluster::ClusterManager;
 use crate::pd::config::ConfigManager;
 use crate::pd::http_handler::PdHttpHandler;
-use crate::pd::journal::PdAppStorage;
+use crate::pd::journal::{self, PdAppStorage};
 use crate::pd::meta::{MetaManager, RouteStore};
 use crate::pd::mount::MountManager;
 use crate::pd::node::NodeManager;
@@ -130,12 +130,15 @@ impl Pd {
         let journal_rt: Arc<Runtime> = conf.journal.create_runtime();
         let raft_client = RaftClient::from_conf(journal_rt.clone(), &conf.journal);
 
+        // Unified journal client for all Raft propose operations.
+        let journal_client = Arc::new(journal::Client::new(raft_client));
+
         let config_manager = Arc::new(ConfigManager::new(
             store.clone(),
-            raft_client.clone(),
+            journal_client.clone(),
             conf.dynamic_config.clone(),
         ));
-        let mount_manager = Arc::new(MountManager::new(store.clone(), raft_client.clone()));
+        let mount_manager = Arc::new(MountManager::new(store.clone(), journal_client.clone()));
         mount_manager.restore()?;
 
         let node_store = Arc::new(NodeStore::new(store.clone()));
@@ -159,7 +162,7 @@ impl Pd {
             conf.metanode.hash_level,
             node_manager.clone(),
             route_store,
-            config_manager.clone(),
+            journal_client.clone(),
         ));
         meta_manager.restore()?;
 
@@ -180,6 +183,7 @@ impl Pd {
             config_manager.clone(),
             mount_manager.clone(),
             Some(meta_manager),
+            journal_client,
         ));
 
         let role_monitor = RoleMonitor::new();
@@ -197,7 +201,7 @@ impl Pd {
             conf: conf.clone(),
             config_manager,
             mount_manager,
-            cluster_manager: cluster_manager,
+            cluster_manager,
         };
         let rpc_server = RpcServer::with_rt(rt.clone(), rpc_conf, service.clone());
         let web_server = WebServer::with_rt(rt.clone(), conf.pd_web_conf(), service.clone());

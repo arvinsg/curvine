@@ -15,9 +15,9 @@
 use crate::pd::bg::BGManager;
 use crate::pd::config::ConfigManager;
 use crate::pd::journal::entry::PdEntry;
+use crate::pd::meta::MetaManager;
 use crate::pd::mount::MountManager;
 use crate::pd::node::NodeManager;
-use crate::pd::meta::MetaManager;
 use crate::pd::store::RocksKvEngine;
 use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::AppStorage;
@@ -78,53 +78,46 @@ impl PdAppStorage {
                     entry.info.base.node_id, entry.info.base.address
                 );
                 if let Some(ref nm) = self.node_manager {
-                    nm.apply_register_node(&entry)
-                        .map_err(|e| RaftError::from(e.to_string()))?;
+                    nm.apply_register_node(&entry)?;
                 }
             }
-            PdEntry::UpdateNodeState(entry) => {
+            PdEntry::SaveNode(entry) => {
                 info!(
-                    "Apply UpdateNodeState node_id:{} {:?} -> {:?}",
-                    entry.node_id, entry.old_state, entry.new_state
+                    "Apply SaveNode node_id:{}, state:{:?}",
+                    entry.info.base.node_id, entry.info.state
                 );
                 if let Some(ref nm) = self.node_manager {
-                    nm.apply_update_state(&entry)
-                        .map_err(|e| RaftError::from(e.to_string()))?;
+                    nm.apply_save_node(&entry)?;
                 }
             }
             PdEntry::CreateBG(entry) => {
                 info!("Apply CreateBG bg_id={}", entry.info.bg_id);
                 if let Some(ref bm) = self.bg_manager {
-                    bm.apply_create_bg(&entry)
-                        .map_err(|e| RaftError::from(e.to_string()))?;
+                    bm.apply_create_bg(&entry)?;
                 }
             }
             PdEntry::UpdateBG(entry) => {
                 info!("Apply UpdateBG bg_id={}", entry.bg_id);
                 if let Some(ref bm) = self.bg_manager {
-                    bm.apply_update_bg(&entry)
-                        .map_err(|e| RaftError::from(e.to_string()))?;
+                    bm.apply_update_bg(&entry)?;
                 }
             }
             PdEntry::DeleteBG(bg_id) => {
                 info!("Apply DeleteBG bg_id={}", bg_id);
                 if let Some(ref bm) = self.bg_manager {
-                    bm.apply_delete_bg(bg_id)
-                        .map_err(|e| RaftError::from(e.to_string()))?;
+                    bm.apply_delete_bg(bg_id)?;
                 }
             }
             PdEntry::AddPathRoute(ref entry) => {
                 info!("Apply AddPathRoute path={}", entry.path);
                 if let Some(ref pt) = self.meta_manager {
-                    pt.apply_add_route(entry)
-                        .map_err(|e| RaftError::from(e.to_string()))?;
+                    pt.apply_add_route(entry)?;
                 }
             }
             PdEntry::RemovePathRoute(ref path) => {
                 info!("Apply RemovePathRoute path={}", path);
                 if let Some(ref pt) = self.meta_manager {
-                    pt.apply_remove_route(path)
-                        .map_err(|e| RaftError::from(e.to_string()))?;
+                    pt.apply_remove_route(path)?;
                 }
             }
         }

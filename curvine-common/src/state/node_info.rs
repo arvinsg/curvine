@@ -43,9 +43,10 @@ pub struct NodeInfo {
     pub base: NodeBase,
     pub epoch: u64,
     pub state: NodeState,
+    pub last_heartbeat_ms: u64,
 
     #[serde(skip)]
-    pub last_heartbeat_ms: u64,
+    pub last_persist_ms: u64,
 
     #[serde(skip)]
     pub sys_stats: SystemStats,
@@ -57,6 +58,29 @@ impl NodeInfo {
     pub fn with_last_heartbeat_ms(mut self, ms: u64) -> Self {
         self.last_heartbeat_ms = ms;
         self
+    }
+
+    pub fn preserve_memory_fields(&mut self, source: &NodeInfo) {
+        self.last_persist_ms = source.last_persist_ms;
+        self.sys_stats = source.sys_stats.clone();
+        match (&mut self.payload, &source.payload) {
+            (NodePayload::Worker(ref mut dst), NodePayload::Worker(ref src)) => {
+                dst.storage_stats = src.storage_stats.clone();
+            }
+            (NodePayload::Meta(ref mut dst), NodePayload::Meta(ref src)) => {
+                dst.stats = src.stats.clone();
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether this node should be persisted via Raft.
+    /// Returns true if the time since last persist exceeds the given interval.
+    pub fn need_persist(&self, now_ms: u64, interval_ms: u64) -> bool {
+        if self.last_persist_ms == 0 {
+            return true;
+        }
+        now_ms.saturating_sub(self.last_persist_ms) > interval_ms
     }
 
     #[inline]

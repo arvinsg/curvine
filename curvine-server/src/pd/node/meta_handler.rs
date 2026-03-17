@@ -14,10 +14,10 @@
 
 use super::HeartbeatHandler;
 use curvine_common::state::{
-    HeartbeatRequest, HeartbeatResponse, HeartbeatResponsePayload, MetaHeartbeatResponse, NodeInfo,
+    HeartbeatPayload, HeartbeatRequest, HeartbeatResponsePayload, MetaHeartbeatResponse, NodeInfo,
     NodePayload, NodeState, NodeType, RegisterRequest,
 };
-use curvine_common::FsResult;
+use curvine_common::{FsError, FsResult};
 
 pub struct MetaHeartbeatHandler;
 
@@ -38,45 +38,67 @@ impl HeartbeatHandler for MetaHeartbeatHandler {
         NodeType::Meta
     }
 
-    // TODO: 1. 没有校验节点的信息，或更新节点的信息 2. 返回的信息也有误
-    fn handle_register(&self, req: RegisterRequest) -> FsResult<NodeInfo> {
+    fn build_node_info(&self, req: &RegisterRequest) -> FsResult<NodeInfo> {
         let payload = match &req.payload {
             NodePayload::Meta(p) => p.clone(),
-            _ => return Err(curvine_common::FsError::common("expected Meta payload")),
+            _ => return Err(FsError::common("expected Meta payload")),
         };
         Ok(NodeInfo {
             base: req.base.clone(),
             epoch: 0,
             state: NodeState::Starting,
             last_heartbeat_ms: 0,
+            last_persist_ms: 0,
             sys_stats: Default::default(),
             payload: NodePayload::Meta(payload),
         })
     }
 
-    // TODO: 1. 没有针对 metanode 特点做针对校验
-    fn handle_heartbeat(&self, req: HeartbeatRequest) -> FsResult<HeartbeatResponse> {
-        Ok(HeartbeatResponse {
-            error: None,
-            epoch: req.epoch,
-            config_version: 0,
-            mount_version: 0,
-            bg_version: 0,
-            payload: HeartbeatResponsePayload::Meta(MetaHeartbeatResponse {
-                path_route_update: None,
-                node_group_update: None,
-            }),
-        })
+    fn process_heartbeat(&self, node: &mut NodeInfo, req: &HeartbeatRequest) -> FsResult<bool> {
+        let HeartbeatPayload::Meta(ref m) = req.payload else {
+            return Err(FsError::common("expected Meta heartbeat payload"));
+        };
+
+        let mut changed = false;
+
+        node.sys_stats = m.sys_stats.clone();
+
+        if let NodePayload::Meta(ref mut p) = node.payload {
+            p.stats = m.inodes_stats.clone();
+            if p.group_id != m.group_id {
+                log::error!(
+                    "meta node group id changed, current:{}, new group id:{}",
+                    p.group_id,
+                    m.group_id
+                );
+                return Ok(false);
+            }
+
+            if p.group_epoch != m.group_epoch {
+                p.group_epoch = m.group_epoch;
+                p.is_leader = m.is_leader;
+                p.rw_policy = m.rw_policy;
+                p.peers = m.peers.clone();
+                changed = true;
+                log::info!(
+                    "meta node change group_id:{}, group_epoch:{}",
+                    p.group_id,
+                    m.group_epoch
+                );
+            }
+        }
+
+        Ok(changed)
     }
 
-    // TODO: 1. 必要性待确定
-    fn validate_consistency(&self, node: &NodeInfo, req: &HeartbeatRequest) -> FsResult<()> {
-        if node.epoch != req.epoch {
-            return Err(curvine_common::FsError::common(format!(
-                "epoch mismatch: node {} vs req {}",
-                node.epoch, req.epoch
-            )));
-        }
-        Ok(())
+    fn build_heartbeat_response(
+        &self,
+        _node: &NodeInfo,
+        _req: &HeartbeatRequest,
+    ) -> FsResult<HeartbeatResponsePayload> {
+        Ok(HeartbeatResponsePayload::Meta(MetaHeartbeatResponse {
+            path_route_update: None,
+            node_group_update: None,
+        }))
     }
 }

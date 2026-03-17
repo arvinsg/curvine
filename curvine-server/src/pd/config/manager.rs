@@ -16,16 +16,15 @@ use super::error::unknown_key_error;
 use super::keys::{DynamicConfigItem, DYNAMIC_CONFIG_ITEMS};
 use super::store::ConfigStore;
 use crate::pd::journal::entry::ConfigEntry;
-use crate::pd::journal::PdEntry;
+use crate::pd::journal::{self, PdEntry};
 use crate::pd::store::KvStore;
 use curvine_common::proto::*;
-use curvine_common::raft::RaftClient;
 use curvine_common::state::ConfigInfo;
-use curvine_common::utils::{ProtoUtils, SerdeUtils as Serde};
+use curvine_common::utils::ProtoUtils;
 use curvine_common::{FsError, FsResult};
 use log::{info, warn};
 use orpc::common::LocalTime;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Cache for dynamic config items: registry + current effective values.
@@ -36,18 +35,14 @@ struct DynamicConfigCache {
 
 impl DynamicConfigCache {
     fn new(config_store: &ConfigStore, conf_overrides: HashMap<String, String>) -> FsResult<Self> {
-        // Build registry from static items.
         let mut registry = HashMap::new();
         for item in DYNAMIC_CONFIG_ITEMS {
             registry.insert(item.key.to_string(), item.clone());
         }
 
-        // Initialize values with default/conf overrides.
         let mut values: HashMap<String, ConfigInfo> = HashMap::new();
         for (key, item) in &registry {
-            // Start from static default.
             let mut effective = item.default.to_string();
-            // PdConf override (if present).
             if let Some(conf_v) = conf_overrides.get(key) {
                 effective = conf_v.clone();
             }
@@ -62,7 +57,6 @@ impl DynamicConfigCache {
             );
         }
 
-        // Overlay persisted values from store (KV > conf > default).
         let persisted = config_store.list("", None)?;
         for item in persisted {
             values.insert(item.key.clone(), item);
@@ -93,7 +87,6 @@ impl DynamicConfigCache {
     }
 
     fn update_from_kv(&self, item: &ConfigInfo) {
-        // Always update cache; for non-registered keys this still keeps latest value.
         self.values
             .write()
             .unwrap()
@@ -103,7 +96,7 @@ impl DynamicConfigCache {
 
 pub struct ConfigManager {
     config_store: Arc<ConfigStore>,
-    raft_client: RaftClient,
+    journal_client: Arc<journal::Client>,
     dynamic_cache: DynamicConfigCache,
     set_lock: Mutex<()>,
 }
@@ -111,21 +104,18 @@ pub struct ConfigManager {
 impl ConfigManager {
     pub fn new(
         store: Arc<dyn KvStore>,
-        raft_client: RaftClient,
+        journal_client: Arc<journal::Client>,
         conf_dynamic_config: HashMap<String, String>,
     ) -> Self {
         let config_store = Arc::new(ConfigStore::new(store));
         let dynamic_cache = DynamicConfigCache::new(&config_store, conf_dynamic_config)
-            .unwrap_or_else(|_| {
-                // In case of error, fall back to empty cache to avoid panics.
-                DynamicConfigCache {
-                    registry: HashMap::new(),
-                    values: RwLock::new(HashMap::new()),
-                }
+            .unwrap_or_else(|_| DynamicConfigCache {
+                registry: HashMap::new(),
+                values: RwLock::new(HashMap::new()),
             });
         Self {
             config_store,
-            raft_client,
+            journal_client,
             dynamic_cache,
             set_lock: Mutex::new(()),
         }
@@ -135,11 +125,7 @@ impl ConfigManager {
         self.dynamic_cache.is_valid_key(key)
     }
 
-    fn default_config_info(&self, key: &str) -> Option<ConfigInfo> {
-        self.dynamic_cache.get(key)
-    }
-
-    // -- Raft apply callbacks (called by PdAppStorage) -----------------------
+    //  Raft apply callbacks (called by PdAppStorage)
 
     pub fn apply_set_config(&self, item: &ConfigInfo) -> FsResult<()> {
         if let Some(existing) = self.config_store.get(&item.key)? {
@@ -153,39 +139,24 @@ impl ConfigManager {
         }
         info!("Apply set config: {}", item.key);
         self.config_store.set(item)?;
-        // Update dynamic cache if this is a registered dynamic key.
         self.dynamic_cache.update_from_kv(item);
         Ok(())
     }
 
     // -- Public API ----------------------------------------------------------
 
-    fn propose(&self, entry: PdEntry) -> FsResult<()> {
-        let data = Serde::serialize(&entry)?;
-        self.raft_client.block_on_send_propose(data)?;
-        Ok(())
-    }
-
-    /// Propose an arbitrary PD entry (e.g. UpdateNodeState). Used by schedule/cluster.
-    pub fn propose_pd_entry(&self, entry: PdEntry) -> FsResult<()> {
-        self.propose(entry)
-    }
-
-    /// Get config value as u32; returns default if key missing or parse fails.
     pub fn get_u32(&self, key: &str, default: u32) -> u32 {
         self.config_value_str(key)
             .and_then(|s| s.parse().ok())
             .unwrap_or(default)
     }
 
-    /// Get config value as u64; returns default if key missing or parse fails.
     pub fn get_u64(&self, key: &str, default: u64) -> u64 {
         self.config_value_str(key)
             .and_then(|s| s.parse().ok())
             .unwrap_or(default)
     }
 
-    /// Get config value as bool; "true"/"1" => true, else false.
     pub fn get_bool(&self, key: &str, default: bool) -> bool {
         self.config_value_str(key)
             .map(|s| s == "true" || s == "1")
@@ -200,12 +171,10 @@ impl ConfigManager {
 
     pub fn get_config(&self, req: GetConfigRequest) -> FsResult<GetConfigResponse> {
         info!("Get config: {}", req.key);
-
         let item = self
             .dynamic_cache
             .get(&req.key)
             .map(|i| ProtoUtils::config_info_to_pb(&i));
-
         Ok(GetConfigResponse { item })
     }
 
@@ -213,7 +182,6 @@ impl ConfigManager {
         info!("List config with prefix: {}", req.prefix);
         let limit = req.limit.unwrap_or(1000).min(10000) as usize;
 
-        // All configs live in dynamic_cache.values; filter by prefix and limit.
         let mut items: Vec<ConfigInfo> = self
             .dynamic_cache
             .keys_with_prefix(&req.prefix)
@@ -235,21 +203,19 @@ impl ConfigManager {
         }
         info!("Set config: {}", req.key);
 
-        // Config updates are very low frequency; use a coarse lock to
-        // ensure version is computed safely when multiple writers exist.
         let _guard = self.set_lock.lock().unwrap();
 
         let mut item = ProtoUtils::set_config_request_to_config_info(req);
 
-        // Version is based on current cached value (KV-sourced if present).
         if let Some(existing) = self.dynamic_cache.get(&item.key) {
             item.version = existing.version + 1;
         }
 
-        self.propose(PdEntry::SetConfig(ConfigEntry {
-            op_ms: LocalTime::mills(),
-            info: item.clone(),
-        }))?;
+        self.journal_client
+            .propose(PdEntry::SetConfig(ConfigEntry {
+                op_ms: LocalTime::mills(),
+                info: item.clone(),
+            }))?;
 
         Ok(SetConfigResponse {
             success: true,

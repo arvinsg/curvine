@@ -52,10 +52,11 @@ pub struct InodesStats {
 /// Meta node persisted payload
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MetaNodePayload {
-    pub group_id: u64,
+    pub group_id: u32,
     pub peers: Vec<PeerInfo>,
     pub rw_policy: RwPolicy,
     pub is_leader: bool,
+    pub group_epoch: u64,
 
     #[serde(skip)]
     pub stats: InodesStats,

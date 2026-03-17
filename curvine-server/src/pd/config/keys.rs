@@ -32,6 +32,10 @@ pub const PD_NODE_HEARTBEAT_TIMEOUT_MS_DEFAULT: u64 = 60_000;
 pub const PD_NODE_LOST_RECOVERY_WINDOW_MS: &str = "pd.node.lost_recovery_window_ms";
 pub const PD_NODE_LOST_RECOVERY_WINDOW_MS_DEFAULT: u64 = 300_000;
 
+/// Interval between periodic persists of node info via Raft, in milliseconds.
+pub const PD_NODE_PERSIST_INTERVAL_MS: &str = "pd.node.persist_interval_ms";
+pub const PD_NODE_PERSIST_INTERVAL_MS_DEFAULT: u64 = 300_000;
+
 /// All registered dynamic config items.
 pub static DYNAMIC_CONFIG_ITEMS: &[DynamicConfigItem] = &[
     DynamicConfigItem {
@@ -43,5 +47,10 @@ pub static DYNAMIC_CONFIG_ITEMS: &[DynamicConfigItem] = &[
         key: PD_NODE_LOST_RECOVERY_WINDOW_MS,
         default: "300000",
         desc: "Lost worker recovery window in milliseconds",
+    },
+    DynamicConfigItem {
+        key: PD_NODE_PERSIST_INTERVAL_MS,
+        default: "300000",
+        desc: "Interval between periodic persists of node info via Raft",
     },
 ];

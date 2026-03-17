@@ -1,4 +1,5 @@
 use super::manager::ConfigManager;
+use crate::pd::journal;
 use crate::pd::store::memory_kv_engine::MemoryKvEngine;
 use crate::pd::store::KvStore;
 use curvine_common::conf::JournalConf;
@@ -13,7 +14,8 @@ fn test_manager(dynamic: HashMap<String, String>) -> ConfigManager {
     let journal_conf = JournalConf::default();
     let rt = journal_conf.create_runtime();
     let raft = RaftClient::from_conf(rt, &journal_conf);
-    ConfigManager::new(engine, raft, dynamic)
+    let jc = Arc::new(journal::Client::new(raft));
+    ConfigManager::new(engine, jc, dynamic)
 }
 
 fn dynamic(entries: &[(&str, &str)]) -> HashMap<String, String> {

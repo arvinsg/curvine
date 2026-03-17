@@ -14,10 +14,10 @@
 
 use super::HeartbeatHandler;
 use curvine_common::state::{
-    HeartbeatRequest, HeartbeatResponse, HeartbeatResponsePayload, NodeInfo, NodePayload,
-    NodeState, NodeType, RegisterRequest, WorkerHeartbeatResponse,
+    HeartbeatPayload, HeartbeatRequest, HeartbeatResponsePayload, NodeInfo, NodePayload, NodeState,
+    NodeType, RegisterRequest, WorkerHeartbeatResponse,
 };
-use curvine_common::FsResult;
+use curvine_common::{FsError, FsResult};
 
 pub struct WorkerHeartbeatHandler;
 
@@ -38,42 +38,54 @@ impl HeartbeatHandler for WorkerHeartbeatHandler {
         NodeType::Worker
     }
 
-    // TODO: 和 MetaNode 存在同样的问题
-    fn handle_register(&self, req: RegisterRequest) -> FsResult<NodeInfo> {
+    fn build_node_info(&self, req: &RegisterRequest) -> FsResult<NodeInfo> {
         let payload = match &req.payload {
             NodePayload::Worker(p) => p.clone(),
-            _ => return Err(curvine_common::FsError::common("expected Worker payload")),
+            _ => return Err(FsError::common("expected Worker payload")),
         };
         Ok(NodeInfo {
             base: req.base.clone(),
             epoch: 0,
             state: NodeState::Starting,
             last_heartbeat_ms: 0,
+            last_persist_ms: 0,
             sys_stats: Default::default(),
             payload: NodePayload::Worker(payload),
         })
     }
 
-    // TODO: 和 MetaNode 存在同样的问题
-    fn handle_heartbeat(&self, req: HeartbeatRequest) -> FsResult<HeartbeatResponse> {
-        Ok(HeartbeatResponse {
-            error: None,
-            epoch: req.epoch,
-            config_version: 0,
-            mount_version: 0,
-            bg_version: 0,
-            payload: HeartbeatResponsePayload::Worker(WorkerHeartbeatResponse::default()),
-        })
+    fn process_heartbeat(&self, node: &mut NodeInfo, req: &HeartbeatRequest) -> FsResult<bool> {
+        let HeartbeatPayload::Worker(ref w) = req.payload else {
+            return Err(FsError::common("expected Worker heartbeat payload"));
+        };
+
+        node.sys_stats = w.sys_stats.clone();
+
+        if let NodePayload::Worker(ref mut p) = node.payload {
+            p.storage_stats = w.storage_stats.clone();
+
+            // Warn if storage specs changed since registration (do not update).
+            for (sid, _stat) in &w.storage_stats {
+                if !p.storage_specs.contains_key(sid) {
+                    log::warn!(
+                        "Worker {} reports unknown storage_id={}, re-register to update specs",
+                        node.base.node_id,
+                        sid
+                    );
+                }
+            }
+        }
+
+        Ok(false)
     }
 
-    // TODO: 和 MetaNode 存在同样的问题
-    fn validate_consistency(&self, node: &NodeInfo, req: &HeartbeatRequest) -> FsResult<()> {
-        if node.epoch != req.epoch {
-            return Err(curvine_common::FsError::common(format!(
-                "epoch mismatch: node {} vs req {}",
-                node.epoch, req.epoch
-            )));
-        }
-        Ok(())
+    fn build_heartbeat_response(
+        &self,
+        _node: &NodeInfo,
+        _req: &HeartbeatRequest,
+    ) -> FsResult<HeartbeatResponsePayload> {
+        Ok(HeartbeatResponsePayload::Worker(
+            WorkerHeartbeatResponse::default(),
+        ))
     }
 }

@@ -12,24 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::{HeartbeatRequest, HeartbeatResponse, NodeInfo, RegisterRequest};
+use curvine_common::state::{
+    HeartbeatRequest, HeartbeatResponsePayload, NodeInfo, NodeType, RegisterRequest,
+};
 use curvine_common::FsResult;
 
-/// Handler for a specific node type (Worker or Meta).
+/// Handler for a specific node type (Worker or Meta...).
 pub trait HeartbeatHandler: Send + Sync {
     /// Returns the node type this handler supports.
-    fn supported_node_type(&self) -> curvine_common::state::NodeType;
+    fn supported_node_type(&self) -> NodeType;
 
-    /// Handles node registration.
-    fn handle_register(&self, req: RegisterRequest) -> FsResult<NodeInfo>;
+    /// Build initial NodeInfo from a registration request.
+    fn build_node_info(&self, req: &RegisterRequest) -> FsResult<NodeInfo>;
 
-    /// Handles node heartbeat.
-    fn handle_heartbeat(&self, req: HeartbeatRequest) -> FsResult<HeartbeatResponse>;
+    /// Process heartbeat: update role-specific fields on the in-memory node.
+    fn process_heartbeat(&self, node: &mut NodeInfo, req: &HeartbeatRequest) -> FsResult<bool>;
 
-    /// Validates consistency (epoch, labels, etc.).
-    fn validate_consistency(
+    /// Build the role-specific part of the heartbeat response payload.
+    fn build_heartbeat_response(
         &self,
         node: &NodeInfo,
         req: &HeartbeatRequest,
-    ) -> FsResult<()>;
+    ) -> FsResult<HeartbeatResponsePayload>;
 }

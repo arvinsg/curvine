@@ -14,12 +14,14 @@
 
 use super::{HandlerRegistry, HeartbeatHandler, MetaHeartbeatHandler, WorkerHeartbeatHandler};
 use crate::pd::config::ConfigManager;
-use crate::pd::journal::entry::{NodeEntry, NodeStateEntry};
+use crate::pd::journal::entry::NodeEntry;
+use crate::pd::journal::{self, PdEntry};
 use curvine_common::state::{
-    HeartbeatPayload, HeartbeatRequest, HeartbeatResponse, NodeInfo, NodePayload, NodeState,
-    NodeType, RegisterRequest,
+    HeartbeatRequest, HeartbeatResponse, NodeInfo, NodeState, NodeType, RegisterRequest,
 };
 use curvine_common::{FsError, FsResult};
+use log::info;
+use orpc::common::LocalTime;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -31,10 +33,15 @@ pub struct NodeManager {
     store: Arc<NodeStore>,
     handler_registry: HandlerRegistry,
     config_manager: Arc<ConfigManager>,
+    journal_client: Arc<journal::Client>,
 }
 
 impl NodeManager {
-    pub fn new(store: Arc<NodeStore>, config_manager: Arc<ConfigManager>) -> Self {
+    pub fn new(
+        store: Arc<NodeStore>,
+        config_manager: Arc<ConfigManager>,
+        journal_client: Arc<journal::Client>,
+    ) -> Self {
         let mut registry = HandlerRegistry::new();
         registry.register(Arc::new(WorkerHeartbeatHandler::new()));
         registry.register(Arc::new(MetaHeartbeatHandler::new()));
@@ -43,6 +50,7 @@ impl NodeManager {
             store,
             handler_registry: registry,
             config_manager,
+            journal_client,
         }
     }
 
@@ -56,14 +64,22 @@ impl NodeManager {
             .ok_or_else(|| FsError::common(format!("unsupported node type: {:?}", node_type)))
     }
 
-    //////////////////////////////////////////////////////////////////////////////////////////////////////
-    /// Builds NodeInfo and new_epoch for registration. Caller is responsible for proposing PdEntry::RegisterNode.
-    pub fn prepare_register(&self, req: RegisterRequest) -> FsResult<(NodeInfo, u64)> {
+    // ========== Registration ==========
+
+    pub fn register(&self, req: RegisterRequest) -> FsResult<(NodeInfo, u64)> {
         let handler = self.get_handler(req.base.node_type)?;
+        let now = LocalTime::mills();
+
         let new_epoch = {
             let index = self.index.read().unwrap();
             if let Some(existing) = index.get_by_id(req.base.node_id) {
                 if existing.state == NodeState::Lost || existing.state == NodeState::Offline {
+                    if existing.base.address != req.base.address {
+                        info!(
+                            "Node {} address changed: {:?} -> {:?}, re-registering",
+                            req.base.node_id, existing.base.address, req.base.address
+                        );
+                    }
                     existing.epoch + 1
                 } else {
                     return Err(FsError::common(format!(
@@ -75,113 +91,218 @@ impl NodeManager {
                 1
             }
         };
-        let mut info = handler.handle_register(req)?;
-        info.epoch = new_epoch;
-        Ok((info, new_epoch))
+
+        let mut node = handler.build_node_info(&req)?;
+        node.epoch = new_epoch;
+        node.last_heartbeat_ms = now;
+
+        let entry = NodeEntry {
+            op_ms: now,
+            info: node.clone(),
+        };
+        self.journal_client
+            .propose(PdEntry::RegisterNode(entry))?;
+
+        Ok((node, new_epoch))
     }
 
-    /// Handles heartbeat: validates, updates last_heartbeat_ms, returns response.
+    // ========== Heartbeat ==========
+
     pub fn handle_heartbeat(&self, req: HeartbeatRequest) -> FsResult<HeartbeatResponse> {
         let handler = self.get_handler(req.node_type)?;
-        let mut index = self.index.write().unwrap();
-        let node = index
-            .get_by_id_mut(req.node_id)
-            .ok_or_else(|| FsError::common(format!("node {} not found", req.node_id)))?;
-        handler.validate_consistency(node, &req)?;
-        node.last_heartbeat_ms = req.timestamp_ms;
-        match &req.payload {
-            HeartbeatPayload::Worker(w) => {
-                node.sys_stats = w.sys_stats.clone();
-                if let NodePayload::Worker(ref mut p) = &mut node.payload {
-                    p.storage_stats = w.storage_stats.clone();
-                }
+        let now = LocalTime::mills();
+        let persist_interval = self.persist_interval_ms();
+
+        let (node_snapshot, need_persist) = {
+            let mut index = self.index.write().unwrap();
+            let node = index
+                .get_by_id_mut(req.node_id)
+                .ok_or_else(|| FsError::common(format!("node {} not found", req.node_id)))?;
+
+            if node.epoch != req.epoch {
+                return Err(FsError::common(format!(
+                    "epoch mismatch for node {}: expected {} got {}",
+                    req.node_id, node.epoch, req.epoch
+                )));
             }
-            HeartbeatPayload::Meta(m) => {
-                node.sys_stats = m.sys_stats.clone();
-                if let NodePayload::Meta(ref mut p) = &mut node.payload {
-                    p.stats = m.inodes_stats.clone();
+
+            // Reject heartbeats from terminal states
+            match node.state {
+                NodeState::Offline | NodeState::Blacklist => {
+                    return Err(FsError::common(format!(
+                        "node {} is {:?}, must re-register",
+                        req.node_id, node.state
+                    )));
                 }
+                _ => {}
+            }
+
+            // Delegate payload processing to handler
+            let critical_changed = handler.process_heartbeat(node, &req)?;
+            node.last_heartbeat_ms = now;
+
+            // State transition: Starting/Lost → Live
+            let state_changed = matches!(node.state, NodeState::Starting | NodeState::Lost);
+
+            let need_persist = critical_changed
+                || state_changed
+                || node.need_persist(now, persist_interval);
+
+            // Release the mutable borrow on node before calling index methods
+            let node_id = req.node_id;
+            if state_changed {
+                index.update_state(node_id, NodeState::Live);
+            }
+
+            let snapshot = index.get_by_id(node_id).unwrap().clone();
+            (snapshot, need_persist)
+        };
+
+        let response_payload = handler.build_heartbeat_response(&node_snapshot, &req)?;
+
+        if need_persist {
+            let entry = NodeEntry {
+                op_ms: now,
+                info: node_snapshot.clone(),
+            };
+            self.journal_client.propose(PdEntry::SaveNode(entry))?;
+
+            let mut index = self.index.write().unwrap();
+            if let Some(n) = index.get_by_id_mut(req.node_id) {
+                n.last_persist_ms = now;
             }
         }
-        drop(index);
-        handler.handle_heartbeat(req)
+
+        Ok(HeartbeatResponse {
+            error: None,
+            epoch: node_snapshot.epoch,
+            config_version: 0,
+            mount_version: 0,
+            bg_version: 0,
+            payload: response_payload,
+        })
     }
 
-    /// Apply RegisterNode entry (called from PdAppStorage when Raft applies).
+    // ========== Raft apply callbacks ==========
+
+    /// Apply RegisterNode entry from Raft.
     pub fn apply_register_node(&self, entry: &NodeEntry) -> FsResult<()> {
-        let mut info = entry.info.clone();
-        info.last_heartbeat_ms = entry.op_ms;
-        self.store.put(&info)?;
+        let mut node = entry.info.clone();
+        node.last_persist_ms = entry.op_ms;
+        self.store.put(&node)?;
         let mut index = self.index.write().unwrap();
-        index.insert(info);
+        index.insert(node);
         Ok(())
     }
 
-    /// Apply UpdateNodeState entry (called from PdAppStorage when Raft applies).
-    pub fn apply_update_state(&self, entry: &NodeStateEntry) -> FsResult<()> {
+    /// Apply SaveNode entry from Raft — persists full NodeInfo.
+    pub fn apply_save_node(&self, entry: &NodeEntry) -> FsResult<()> {
+        self.store.put(&entry.info)?;
         let mut index = self.index.write().unwrap();
-        if !index.update_state(entry.node_id, entry.new_state) {
-            return Ok(());
+        let mut updated = entry.info.clone();
+        if let Some(existing) = index.get_by_id(entry.info.base.node_id) {
+            updated.preserve_memory_fields(existing);
         }
-        if let Some(node) = index.get_by_id(entry.node_id).cloned() {
-            drop(index);
-            let mut node_for_store = node;
-            node_for_store.epoch = entry.new_epoch.unwrap_or(node_for_store.epoch);
-            self.store.put(&node_for_store)?;
+        updated.last_persist_ms = entry.op_ms;
+        index.insert(updated);
+        Ok(())
+    }
+
+    // ========== State management ==========
+
+    /// Persist the current in-memory state of a node to Raft.
+    pub fn persist_node(&self, node_id: u32) -> FsResult<()> {
+        let node = {
+            let index = self.index.read().unwrap();
+            index.get_by_id(node_id).cloned()
+        };
+        let Some(node) = node else { return Ok(()) };
+        let now = LocalTime::mills();
+        let entry = NodeEntry {
+            op_ms: now,
+            info: node,
+        };
+        self.journal_client.propose(PdEntry::SaveNode(entry))?;
+        let mut index = self.index.write().unwrap();
+        if let Some(n) = index.get_by_id_mut(node_id) {
+            n.last_persist_ms = now;
         }
         Ok(())
     }
-    //////////////////////////////////////////////////////////////////////////////////////////////
+
+    /// Update state in-memory and immediately persist via Raft.
+    pub fn update_state_and_persist(&self, node_id: u32, new_state: NodeState) -> FsResult<()> {
+        {
+            let mut index = self.index.write().unwrap();
+            index.update_state(node_id, new_state);
+        }
+        self.persist_node(node_id)
+    }
+
+    // ========== Restore & queries ==========
 
     /// Restore in-memory index from store (call on startup).
     pub fn restore(&self) -> FsResult<()> {
         let nodes = self.store.list_all()?;
         let mut index = self.index.write().unwrap();
-        for node in nodes {
+        for mut node in nodes {
+            // Treat persisted last_heartbeat_ms as the initial last_persist_ms
+            // so that need_persist() won't fire on every first heartbeat.
+            node.last_persist_ms = node.last_heartbeat_ms;
             index.insert(node);
         }
         Ok(())
     }
 
-    /// Get node by id.
     pub fn get_node(&self, node_id: u32) -> Option<NodeInfo> {
         let index = self.index.read().unwrap();
         index.get_by_id(node_id).cloned()
     }
 
-    /// Get nodes by type.
     pub fn get_nodes_by_type(&self, node_type: NodeType) -> Vec<NodeInfo> {
         let index = self.index.read().unwrap();
         index.get_by_type(node_type).into_iter().cloned().collect()
     }
 
-    /// Get nodes by state.
     pub fn get_nodes_by_state(&self, state: NodeState) -> Vec<NodeInfo> {
         let index = self.index.read().unwrap();
         index.get_by_state(state).into_iter().cloned().collect()
     }
 
-    /// Mark nodes that have not heartbeaten within timeout as Lost (in-memory only).
-    pub fn check_heartbeat_timeout(&self, now_ms: u64, timeout_ms: u64) -> Vec<u32> {
+    /// Detect nodes that have exceeded heartbeat timeout.
+    /// Transitions Live → Lost in-memory and returns the timed-out node IDs.
+    pub fn detect_heartbeat_timeout(&self, now_ms: u64, timeout_ms: u64) -> Vec<u32> {
         let mut index = self.index.write().unwrap();
-        let mut marked = Vec::new();
-        for node_id in index.all_node_ids() {
-            if let Some(node) = index.get_by_id(node_id) {
-                if node.state == NodeState::Live
-                    && node.last_heartbeat_ms > 0
-                    && now_ms.saturating_sub(node.last_heartbeat_ms) > timeout_ms
-                {
-                    index.update_state(node_id, NodeState::Lost);
-                    marked.push(node_id);
-                }
+        let all_ids = index.all_node_ids();
+        let mut timed_out = Vec::new();
+        for node_id in all_ids {
+            let is_timeout = index
+                .get_by_id(node_id)
+                .map(|n| {
+                    n.state == NodeState::Live
+                        && n.last_heartbeat_ms > 0
+                        && now_ms.saturating_sub(n.last_heartbeat_ms) > timeout_ms
+                })
+                .unwrap_or(false);
+            if is_timeout {
+                index.update_state(node_id, NodeState::Lost);
+                timed_out.push(node_id);
             }
         }
-        marked
+        timed_out
     }
 
-    /// Returns heartbeat timeout in ms (from config or default 60s).
     pub fn heartbeat_timeout_ms(&self) -> u64 {
-        self.config_manager
-            .get_u64("pd.node.heartbeat_timeout_ms", 60_000)
+        self.config_manager.get_u64(
+            crate::pd::config::keys::PD_NODE_HEARTBEAT_TIMEOUT_MS,
+            crate::pd::config::keys::PD_NODE_HEARTBEAT_TIMEOUT_MS_DEFAULT,
+        )
+    }
+
+    fn persist_interval_ms(&self) -> u64 {
+        self.config_manager.get_u64(
+            crate::pd::config::keys::PD_NODE_PERSIST_INTERVAL_MS,
+            crate::pd::config::keys::PD_NODE_PERSIST_INTERVAL_MS_DEFAULT,
+        )
     }
 }

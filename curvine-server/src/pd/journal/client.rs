@@ -12,10 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod app_storage;
-pub mod client;
-pub mod entry;
+use super::PdEntry;
+use curvine_common::raft::RaftClient;
+use curvine_common::utils::SerdeUtils as Serde;
+use curvine_common::FsResult;
 
-pub use app_storage::PdAppStorage;
-pub use client::Client;
-pub use entry::PdEntry;
+/// Unified Raft propose client for all PD modules.
+pub struct Client {
+    raft_client: RaftClient,
+}
+
+impl Client {
+    pub fn new(raft_client: RaftClient) -> Self {
+        Self { raft_client }
+    }
+
+    /// Propose a PdEntry through Raft consensus.
+    pub fn propose(&self, entry: PdEntry) -> FsResult<()> {
+        let data = Serde::serialize(&entry)?;
+        self.raft_client.block_on_send_propose(data)?;
+        Ok(())
+    }
+}
