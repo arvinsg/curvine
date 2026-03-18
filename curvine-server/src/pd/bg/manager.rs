@@ -14,7 +14,8 @@
 
 use super::state_machine;
 use super::{BGStore, BGTable};
-use crate::pd::journal::entry::{BGEntry, BGUpdateEntry};
+use crate::pd::journal::entry::{BatchBGEntry, BGEntry, BGUpdateEntry};
+use crate::pd::journal::{self, PdEntry};
 use crate::pd::node::NodeManager;
 use crate::pd::pool::PoolManager;
 use curvine_common::state::{
@@ -53,15 +54,21 @@ pub struct BGManager {
     bgs: RwLock<HashMap<u32, BlockGroupInfo>>,
     store: Arc<BGStore>,
     pool_manager: Arc<PoolManager>,
+    journal_client: Arc<journal::Client>,
 }
 
 impl BGManager {
-    pub fn new(store: Arc<BGStore>, pool_manager: Arc<PoolManager>) -> Self {
+    pub fn new(
+        store: Arc<BGStore>,
+        pool_manager: Arc<PoolManager>,
+        journal_client: Arc<journal::Client>,
+    ) -> Self {
         Self {
             tables: RwLock::new(HashMap::new()),
             bgs: RwLock::new(HashMap::new()),
             store,
             pool_manager,
+            journal_client,
         }
     }
 
@@ -104,6 +111,7 @@ impl BGManager {
         if let Some(ref lease) = entry.lease_owner {
             info.lease_owner = lease.clone();
         }
+        info.epoch += 1;
         self.store.put(&info)?;
         bgs.insert(entry.bg_id, info.clone());
         drop(bgs);
@@ -119,6 +127,122 @@ impl BGManager {
             let _ = self.bump_table_epoch(tid);
         }
         Ok(())
+    }
+
+    /// Apply a batch of BG operations atomically (from Raft).
+    /// Table is created/updated first, then creates, then updates.
+    /// Table epoch is bumped once at the end.
+    pub fn apply_batch_bg(&self, entry: &BatchBGEntry) -> FsResult<()> {
+        let mut table_id_to_bump = None;
+
+        if let Some(ref table) = entry.table {
+            self.store.put_table(table)?;
+            table_id_to_bump = Some(table.table_id);
+            self.tables
+                .write()
+                .unwrap()
+                .insert(table.table_id, table.clone());
+        }
+
+        for bg in &entry.creates {
+            self.store.put(bg)?;
+            self.bgs.write().unwrap().insert(bg.bg_id, bg.clone());
+            if table_id_to_bump.is_none() {
+                table_id_to_bump = Some(bg.table_id);
+            }
+        }
+
+        for update in &entry.updates {
+            let mut bgs = self.bgs.write().unwrap();
+            if let Some(bg) = bgs.get_mut(&update.bg_id) {
+                if let Some(s) = update.state {
+                    bg.state = s;
+                }
+                if let Some(ref rs) = update.replica_set {
+                    bg.replica_set = rs.clone();
+                }
+                if let Some(ref lease) = update.lease_owner {
+                    bg.lease_owner = lease.clone();
+                }
+                bg.epoch += 1;
+                self.store.put(bg)?;
+                if table_id_to_bump.is_none() {
+                    table_id_to_bump = Some(bg.table_id);
+                }
+            }
+        }
+
+        if let Some(tid) = table_id_to_bump {
+            self.bump_table_epoch(tid)?;
+        }
+        Ok(())
+    }
+
+    /// Propose a BG update via Raft.
+    pub fn propose_update_bg(&self, entry: BGUpdateEntry) -> FsResult<()> {
+        self.journal_client.propose(PdEntry::UpdateBG(entry))
+    }
+
+    /// Propose a batch BG operation via Raft.
+    pub fn propose_batch_bg(&self, entry: BatchBGEntry) -> FsResult<()> {
+        self.journal_client.propose(PdEntry::BatchBG(entry))
+    }
+
+    /// Create a new BGTable for a pool. Uses the placement algorithm to assign BGs
+    /// to workers, then proposes the entire result as a single BatchBG Raft entry.
+    pub fn create_table(
+        &self,
+        pool_id: u16,
+        bucket_count: u32,
+        replica_count: u16,
+        workers: &[u32],
+    ) -> FsResult<()> {
+        use curvine_common::state::{BlockGroupPolicy, PlacementPolicy, StorageType};
+
+        let table_id = (pool_id as u32) << 16 | (replica_count as u32);
+
+        if self.tables.read().unwrap().contains_key(&table_id) {
+            return Err(FsError::common(format!(
+                "table already exists for pool {} replicas {}",
+                pool_id, replica_count
+            )));
+        }
+
+        let next_bg_id = self.store.get_next_bg_id()?;
+        let policy = BlockGroupPolicy {
+            storage_type: StorageType::Ssd,
+            replicas: replica_count,
+            placement: PlacementPolicy::Default,
+        };
+
+        let result = super::placement::build_table(
+            table_id,
+            bucket_count,
+            replica_count,
+            policy,
+            workers,
+            next_bg_id,
+        )?;
+
+        let new_next_id = next_bg_id + bucket_count;
+        self.store.set_next_bg_id(new_next_id)?;
+
+        let entry = BatchBGEntry {
+            op_ms: orpc::common::LocalTime::mills(),
+            table: Some(result.table),
+            creates: result.bgs,
+            updates: vec![],
+        };
+        self.propose_batch_bg(entry)
+    }
+
+    /// Check if a BGTable exists for the given pool_id.
+    pub fn has_table_for_pool(&self, pool_id: u16) -> bool {
+        self.tables
+            .read()
+            .unwrap()
+            .values()
+            .any(|t| t.pool_id() == pool_id)
     }
 
     fn bump_table_epoch(&self, table_id: u32) -> FsResult<()> {
@@ -202,7 +326,7 @@ impl BGManager {
             .buckets
             .iter()
             .filter_map(|&bg_id| bgs.get(&bg_id).cloned())
-            .map(|bg| block_group_info_to_view(bg, node_manager))
+            .map(|bg| block_group_info_to_view(&bg, node_manager))
             .collect();
         drop(bgs);
         if buckets.len() != table.buckets.len() {
@@ -217,9 +341,9 @@ impl BGManager {
         })
     }
 
-    /// TODO: Rebuild table buckets: for each bucket, verify the BG's replica_set workers are still alive.
+    /// Rebuild table buckets: for each bucket, verify the BG's replica_set workers are still alive.
     /// If any BG has insufficient replicas, attempt to select new workers via PoolManager.
-    /// Epoch is incremented and persisted after any change.
+    /// All changes are batched into a single Raft entry for consistency.
     pub fn rebuild_table(&self, table_id: u32) -> FsResult<()> {
         let table = {
             let tables = self.tables.read().unwrap();
@@ -229,7 +353,6 @@ impl BGManager {
                 .ok_or_else(|| FsError::common(format!("table {} not found", table_id)))?
         };
 
-        // Collect BGs that need replica repair (snapshot under read lock)
         let repair_list: Vec<(u32, Vec<u32>, Vec<u32>)> = {
             let bgs = self.bgs.read().unwrap();
             table
@@ -260,7 +383,7 @@ impl BGManager {
             return Ok(());
         }
 
-        let mut changed = false;
+        let mut updates = Vec::new();
         for (bg_id, alive, old_replica_set) in &repair_list {
             let needed = table.replica_count() as u16 - alive.len() as u16;
             let new_workers = match self.pool_manager.select_workers_for_bg(
@@ -278,17 +401,23 @@ impl BGManager {
             let mut new_replicas = alive.clone();
             new_replicas.extend(new_workers);
 
-            let mut bgs_w = self.bgs.write().unwrap();
-            if let Some(bg_mut) = bgs_w.get_mut(bg_id) {
-                bg_mut.replica_set = new_replicas;
-                bg_mut.epoch += 1;
-                let _ = self.store.put(bg_mut);
-                changed = true;
-            }
+            updates.push(BGUpdateEntry {
+                op_ms: orpc::common::LocalTime::mills(),
+                bg_id: *bg_id,
+                state: None,
+                replica_set: Some(new_replicas),
+                lease_owner: None,
+            });
         }
 
-        if changed {
-            self.bump_table_epoch(table_id)?;
+        if !updates.is_empty() {
+            let entry = BatchBGEntry {
+                op_ms: orpc::common::LocalTime::mills(),
+                table: None,
+                creates: vec![],
+                updates,
+            };
+            self.propose_batch_bg(entry)?;
         }
         Ok(())
     }
@@ -326,17 +455,19 @@ mod tests {
         let journal_conf = curvine_common::conf::JournalConf::default();
         let rt = journal_conf.create_runtime();
         let raft = curvine_common::raft::RaftClient::from_conf(rt, &journal_conf);
+        let jc = Arc::new(crate::pd::journal::Client::new(raft));
         let config_manager = Arc::new(crate::pd::config::ConfigManager::new(
             Arc::new(crate::pd::store::memory_kv_engine::MemoryKvEngine::new()),
-            raft,
+            jc.clone(),
             std::collections::HashMap::new(),
         ));
-        let node_manager: Arc<NodeManager> = Arc::new(NodeManager::new(node_store, config_manager));
-        let pool_manager = Arc::new(PoolManager::new(pool_store, node_manager));
-        BGManager::new(bg_store, pool_manager)
+        let node_manager: Arc<NodeManager> = Arc::new(NodeManager::new(node_store, config_manager, jc.clone()));
+        let pool_manager = Arc::new(PoolManager::new(pool_store, node_manager, jc.clone()));
+        BGManager::new(bg_store, pool_manager, jc)
     }
 
     fn make_bg(bg_id: u32, table_id: u32, replica_set: Vec<u32>) -> BlockGroupInfo {
+        let leader = replica_set.first().copied().unwrap_or(0);
         BlockGroupInfo {
             bg_id,
             table_id,
@@ -344,7 +475,7 @@ mod tests {
             replica_set,
             state: BGState::Assigned,
             lease_owner: BGLease {
-                node_id: replica_set.first().copied().unwrap_or(0),
+                node_id: leader,
                 expire_time_ms: 0,
             },
             stats: Default::default(),

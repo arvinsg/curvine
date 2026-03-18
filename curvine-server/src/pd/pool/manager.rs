@@ -13,10 +13,13 @@
 // limitations under the License.
 
 use super::{PoolIndex, PoolStore};
+use crate::pd::journal::entry::PoolEntry;
+use crate::pd::journal::{self, PdEntry};
 use crate::pd::node::NodeManager;
 use curvine_common::state::{NodeInfo, NodePayload, NodeType, StorageSpec};
 use curvine_common::state::{NodeState, PlacementPolicy, PoolInfo, PoolStats, StorageType};
 use curvine_common::{FsError, FsResult};
+use orpc::common::LocalTime;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -38,19 +41,26 @@ pub struct PoolManager {
     index: Arc<RwLock<PoolIndex>>,
     store: Arc<PoolStore>,
     node_manager: Arc<NodeManager>,
+    journal_client: Arc<journal::Client>,
 }
 
 impl PoolManager {
-    pub fn new(store: Arc<PoolStore>, node_manager: Arc<NodeManager>) -> Self {
+    pub fn new(
+        store: Arc<PoolStore>,
+        node_manager: Arc<NodeManager>,
+        journal_client: Arc<journal::Client>,
+    ) -> Self {
         Self {
             index: Arc::new(RwLock::new(PoolIndex::new())),
             store,
             node_manager,
+            journal_client,
         }
     }
 
     /// Assign worker to pools based on storage_specs (unique storage_type -> pool).
     /// Returns list of pool_ids the worker was added to.
+    /// Updates index in-memory and proposes SavePool via Raft for persistence.
     pub fn assign_worker_to_pools(
         &self,
         worker_id: u32,
@@ -71,26 +81,39 @@ impl PoolManager {
         }
         let pool_ids_vec: Vec<u16> = pool_ids.into_iter().collect();
 
+        let now = LocalTime::mills();
         for pid in &pool_ids_vec {
             if let Some(pool) = index.get_pool(*pid).cloned() {
-                self.store.put_pool(&pool)?;
+                self.journal_client
+                    .propose(PdEntry::SavePool(PoolEntry { op_ms: now, info: pool }))?;
             }
         }
         Ok(pool_ids_vec)
     }
 
     /// Remove worker from all pools (e.g. on worker offline).
+    /// Updates index in-memory and proposes SavePool via Raft for persistence.
     pub fn remove_worker_from_pools(&self, worker_id: u32) -> FsResult<()> {
         let mut index = self.index.write().unwrap();
         let pool_ids = { index.remove_worker(worker_id) };
         let Some(pool_ids) = pool_ids else {
             return Ok(());
         };
+        let now = LocalTime::mills();
         for pool_id in &pool_ids {
             if let Some(pool) = index.get_pool(*pool_id).cloned() {
-                self.store.put_pool(&pool)?;
+                self.journal_client
+                    .propose(PdEntry::SavePool(PoolEntry { op_ms: now, info: pool }))?;
             }
         }
+        Ok(())
+    }
+
+    /// Raft apply callback for SavePool.
+    pub fn apply_save_pool(&self, entry: &PoolEntry) -> FsResult<()> {
+        self.store.put_pool(&entry.info)?;
+        let mut index = self.index.write().unwrap();
+        index.insert_pool(entry.info.clone());
         Ok(())
     }
 

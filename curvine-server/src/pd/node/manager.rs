@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::event::NodeEvent;
 use super::{HandlerRegistry, HeartbeatHandler, MetaHeartbeatHandler, WorkerHeartbeatHandler};
 use crate::pd::config::ConfigManager;
 use crate::pd::journal::entry::NodeEntry;
@@ -24,9 +25,12 @@ use log::info;
 use orpc::common::LocalTime;
 use std::sync::Arc;
 use std::sync::RwLock;
+use tokio::sync::broadcast;
 
 use super::index::NodeIndex;
 use super::store::NodeStore;
+
+const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 pub struct NodeManager {
     index: Arc<RwLock<NodeIndex>>,
@@ -34,6 +38,7 @@ pub struct NodeManager {
     handler_registry: HandlerRegistry,
     config_manager: Arc<ConfigManager>,
     journal_client: Arc<journal::Client>,
+    event_tx: broadcast::Sender<NodeEvent>,
 }
 
 impl NodeManager {
@@ -45,13 +50,23 @@ impl NodeManager {
         let mut registry = HandlerRegistry::new();
         registry.register(Arc::new(WorkerHeartbeatHandler::new()));
         registry.register(Arc::new(MetaHeartbeatHandler::new()));
+        let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             index: Arc::new(RwLock::new(NodeIndex::new())),
             store,
             handler_registry: registry,
             config_manager,
             journal_client,
+            event_tx,
         }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<NodeEvent> {
+        self.event_tx.subscribe()
+    }
+
+    fn emit_event(&self, event: NodeEvent) {
+        let _ = self.event_tx.send(event);
     }
 
     pub fn register_handler(&mut self, handler: Arc<dyn HeartbeatHandler>) {
@@ -103,6 +118,12 @@ impl NodeManager {
         self.journal_client
             .propose(PdEntry::RegisterNode(entry))?;
 
+        self.emit_event(NodeEvent::Registered {
+            node_id: node.base.node_id,
+            node_type: node.base.node_type,
+            pool_ids: vec![],
+        });
+
         Ok((node, new_epoch))
     }
 
@@ -142,19 +163,28 @@ impl NodeManager {
             node.last_heartbeat_ms = now;
 
             // State transition: Starting/Lost → Live
-            let state_changed = matches!(node.state, NodeState::Starting | NodeState::Lost);
+            let old_state = node.state;
+            let state_changed = matches!(old_state, NodeState::Starting | NodeState::Lost);
 
             let need_persist = critical_changed
                 || state_changed
                 || node.need_persist(now, persist_interval);
 
-            // Release the mutable borrow on node before calling index methods
             let node_id = req.node_id;
+            let node_type = node.base.node_type;
             if state_changed {
                 index.update_state(node_id, NodeState::Live);
             }
 
             let snapshot = index.get_by_id(node_id).unwrap().clone();
+            if state_changed {
+                self.emit_event(NodeEvent::StateChanged {
+                    node_id,
+                    node_type,
+                    old_state,
+                    new_state: NodeState::Live,
+                });
+            }
             (snapshot, need_persist)
         };
 
@@ -232,9 +262,21 @@ impl NodeManager {
 
     /// Update state in-memory and immediately persist via Raft.
     pub fn update_state_and_persist(&self, node_id: u32, new_state: NodeState) -> FsResult<()> {
-        {
+        let old_info = {
             let mut index = self.index.write().unwrap();
+            let old_info = index.get_by_id(node_id).map(|n| (n.state, n.base.node_type));
             index.update_state(node_id, new_state);
+            old_info
+        };
+        if let Some((old_state, node_type)) = old_info {
+            if old_state != new_state {
+                self.emit_event(NodeEvent::StateChanged {
+                    node_id,
+                    node_type,
+                    old_state,
+                    new_state,
+                });
+            }
         }
         self.persist_node(node_id)
     }
@@ -276,17 +318,25 @@ impl NodeManager {
         let all_ids = index.all_node_ids();
         let mut timed_out = Vec::new();
         for node_id in all_ids {
-            let is_timeout = index
-                .get_by_id(node_id)
-                .map(|n| {
-                    n.state == NodeState::Live
-                        && n.last_heartbeat_ms > 0
-                        && now_ms.saturating_sub(n.last_heartbeat_ms) > timeout_ms
-                })
-                .unwrap_or(false);
-            if is_timeout {
+            let timeout_info = index.get_by_id(node_id).and_then(|n| {
+                if n.state == NodeState::Live
+                    && n.last_heartbeat_ms > 0
+                    && now_ms.saturating_sub(n.last_heartbeat_ms) > timeout_ms
+                {
+                    Some(n.base.node_type)
+                } else {
+                    None
+                }
+            });
+            if let Some(node_type) = timeout_info {
                 index.update_state(node_id, NodeState::Lost);
                 timed_out.push(node_id);
+                self.emit_event(NodeEvent::StateChanged {
+                    node_id,
+                    node_type,
+                    old_state: NodeState::Live,
+                    new_state: NodeState::Lost,
+                });
             }
         }
         timed_out

@@ -14,6 +14,7 @@
 
 pub(crate) mod http_handler;
 mod manager;
+pub mod placement;
 pub mod state_machine;
 mod store;
 mod table;

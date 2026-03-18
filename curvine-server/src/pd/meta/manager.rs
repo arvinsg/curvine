@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::pd::config::ConfigManager;
-use crate::pd::journal::PdEntry;
+use crate::pd::journal::{self, PdEntry};
 use crate::pd::meta::RouteStore;
 use crate::pd::node::NodeManager;
 use curvine_common::state::*;
@@ -30,7 +29,7 @@ pub struct MetaManager {
     path_route_table: RwLock<PathRouteTable>,
     node_manager: Arc<NodeManager>,
     store: Arc<RouteStore>,
-    config_manager: Arc<ConfigManager>,
+    journal_client: Arc<journal::Client>,
 }
 
 impl MetaManager {
@@ -40,7 +39,7 @@ impl MetaManager {
         hash_level: u8,
         node_manager: Arc<NodeManager>,
         store: Arc<RouteStore>,
-        config_manager: Arc<ConfigManager>,
+        journal_client: Arc<journal::Client>,
     ) -> Self {
         Self {
             mode,
@@ -49,7 +48,7 @@ impl MetaManager {
             path_route_table: RwLock::new(PathRouteTable::default()),
             node_manager,
             store,
-            config_manager,
+            journal_client,
         }
     }
 
@@ -118,7 +117,6 @@ impl MetaManager {
 
     // ========== Routing ==========
 
-    /// Route path to group_id. Proxy/Shard: Unsupported. Federation Static: longest prefix, else fallback to min group_id. Federation Hash: dir-level hash.
     pub fn route(&self, path: &str) -> FsResult<u64> {
         match self.mode {
             MetaNodeMode::Proxy => Err(FsError::unsupported("MetaNode mode Proxy")),
@@ -171,8 +169,8 @@ impl MetaManager {
             entry.create_time_ms = now;
         }
         entry.update_time_ms = now;
-        self.config_manager
-            .propose_pd_entry(PdEntry::AddPathRoute(entry))?;
+        self.journal_client
+            .propose(PdEntry::AddPathRoute(entry))?;
         Ok(())
     }
 
@@ -184,8 +182,8 @@ impl MetaManager {
                 "remove_route only in Federation Static mode".to_string(),
             ));
         }
-        self.config_manager
-            .propose_pd_entry(PdEntry::RemovePathRoute(path.to_string()))?;
+        self.journal_client
+            .propose(PdEntry::RemovePathRoute(path.to_string()))?;
         Ok(())
     }
 
@@ -195,7 +193,6 @@ impl MetaManager {
         self.path_route_table.read().unwrap().clone()
     }
 
-    /// For Meta heartbeat: path route update (Federation Static only).
     pub fn get_path_route_update(&self) -> Option<PathRouteUpdate> {
         if self.mode != MetaNodeMode::Federation
             || self.federation_route_mode != Some(FederationRouteMode::Static)
@@ -227,7 +224,6 @@ impl MetaManager {
 
     // ========== Client summary (for RPC / cache) ==========
 
-    /// Build client-facing summary. Proxy/Shard returns Unsupported.
     pub fn build_client_summary(&self) -> FsResult<MetaRouteSummary> {
         match self.mode {
             MetaNodeMode::Proxy => Err(FsError::unsupported("MetaNode mode Proxy")),
@@ -281,7 +277,7 @@ impl MetaManager {
                     address: node.base.address.clone(),
                     is_leader: Some(p.is_leader),
                 };
-                by_group.entry(p.group_id).or_default().push(peer);
+                by_group.entry(p.group_id as u64).or_default().push(peer);
             }
         }
         by_group
@@ -311,17 +307,28 @@ mod tests {
     fn node_manager_with_meta() -> Arc<NodeManager> {
         let store: Arc<dyn crate::pd::store::KvStore> =
             Arc::new(crate::pd::store::memory_kv_engine::MemoryKvEngine::new());
-        let raft = curvine_common::raft::RaftClient::from_conf(
-            curvine_common::conf::JournalConf::default().create_runtime(),
-            &curvine_common::conf::JournalConf::default(),
-        );
+        let jc = Arc::new(journal::Client::new(
+            curvine_common::raft::RaftClient::from_conf(
+                curvine_common::conf::JournalConf::default().create_runtime(),
+                &curvine_common::conf::JournalConf::default(),
+            ),
+        ));
         let config = Arc::new(crate::pd::config::ConfigManager::new(
             store.clone(),
-            raft,
+            jc.clone(),
             std::collections::HashMap::new(),
         ));
         let node_store = Arc::new(crate::pd::node::NodeStore::new(store));
-        Arc::new(NodeManager::new(node_store, config))
+        Arc::new(NodeManager::new(node_store, config, jc))
+    }
+
+    fn make_journal_client() -> Arc<journal::Client> {
+        Arc::new(journal::Client::new(
+            curvine_common::raft::RaftClient::from_conf(
+                curvine_common::conf::JournalConf::default().create_runtime(),
+                &curvine_common::conf::JournalConf::default(),
+            ),
+        ))
     }
 
     #[test]
@@ -337,22 +344,15 @@ mod tests {
         let nm = node_manager_with_meta();
         let store: Arc<dyn crate::pd::store::KvStore> =
             Arc::new(crate::pd::store::memory_kv_engine::MemoryKvEngine::new());
-        let path_store = Arc::new(RouteStore::new(store.clone()));
-        let config_manager = Arc::new(crate::pd::config::ConfigManager::new(
-            store,
-            curvine_common::raft::RaftClient::from_conf(
-                curvine_common::conf::JournalConf::default().create_runtime(),
-                &curvine_common::conf::JournalConf::default(),
-            ),
-            std::collections::HashMap::new(),
-        ));
+        let path_store = Arc::new(RouteStore::new(store));
+        let jc = make_journal_client();
         let mgr = MetaManager::new(
             MetaNodeMode::Federation,
             Some(FederationRouteMode::Static),
             2,
             nm,
             path_store,
-            config_manager,
+            jc,
         );
         mgr.apply_add_route(&PathRouteEntry {
             path: "/user/a".to_string(),
@@ -371,7 +371,6 @@ mod tests {
         assert_eq!(mgr.route("/user").unwrap(), 1);
         assert_eq!(mgr.route("/user/a").unwrap(), 10);
         assert_eq!(mgr.route("/user/a/b").unwrap(), 10);
-        // Fallback when no match: need at least one group. With no meta nodes, get_active_groups is empty so route would error. So this test doesn't cover fallback; we'd need to add a meta node to get a group. Leave as is.
     }
 
     #[test]
@@ -380,15 +379,8 @@ mod tests {
         let store: Arc<dyn crate::pd::store::KvStore> =
             Arc::new(crate::pd::store::memory_kv_engine::MemoryKvEngine::new());
         let path_store = Arc::new(RouteStore::new(store));
-        let config_manager = Arc::new(crate::pd::config::ConfigManager::new(
-            Arc::new(crate::pd::store::memory_kv_engine::MemoryKvEngine::new()),
-            curvine_common::raft::RaftClient::from_conf(
-                curvine_common::conf::JournalConf::default().create_runtime(),
-                &curvine_common::conf::JournalConf::default(),
-            ),
-            std::collections::HashMap::new(),
-        ));
-        let mgr = MetaManager::new(MetaNodeMode::Proxy, None, 2, nm, path_store, config_manager);
+        let jc = make_journal_client();
+        let mgr = MetaManager::new(MetaNodeMode::Proxy, None, 2, nm, path_store, jc);
         assert!(mgr.route("/any").is_err());
         assert!(mgr.build_client_summary().is_err());
     }

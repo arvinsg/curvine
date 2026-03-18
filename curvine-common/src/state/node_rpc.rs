@@ -56,6 +56,12 @@ pub enum HeartbeatPayload {
 pub struct WorkerHeartbeatPayload {
     pub storage_stats: HashMap<String, StorageStats>,
     pub sys_stats: SystemStats,
+    /// BGs currently held by the worker (for PD to validate assignments)
+    #[serde(default)]
+    pub bg_ids: Vec<u32>,
+    /// BG epochs for staleness detection (bg_id -> epoch)
+    #[serde(default)]
+    pub bg_epochs: HashMap<u32, u64>,
 }
 
 /// Meta heartbeat payload (is_leader, group_epoch, stats)

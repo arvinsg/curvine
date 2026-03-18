@@ -23,6 +23,9 @@ pub struct WorkerNodePayload {
     pub az: Option<String>,
     pub rack: Option<String>,
 
+    /// BGs currently held by the worker (updated from heartbeat, not persisted)
+    #[serde(skip)]
+    pub bg_ids: Vec<u32>,
     #[serde(skip)]
     pub storage_stats: HashMap<String, StorageStats>,
 }

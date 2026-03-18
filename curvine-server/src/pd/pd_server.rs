@@ -142,15 +142,27 @@ impl Pd {
         mount_manager.restore()?;
 
         let node_store = Arc::new(NodeStore::new(store.clone()));
-        let node_manager = Arc::new(NodeManager::new(node_store, config_manager.clone()));
+        let node_manager = Arc::new(NodeManager::new(
+            node_store,
+            config_manager.clone(),
+            journal_client.clone(),
+        ));
         node_manager.restore()?;
 
         let pool_store = Arc::new(PoolStore::new(store.clone()));
-        let pool_manager = Arc::new(PoolManager::new(pool_store, node_manager.clone()));
+        let pool_manager = Arc::new(PoolManager::new(
+            pool_store,
+            node_manager.clone(),
+            journal_client.clone(),
+        ));
         pool_manager.restore()?;
 
         let bg_store = Arc::new(BGStore::new(store.clone()));
-        let bg_manager = Arc::new(BGManager::new(bg_store, pool_manager.clone()));
+        let bg_manager = Arc::new(BGManager::new(
+            bg_store,
+            pool_manager.clone(),
+            journal_client.clone(),
+        ));
         bg_manager.restore()?;
 
         let metanode_mode = parse_metanode_mode(&conf.metanode.mode);
@@ -172,6 +184,7 @@ impl Pd {
             config_manager.clone(),
             mount_manager.clone(),
             Some(node_manager.clone()),
+            Some(pool_manager.clone()),
             Some(bg_manager.clone()),
             Some(meta_manager.clone()),
         );

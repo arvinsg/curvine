@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use curvine_common::state::BGLease;
-use curvine_common::state::{BlockGroupInfo, ConfigInfo, MountInfo, NodeInfo, PathRouteEntry};
+use curvine_common::state::{BlockGroupInfo, ConfigInfo, MountInfo, NodeInfo, PathRouteEntry, PoolInfo};
 use serde::{Deserialize, Serialize};
 
 // mount
@@ -44,6 +44,13 @@ pub struct NodeEntry {
     pub info: NodeInfo,
 }
 
+/// Pool entry (Raft log) — used for worker add/remove persistence
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct PoolEntry {
+    pub op_ms: u64,
+    pub info: PoolInfo,
+}
+
 /// BG create entry (Raft log)
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct BGEntry {
@@ -61,6 +68,15 @@ pub struct BGUpdateEntry {
     pub lease_owner: Option<BGLease>,
 }
 
+/// Batch BG entry (Raft log) — atomically applies table + multiple BG creates/updates
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct BatchBGEntry {
+    pub op_ms: u64,
+    pub table: Option<super::super::bg::BGTable>,
+    pub creates: Vec<BlockGroupInfo>,
+    pub updates: Vec<BGUpdateEntry>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum PdEntry {
     Noop,
@@ -72,10 +88,14 @@ pub enum PdEntry {
     RegisterNode(NodeEntry),
     SaveNode(NodeEntry),
 
+    // Pool management
+    SavePool(PoolEntry),
+
     // BG management
     CreateBG(BGEntry),
     UpdateBG(BGUpdateEntry),
     DeleteBG(u32),
+    BatchBG(BatchBGEntry),
 
     // Path route (MetaNode Federation static mode)
     AddPathRoute(PathRouteEntry),

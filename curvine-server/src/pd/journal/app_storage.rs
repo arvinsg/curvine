@@ -18,6 +18,7 @@ use crate::pd::journal::entry::PdEntry;
 use crate::pd::meta::MetaManager;
 use crate::pd::mount::MountManager;
 use crate::pd::node::NodeManager;
+use crate::pd::pool::PoolManager;
 use crate::pd::store::RocksKvEngine;
 use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::AppStorage;
@@ -34,6 +35,7 @@ pub struct PdAppStorage {
     config_manager: Arc<ConfigManager>,
     mount_manager: Arc<MountManager>,
     node_manager: Option<Arc<NodeManager>>,
+    pool_manager: Option<Arc<PoolManager>>,
     bg_manager: Option<Arc<BGManager>>,
     meta_manager: Option<Arc<MetaManager>>,
 }
@@ -45,6 +47,7 @@ impl PdAppStorage {
         config_manager: Arc<ConfigManager>,
         mount_manager: Arc<MountManager>,
         node_manager: Option<Arc<NodeManager>>,
+        pool_manager: Option<Arc<PoolManager>>,
         bg_manager: Option<Arc<BGManager>>,
         meta_manager: Option<Arc<MetaManager>>,
     ) -> Self {
@@ -54,6 +57,7 @@ impl PdAppStorage {
             config_manager,
             mount_manager,
             node_manager,
+            pool_manager,
             bg_manager,
             meta_manager,
         }
@@ -90,6 +94,16 @@ impl PdAppStorage {
                     nm.apply_save_node(&entry)?;
                 }
             }
+            PdEntry::SavePool(entry) => {
+                info!(
+                    "Apply SavePool pool_id:{}, workers:{}",
+                    entry.info.pool_id,
+                    entry.info.workers.len()
+                );
+                if let Some(ref pm) = self.pool_manager {
+                    pm.apply_save_pool(&entry)?;
+                }
+            }
             PdEntry::CreateBG(entry) => {
                 info!("Apply CreateBG bg_id={}", entry.info.bg_id);
                 if let Some(ref bm) = self.bg_manager {
@@ -106,6 +120,17 @@ impl PdAppStorage {
                 info!("Apply DeleteBG bg_id={}", bg_id);
                 if let Some(ref bm) = self.bg_manager {
                     bm.apply_delete_bg(bg_id)?;
+                }
+            }
+            PdEntry::BatchBG(entry) => {
+                info!(
+                    "Apply BatchBG table={}, creates={}, updates={}",
+                    entry.table.is_some(),
+                    entry.creates.len(),
+                    entry.updates.len()
+                );
+                if let Some(ref bm) = self.bg_manager {
+                    bm.apply_batch_bg(&entry)?;
                 }
             }
             PdEntry::AddPathRoute(ref entry) => {
@@ -162,6 +187,9 @@ impl AppStorage for PdAppStorage {
             .map_err(|e| RaftError::from(e.to_string()))?;
         if let Some(ref nm) = self.node_manager {
             nm.restore().map_err(|e| RaftError::from(e.to_string()))?;
+        }
+        if let Some(ref pm) = self.pool_manager {
+            pm.restore().map_err(|e| RaftError::from(e.to_string()))?;
         }
         if let Some(ref bm) = self.bg_manager {
             bm.restore().map_err(|e| RaftError::from(e.to_string()))?;

@@ -15,6 +15,7 @@
 use super::manager::PoolManager;
 use super::store::PoolStore;
 use crate::pd::config::ConfigManager;
+use crate::pd::journal;
 use crate::pd::node::NodeManager;
 use crate::pd::node::NodeStore;
 use crate::pd::store::memory_kv_engine::MemoryKvEngine;
@@ -25,20 +26,25 @@ use curvine_common::state::StorageSpec;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-fn test_pool_manager() -> PoolManager {
-    let store: Arc<dyn KvStore> = Arc::new(MemoryKvEngine::new());
+fn make_journal_client() -> Arc<journal::Client> {
     let journal_conf = JournalConf::default();
     let rt = journal_conf.create_runtime();
     let raft = RaftClient::from_conf(rt, &journal_conf);
+    Arc::new(journal::Client::new(raft))
+}
+
+fn test_pool_manager() -> PoolManager {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvEngine::new());
+    let jc = make_journal_client();
     let config_manager = Arc::new(ConfigManager::new(
         store.clone(),
-        raft,
+        jc.clone(),
         HashMap::new(),
     ));
     let node_store = Arc::new(NodeStore::new(store.clone()));
-    let node_manager = Arc::new(NodeManager::new(node_store, config_manager));
+    let node_manager = Arc::new(NodeManager::new(node_store, config_manager, jc.clone()));
     let pool_store = Arc::new(PoolStore::new(store));
-    PoolManager::new(pool_store, node_manager)
+    PoolManager::new(pool_store, node_manager, jc)
 }
 
 #[test]
@@ -128,18 +134,16 @@ fn remove_worker_from_pools() {
 #[test]
 fn restore_rebuilds_worker_to_pools_from_store_only() {
     let store: Arc<dyn KvStore> = Arc::new(MemoryKvEngine::new());
-    let journal_conf = JournalConf::default();
-    let rt = journal_conf.create_runtime();
-    let raft = RaftClient::from_conf(rt, &journal_conf);
+    let jc = make_journal_client();
     let config_manager = Arc::new(ConfigManager::new(
         store.clone(),
-        raft,
+        jc.clone(),
         HashMap::new(),
     ));
     let node_store = Arc::new(NodeStore::new(store.clone()));
-    let node_manager = Arc::new(NodeManager::new(node_store, config_manager));
+    let node_manager = Arc::new(NodeManager::new(node_store, config_manager, jc.clone()));
     let pool_store1 = Arc::new(PoolStore::new(store.clone()));
-    let mgr1 = PoolManager::new(pool_store1, node_manager.clone());
+    let mgr1 = PoolManager::new(pool_store1, node_manager.clone(), jc.clone());
     mgr1.restore().unwrap();
     let mut specs = std::collections::HashMap::new();
     specs.insert(
@@ -155,7 +159,7 @@ fn restore_rebuilds_worker_to_pools_from_store_only() {
     mgr1.assign_worker_to_pools(100, &specs).unwrap();
 
     let pool_store2 = Arc::new(PoolStore::new(store));
-    let mgr2 = PoolManager::new(pool_store2, node_manager);
+    let mgr2 = PoolManager::new(pool_store2, node_manager, jc);
     mgr2.restore().unwrap();
     let pool = mgr2.get_pool(super::POOL_ID_SSD).unwrap();
     assert!(pool.workers.contains(&100));
