@@ -12,15 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod balance;
+pub mod bg_table_scheduler;
 pub mod checker;
 pub mod checker_controller;
 pub mod coordinator;
 pub mod operator;
 pub mod operator_controller;
-pub mod rebuild_scheduler;
+pub mod placement;
 
+pub use bg_table_scheduler::BGTableScheduler;
 pub use checker::{BGPushCommand, CheckResult, Scheduler};
-pub use coordinator::{Coordinator, CoordinatorContext};
-pub use operator::{BGCommands, BGOperator, OpStatus, OpStep, RebuildReason};
+pub use coordinator::{Coordinator, CoordinatorContext, LeaderChecker};
+pub use operator::{BGCommands, BGOperator, OpStatus, OpStep, OperatorBuilder, OperatorKind};
 pub use operator_controller::OperatorController;
-pub use rebuild_scheduler::RebuildScheduler;

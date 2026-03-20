@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use self::balance::{BGBalanceChecker, LeaseBalanceChecker};
 use self::bg_assignment::BGAssignmentChecker;
-use self::node_health::NodeHealthChecker;
+use self::lease_validity::LeaseValidityChecker;
+use self::placement_rule::PlacementRuleChecker;
 use self::replica::ReplicaChecker;
 use crate::pd::node::NodeEvent;
 use crate::pd::schedule::operator::BGOperator;
@@ -21,8 +23,10 @@ use crate::pd::schedule::CoordinatorContext;
 use curvine_common::state::BlockGroupInfo;
 use std::sync::Arc;
 
+pub mod balance;
 pub mod bg_assignment;
-pub mod node_health;
+pub mod lease_validity;
+pub mod placement_rule;
 pub mod replica;
 
 /// Context passed to checkers (read-only refs to managers)
@@ -31,6 +35,8 @@ pub struct CheckerContext<'a> {
     pub bg_manager: &'a crate::pd::bg::BGManager,
     pub node_manager: &'a crate::pd::node::NodeManager,
     pub config_manager: &'a crate::pd::config::ConfigManager,
+    /// Suspect BGs that should be checked with priority.
+    pub suspect_bgs: Vec<BlockGroupInfo>,
 }
 
 /// Direct BG push command for a worker (via heartbeat response or RPC)
@@ -65,8 +71,11 @@ pub trait Scheduler: Send + Sync {
 /// Build default set of checkers
 pub fn default_checkers(ctx: Arc<CoordinatorContext>) -> Vec<Box<dyn Checker>> {
     vec![
-        Box::new(NodeHealthChecker::new(ctx.clone())),
+        Box::new(LeaseValidityChecker::new(ctx.clone())),
         Box::new(ReplicaChecker::new(ctx.clone())),
+        Box::new(PlacementRuleChecker::new(ctx.clone())),
+        Box::new(BGBalanceChecker::new(ctx.clone())),
+        Box::new(LeaseBalanceChecker::new(ctx.clone())),
         Box::new(BGAssignmentChecker::new(ctx)),
     ]
 }
