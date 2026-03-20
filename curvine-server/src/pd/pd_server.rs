@@ -39,6 +39,8 @@ use orpc::server::{RpcServer, ServerStateListener};
 use orpc::CommonResult;
 use std::sync::Arc;
 
+use crate::pd::schedule::coordinator::{LeaderChecker, RaftLeaderChecker};
+
 use crate::pd::rpc_handler::PdRpcHandler;
 
 fn parse_metanode_mode(s: &str) -> MetaNodeMode {
@@ -156,6 +158,7 @@ impl Pd {
             journal_client.clone(),
         ));
         pool_manager.restore()?;
+        pool_manager.rebuild_allocatable();
 
         let bg_store = Arc::new(BGStore::new(store.clone()));
         let bg_manager = Arc::new(BGManager::new(
@@ -189,6 +192,11 @@ impl Pd {
             Some(meta_manager.clone()),
         );
 
+        let role_monitor = RoleMonitor::new();
+        let role_ctl = role_monitor.read_ctl();
+        let leader_checker: Arc<dyn LeaderChecker> =
+            Arc::new(RaftLeaderChecker::new(role_ctl));
+
         let cluster_manager = Arc::new(ClusterManager::new(
             node_manager,
             pool_manager,
@@ -197,9 +205,9 @@ impl Pd {
             mount_manager.clone(),
             Some(meta_manager),
             journal_client,
+            leader_checker,
         ));
 
-        let role_monitor = RoleMonitor::new();
         let raft_journal = PdRaftJournal::new(
             journal_rt,
             log_store,

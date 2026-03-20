@@ -19,12 +19,24 @@ use crate::pd::journal::{self, PdEntry};
 use crate::pd::node::NodeManager;
 use crate::pd::pool::PoolManager;
 use curvine_common::state::{
-    BlockGroupInfo, BlockGroupInfoView, ReplicaInfo, BGTableSummary,
+    BGOpState, BlockGroupInfo, BlockGroupInfoView, ReplicaInfo, BGTableSummary,
+    BG_FLAG_LEASE_INVALID, BG_FLAG_NONE, BG_FLAG_ON_DECOMMISSION_NODE, BG_FLAG_OVER_REPLICATED,
+    BG_FLAG_PLACEMENT_VIOLATION, BG_FLAG_UNAVAILABLE, BG_FLAG_UNDER_REPLICATED,
 };
 use curvine_common::{FsError, FsResult};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::RwLock;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DirtyReason {
+    NodeLost,
+    NodeOffline,
+    NodeDecommission,
+    NodeRecovered,
+    ReplicaChanged,
+    LeaseChanged,
+}
 
 /// Expand BlockGroupInfo to view (replica_set with address and state). BG module owns this; node module stays agnostic of pool/BG.
 fn block_group_info_to_view(bg: &BlockGroupInfo, node_manager: &NodeManager) -> BlockGroupInfoView {
@@ -42,9 +54,12 @@ fn block_group_info_to_view(bg: &BlockGroupInfo, node_manager: &NodeManager) -> 
     BlockGroupInfoView {
         bg_id: bg.bg_id,
         table_id: bg.table_id,
-        epoch: bg.epoch,
+        bg_epoch: bg.bg_epoch,
+        lease_epoch: bg.lease_epoch,
         replica_set,
         state: bg.state,
+        flags: bg.flags,
+        op_state: bg.op_state,
         lease_owner: bg.lease_owner.clone(),
     }
 }
@@ -52,9 +67,18 @@ fn block_group_info_to_view(bg: &BlockGroupInfo, node_manager: &NodeManager) -> 
 pub struct BGManager {
     tables: RwLock<HashMap<u32, BGTable>>,
     bgs: RwLock<HashMap<u32, BlockGroupInfo>>,
+    worker_to_bgs: RwLock<HashMap<u32, HashSet<u32>>>,
+    dirty_bgs: RwLock<HashMap<u32, HashSet<DirtyReason>>>,
+    suspect_bgs: RwLock<HashMap<u32, SuspectEntry>>,
     store: Arc<BGStore>,
     pool_manager: Arc<PoolManager>,
     journal_client: Arc<journal::Client>,
+}
+
+/// Tracks a suspect BG for priority checking.
+struct SuspectEntry {
+    added_ms: u64,
+    check_count: u32,
 }
 
 impl BGManager {
@@ -66,6 +90,9 @@ impl BGManager {
         Self {
             tables: RwLock::new(HashMap::new()),
             bgs: RwLock::new(HashMap::new()),
+            worker_to_bgs: RwLock::new(HashMap::new()),
+            dirty_bgs: RwLock::new(HashMap::new()),
+            suspect_bgs: RwLock::new(HashMap::new()),
             store,
             pool_manager,
             journal_client,
@@ -77,12 +104,17 @@ impl BGManager {
         let bgs = self.store.list_all()?;
         let mut t = self.tables.write().unwrap();
         let mut b = self.bgs.write().unwrap();
+        let mut w2b = self.worker_to_bgs.write().unwrap();
         t.clear();
         b.clear();
+        w2b.clear();
         for table in tables {
             t.insert(table.table_id, table);
         }
         for bg in bgs {
+            for &wid in &bg.replica_set {
+                w2b.entry(wid).or_default().insert(bg.bg_id);
+            }
             b.insert(bg.bg_id, bg);
         }
         Ok(())
@@ -92,6 +124,10 @@ impl BGManager {
         let info = &entry.info;
         self.store.put(&info)?;
         self.bgs.write().unwrap().insert(info.bg_id, info.clone());
+        let mut w2b = self.worker_to_bgs.write().unwrap();
+        for &wid in &info.replica_set {
+            w2b.entry(wid).or_default().insert(info.bg_id);
+        }
         Ok(())
     }
 
@@ -106,12 +142,29 @@ impl BGManager {
             info.state = s;
         }
         if let Some(ref rs) = entry.replica_set {
+            let old_set: HashSet<u32> = info.replica_set.iter().copied().collect();
+            let new_set: HashSet<u32> = rs.iter().copied().collect();
+            let mut w2b = self.worker_to_bgs.write().unwrap();
+            for &removed in old_set.difference(&new_set) {
+                if let Some(set) = w2b.get_mut(&removed) {
+                    set.remove(&entry.bg_id);
+                    if set.is_empty() {
+                        w2b.remove(&removed);
+                    }
+                }
+            }
+            for &added in new_set.difference(&old_set) {
+                w2b.entry(added).or_default().insert(entry.bg_id);
+            }
             info.replica_set = rs.clone();
+            info.bg_epoch += 1;
+            self.mark_dirty(entry.bg_id, DirtyReason::ReplicaChanged);
         }
         if let Some(ref lease) = entry.lease_owner {
-            info.lease_owner = lease.clone();
+            info.lease_owner = Some(lease.clone());
+            info.lease_epoch += 1;
+            self.mark_dirty(entry.bg_id, DirtyReason::LeaseChanged);
         }
-        info.epoch += 1;
         self.store.put(&info)?;
         bgs.insert(entry.bg_id, info.clone());
         drop(bgs);
@@ -121,8 +174,20 @@ impl BGManager {
 
     pub fn apply_delete_bg(&self, bg_id: u32) -> FsResult<()> {
         let table_id = self.bgs.read().unwrap().get(&bg_id).map(|b| b.table_id);
+        let removed = self.bgs.write().unwrap().remove(&bg_id);
+        if let Some(bg) = removed {
+            let mut w2b = self.worker_to_bgs.write().unwrap();
+            for &wid in &bg.replica_set {
+                if let Some(set) = w2b.get_mut(&wid) {
+                    set.remove(&bg_id);
+                    if set.is_empty() {
+                        w2b.remove(&wid);
+                    }
+                }
+            }
+        }
         self.store.delete(bg_id)?;
-        self.bgs.write().unwrap().remove(&bg_id);
+        self.dirty_bgs.write().unwrap().remove(&bg_id);
         if let Some(tid) = table_id {
             let _ = self.bump_table_epoch(tid);
         }
@@ -147,6 +212,10 @@ impl BGManager {
         for bg in &entry.creates {
             self.store.put(bg)?;
             self.bgs.write().unwrap().insert(bg.bg_id, bg.clone());
+            let mut w2b = self.worker_to_bgs.write().unwrap();
+            for &wid in &bg.replica_set {
+                w2b.entry(wid).or_default().insert(bg.bg_id);
+            }
             if table_id_to_bump.is_none() {
                 table_id_to_bump = Some(bg.table_id);
             }
@@ -159,12 +228,27 @@ impl BGManager {
                     bg.state = s;
                 }
                 if let Some(ref rs) = update.replica_set {
+                    let old_set: HashSet<u32> = bg.replica_set.iter().copied().collect();
+                    let new_set: HashSet<u32> = rs.iter().copied().collect();
+                    let mut w2b = self.worker_to_bgs.write().unwrap();
+                    for &removed in old_set.difference(&new_set) {
+                        if let Some(set) = w2b.get_mut(&removed) {
+                            set.remove(&update.bg_id);
+                            if set.is_empty() {
+                                w2b.remove(&removed);
+                            }
+                        }
+                    }
+                    for &added in new_set.difference(&old_set) {
+                        w2b.entry(added).or_default().insert(update.bg_id);
+                    }
                     bg.replica_set = rs.clone();
+                    bg.bg_epoch += 1;
                 }
                 if let Some(ref lease) = update.lease_owner {
-                    bg.lease_owner = lease.clone();
+                    bg.lease_owner = Some(lease.clone());
+                    bg.lease_epoch += 1;
                 }
-                bg.epoch += 1;
                 self.store.put(bg)?;
                 if table_id_to_bump.is_none() {
                     table_id_to_bump = Some(bg.table_id);
@@ -197,7 +281,7 @@ impl BGManager {
         replica_count: u16,
         workers: &[u32],
     ) -> FsResult<()> {
-        use curvine_common::state::{BlockGroupPolicy, PlacementPolicy, StorageType};
+        use curvine_common::state::{BlockGroupPolicy, PlacementPolicy};
 
         let table_id = (pool_id as u32) << 16 | (replica_count as u32);
 
@@ -208,12 +292,17 @@ impl BGManager {
             )));
         }
 
+        let pool = self.pool_manager.get_pool(pool_id)?;
+
         let next_bg_id = self.store.get_next_bg_id()?;
         let policy = BlockGroupPolicy {
-            storage_type: StorageType::Ssd,
+            storage_type: pool.media,
             replicas: replica_count,
             placement: PlacementPolicy::Default,
         };
+
+        let worker_labels = self.pool_manager.get_worker_labels(workers);
+        let rules = self.get_pool_placement_rules(pool_id, PlacementPolicy::Default);
 
         let result = super::placement::build_table(
             table_id,
@@ -222,6 +311,8 @@ impl BGManager {
             policy,
             workers,
             next_bg_id,
+            &worker_labels,
+            &rules,
         )?;
 
         let new_next_id = next_bg_id + bucket_count;
@@ -275,18 +366,235 @@ impl BGManager {
         self.tables.read().unwrap().values().cloned().collect()
     }
 
+    /// Max table epoch across all tables (used as bg_version in heartbeat responses).
+    pub fn max_table_epoch(&self) -> u64 {
+        self.tables
+            .read()
+            .unwrap()
+            .values()
+            .map(|t| t.epoch)
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn list_bgs(&self) -> Vec<BlockGroupInfo> {
         self.bgs.read().unwrap().values().cloned().collect()
     }
 
-    /// BGs that have this worker in replica_set (for schedule/checkers).
-    pub fn get_bgs_on_worker(&self, worker_id: u32) -> Vec<BlockGroupInfo> {
-        self.bgs
+    /// Set BG operation state (runtime-only, not persisted via Raft).
+    /// Used by OperatorController to mark BGs as being operated on.
+    pub fn set_op_state(&self, bg_id: u32, op_state: BGOpState) {
+        if let Some(bg) = self.bgs.write().unwrap().get_mut(&bg_id) {
+            bg.op_state = op_state;
+        }
+    }
+
+    /// Add a flag to a BG (runtime-only, not persisted via Raft).
+    /// Used by checkers to mark transient conditions like assignment mismatch.
+    pub fn add_bg_flag(&self, bg_id: u32, flag: u32) {
+        if let Some(bg) = self.bgs.write().unwrap().get_mut(&bg_id) {
+            bg.flags |= flag;
+        }
+    }
+
+    /// Clear a flag from a BG (runtime-only).
+    pub fn clear_bg_flag(&self, bg_id: u32, flag: u32) {
+        if let Some(bg) = self.bgs.write().unwrap().get_mut(&bg_id) {
+            bg.flags &= !flag;
+        }
+    }
+
+    pub fn refresh_bg_flags(&self, bg_id: u32) -> FsResult<()> {
+        let mut bgs = self.bgs.write().unwrap();
+        let bg = bgs
+            .get_mut(&bg_id)
+            .ok_or_else(|| FsError::common(format!("bg {} not found", bg_id)))?;
+
+        let mut flags = BG_FLAG_NONE;
+        let alive_count = bg
+            .replica_set
+            .iter()
+            .filter(|w| self.pool_manager.is_worker_available(**w))
+            .count();
+        let desired_count = ((bg.table_id & 0xffff) as usize).max(1);
+
+        if alive_count == 0 {
+            flags |= BG_FLAG_UNAVAILABLE;
+        } else if alive_count < desired_count {
+            flags |= BG_FLAG_UNDER_REPLICATED;
+        } else if alive_count > desired_count {
+            flags |= BG_FLAG_OVER_REPLICATED;
+        }
+
+        if let Some(lease) = bg.lease_owner.as_ref() {
+            if !bg.replica_set.contains(&lease.node_id) || !self.pool_manager.is_worker_available(lease.node_id) {
+                flags |= BG_FLAG_LEASE_INVALID;
+            }
+        } else {
+            flags |= BG_FLAG_LEASE_INVALID;
+        }
+
+        if bg.state == curvine_common::state::BGState::Degraded {
+            flags |= BG_FLAG_UNDER_REPLICATED;
+        }
+
+        if bg
+            .replica_set
+            .iter()
+            .any(|w| self.pool_manager.get_worker_node(*w).map(|n| n.state == curvine_common::state::NodeState::Decommission).unwrap_or(false))
+        {
+            flags |= BG_FLAG_ON_DECOMMISSION_NODE;
+        }
+
+        // Placement violation detection
+        let pool_id = (bg.table_id >> 16) as u16;
+        let rules = self.get_pool_placement_rules(pool_id, bg.placement);
+        if rules.iter().any(|r| !r.label_constraints.is_empty() || !r.location_labels.is_empty()) {
+            let worker_ids: Vec<u32> = bg.replica_set.clone();
+            let worker_labels = self.pool_manager.get_worker_labels(&worker_ids);
+            let fit = crate::pd::schedule::placement::fit::fit_bg(&bg.replica_set, &rules, &worker_labels);
+            if fit.has_violation() {
+                flags |= BG_FLAG_PLACEMENT_VIOLATION;
+            }
+        }
+
+        bg.flags = flags;
+        Ok(())
+    }
+
+    pub fn refresh_all_bg_flags(&self) {
+        let bg_ids: Vec<u32> = self.bgs.read().unwrap().keys().copied().collect();
+        for bg_id in bg_ids {
+            let _ = self.refresh_bg_flags(bg_id);
+        }
+    }
+
+    /// Refresh flags for all BGs on a specific worker (event-driven, targeted).
+    /// Marks changed BGs as dirty with the given reason.
+    pub fn refresh_bg_flags_for_worker(&self, worker_id: u32, reason: DirtyReason) {
+        let bg_ids: Vec<u32> = self
+            .worker_to_bgs
             .read()
             .unwrap()
-            .values()
-            .filter(|bg| bg.replica_set.contains(&worker_id))
-            .cloned()
+            .get(&worker_id)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        for bg_id in bg_ids {
+            let old_flags = self.bgs.read().unwrap().get(&bg_id).map(|bg| bg.flags);
+            if self.refresh_bg_flags(bg_id).is_ok() {
+                let new_flags = self.bgs.read().unwrap().get(&bg_id).map(|bg| bg.flags);
+                if old_flags != new_flags {
+                    self.mark_dirty(bg_id, reason);
+                }
+            }
+        }
+    }
+
+    // ========== Dirty BG management ==========
+
+    pub fn mark_dirty(&self, bg_id: u32, reason: DirtyReason) {
+        self.dirty_bgs
+            .write()
+            .unwrap()
+            .entry(bg_id)
+            .or_default()
+            .insert(reason);
+    }
+
+    pub fn clear_dirty(&self, bg_id: u32) {
+        self.dirty_bgs.write().unwrap().remove(&bg_id);
+    }
+
+    pub fn list_dirty_bgs(&self) -> Vec<(u32, HashSet<DirtyReason>)> {
+        self.dirty_bgs
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    }
+
+    // ========== Suspect BG tracking ==========
+
+    /// Mark a BG as suspect (needs priority checking by checkers).
+    pub fn mark_suspect(&self, bg_id: u32) {
+        let now = orpc::common::LocalTime::mills();
+        self.suspect_bgs
+            .write()
+            .unwrap()
+            .entry(bg_id)
+            .or_insert(SuspectEntry {
+                added_ms: now,
+                check_count: 0,
+            });
+    }
+
+    /// Mark all BGs on a worker as suspect.
+    pub fn mark_worker_bgs_suspect(&self, worker_id: u32) {
+        let bg_ids: Vec<u32> = self
+            .worker_to_bgs
+            .read()
+            .unwrap()
+            .get(&worker_id)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        let now = orpc::common::LocalTime::mills();
+        let mut suspects = self.suspect_bgs.write().unwrap();
+        for bg_id in bg_ids {
+            suspects.entry(bg_id).or_insert(SuspectEntry {
+                added_ms: now,
+                check_count: 0,
+            });
+        }
+    }
+
+    /// Get all suspect BGs, incrementing check counts and expiring stale entries.
+    pub fn take_suspect_bgs(&self, max_checks: u32, ttl_ms: u64) -> Vec<BlockGroupInfo> {
+        let now = orpc::common::LocalTime::mills();
+        let mut suspects = self.suspect_bgs.write().unwrap();
+        let mut expired = Vec::new();
+        let mut result_ids = Vec::new();
+
+        for (bg_id, entry) in suspects.iter_mut() {
+            if now.saturating_sub(entry.added_ms) > ttl_ms || entry.check_count >= max_checks {
+                expired.push(*bg_id);
+                continue;
+            }
+            entry.check_count += 1;
+            result_ids.push(*bg_id);
+        }
+        for id in expired {
+            suspects.remove(&id);
+        }
+        drop(suspects);
+
+        let bgs = self.bgs.read().unwrap();
+        result_ids
+            .iter()
+            .filter_map(|id| bgs.get(id).cloned())
+            .collect()
+    }
+
+    /// Clear a BG from the suspect set (checker found no issue).
+    pub fn clear_suspect(&self, bg_id: u32) {
+        self.suspect_bgs.write().unwrap().remove(&bg_id);
+    }
+
+    /// Number of suspect BGs.
+    pub fn suspect_count(&self) -> usize {
+        self.suspect_bgs.read().unwrap().len()
+    }
+
+    /// BGs that have this worker in replica_set (uses worker_to_bgs index).
+    pub fn get_bgs_on_worker(&self, worker_id: u32) -> Vec<BlockGroupInfo> {
+        let w2b = self.worker_to_bgs.read().unwrap();
+        let Some(bg_ids) = w2b.get(&worker_id) else {
+            return Vec::new();
+        };
+        let bgs = self.bgs.read().unwrap();
+        bg_ids
+            .iter()
+            .filter_map(|bg_id| bgs.get(bg_id).cloned())
             .collect()
     }
 
@@ -308,7 +616,10 @@ impl BGManager {
             .unwrap()
             .values()
             .filter(|bg| {
-                bg.lease_owner.expire_time_ms > 0 && bg.lease_owner.expire_time_ms < now_ms
+                bg.lease_owner
+                    .as_ref()
+                    .map(|lease| lease.expire_time_ms > 0 && lease.expire_time_ms < now_ms)
+                    .unwrap_or(false)
             })
             .cloned()
             .collect()
@@ -431,9 +742,42 @@ impl BGManager {
             .map(|t| t.table_id)
             .collect();
         for table_id in table_ids {
-            let _ = self.rebuild_table(table_id);
+            if let Err(e) = self.rebuild_table(table_id) {
+                log::error!("Failed to rebuild table {}: {}", table_id, e);
+            }
         }
         Ok(())
+    }
+
+    /// Get placement rules for a pool. Falls back to expanding the PlacementPolicy.
+    pub fn get_pool_placement_rules(
+        &self,
+        _pool_id: u16,
+        placement: curvine_common::state::PlacementPolicy,
+    ) -> Vec<crate::pd::schedule::placement::PlacementRule> {
+        // TODO: load custom rules from ConfigManager KV when supported
+        // For now, expand from PlacementPolicy
+        vec![crate::pd::schedule::placement::PlacementRule::from_placement_policy(
+            placement,
+            &[], // no default_location_labels for now
+        )]
+    }
+}
+
+impl crate::pd::node::DecommissionChecker for BGManager {
+    fn has_bgs_on_node(&self, node_id: u32) -> bool {
+        self.worker_to_bgs
+            .read()
+            .unwrap()
+            .get(&node_id)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    }
+
+    fn has_pending_operators_for_node(&self, _node_id: u32) -> bool {
+        // BGManager alone cannot check operators.
+        // CompositeDecommissionChecker in cluster/manager.rs provides the real implementation.
+        false
     }
 }
 
@@ -468,18 +812,22 @@ mod tests {
 
     fn make_bg(bg_id: u32, table_id: u32, replica_set: Vec<u32>) -> BlockGroupInfo {
         let leader = replica_set.first().copied().unwrap_or(0);
-        BlockGroupInfo {
-            bg_id,
-            table_id,
-            epoch: 1,
-            replica_set,
-            state: BGState::Assigned,
-            lease_owner: BGLease {
-                node_id: leader,
-                expire_time_ms: 0,
-            },
-            stats: Default::default(),
-        }
+                    BlockGroupInfo {
+                        bg_id,
+                        table_id,
+                        bg_epoch: 1,
+                        lease_epoch: 1,
+                        replica_set,
+                        state: BGState::Assigned,
+                        flags: BG_FLAG_NONE,
+                        op_state: Default::default(),
+                        lease_owner: Some(BGLease {
+                            node_id: leader,
+                            expire_time_ms: 0,
+                        }),
+                        placement: curvine_common::state::PlacementPolicy::Default,
+                        stats: Default::default(),
+                    }
     }
 
     #[test]
@@ -547,8 +895,8 @@ mod tests {
         })
         .unwrap();
         let got = mgr.get_bg(5).unwrap();
-        assert_eq!(got.lease_owner.node_id, 501);
-        assert_eq!(got.lease_owner.expire_time_ms, 99_000);
+        assert_eq!(got.lease_owner.as_ref().unwrap().node_id, 501);
+        assert_eq!(got.lease_owner.as_ref().unwrap().expire_time_ms, 99_000);
     }
 
     #[test]
@@ -572,5 +920,292 @@ mod tests {
         let bgs_after = mgr.list_bgs();
         assert_eq!(bgs_after.len(), 1);
         assert_eq!(bgs_after[0].bg_id, 5);
+    }
+
+    // ========== Epoch correctness tests ==========
+
+    #[test]
+    fn bg_epoch_increments_on_replica_set_change() {
+        let mgr = test_manager();
+        let info = make_bg(10, 1, vec![1, 2, 3]);
+        mgr.apply_create_bg(&BGEntry {
+            op_ms: 0,
+            info: info.clone(),
+        })
+        .unwrap();
+        assert_eq!(mgr.get_bg(10).unwrap().bg_epoch, 1);
+
+        mgr.apply_update_bg(&BGUpdateEntry {
+            op_ms: 1,
+            bg_id: 10,
+            state: None,
+            replica_set: Some(vec![1, 2, 4]),
+            lease_owner: None,
+        })
+        .unwrap();
+        assert_eq!(mgr.get_bg(10).unwrap().bg_epoch, 2);
+
+        // Second replica change should increment again
+        mgr.apply_update_bg(&BGUpdateEntry {
+            op_ms: 2,
+            bg_id: 10,
+            state: None,
+            replica_set: Some(vec![1, 5, 4]),
+            lease_owner: None,
+        })
+        .unwrap();
+        assert_eq!(mgr.get_bg(10).unwrap().bg_epoch, 3);
+    }
+
+    #[test]
+    fn lease_epoch_increments_on_lease_change() {
+        let mgr = test_manager();
+        let info = make_bg(11, 1, vec![1, 2]);
+        mgr.apply_create_bg(&BGEntry {
+            op_ms: 0,
+            info: info.clone(),
+        })
+        .unwrap();
+        assert_eq!(mgr.get_bg(11).unwrap().lease_epoch, 1);
+
+        mgr.apply_update_bg(&BGUpdateEntry {
+            op_ms: 1,
+            bg_id: 11,
+            state: None,
+            replica_set: None,
+            lease_owner: Some(BGLease {
+                node_id: 2,
+                expire_time_ms: 100_000,
+            }),
+        })
+        .unwrap();
+        assert_eq!(mgr.get_bg(11).unwrap().lease_epoch, 2);
+    }
+
+    #[test]
+    fn state_change_does_not_increment_epoch() {
+        let mgr = test_manager();
+        let info = make_bg(12, 1, vec![1]);
+        mgr.apply_create_bg(&BGEntry { op_ms: 0, info }).unwrap();
+        let before = mgr.get_bg(12).unwrap();
+
+        mgr.apply_update_bg(&BGUpdateEntry {
+            op_ms: 1,
+            bg_id: 12,
+            state: Some(BGState::Degraded),
+            replica_set: None,
+            lease_owner: None,
+        })
+        .unwrap();
+        let after = mgr.get_bg(12).unwrap();
+        assert_eq!(before.bg_epoch, after.bg_epoch);
+        assert_eq!(before.lease_epoch, after.lease_epoch);
+    }
+
+    #[test]
+    fn invalid_state_transition_rejected() {
+        let mgr = test_manager();
+        // BG starts at Assigned state
+        let info = make_bg(13, 1, vec![1]);
+        mgr.apply_create_bg(&BGEntry { op_ms: 0, info }).unwrap();
+
+        // Assigned -> Recovering is not valid (must go through Degraded first)
+        let result = mgr.apply_update_bg(&BGUpdateEntry {
+            op_ms: 1,
+            bg_id: 13,
+            state: Some(BGState::Recovering),
+            replica_set: None,
+            lease_owner: None,
+        });
+        assert!(result.is_err());
+    }
+
+    // ========== Worker-to-BG index tests ==========
+
+    #[test]
+    fn worker_to_bg_index_updated_on_replica_change() {
+        let mgr = test_manager();
+        let info = make_bg(20, 1, vec![1, 2]);
+        mgr.apply_create_bg(&BGEntry { op_ms: 0, info }).unwrap();
+
+        // Worker 1 and 2 should have bg 20
+        assert_eq!(mgr.get_bgs_on_worker(1).len(), 1);
+        assert_eq!(mgr.get_bgs_on_worker(2).len(), 1);
+        assert_eq!(mgr.get_bgs_on_worker(3).len(), 0);
+
+        // Change replica_set: remove worker 2, add worker 3
+        mgr.apply_update_bg(&BGUpdateEntry {
+            op_ms: 1,
+            bg_id: 20,
+            state: None,
+            replica_set: Some(vec![1, 3]),
+            lease_owner: None,
+        })
+        .unwrap();
+
+        assert_eq!(mgr.get_bgs_on_worker(1).len(), 1);
+        assert_eq!(mgr.get_bgs_on_worker(2).len(), 0); // removed
+        assert_eq!(mgr.get_bgs_on_worker(3).len(), 1); // added
+    }
+
+    #[test]
+    fn worker_to_bg_index_cleaned_on_delete() {
+        let mgr = test_manager();
+        let info = make_bg(21, 1, vec![1, 2]);
+        mgr.apply_create_bg(&BGEntry { op_ms: 0, info }).unwrap();
+        assert_eq!(mgr.get_bgs_on_worker(1).len(), 1);
+
+        mgr.apply_delete_bg(21).unwrap();
+        assert_eq!(mgr.get_bgs_on_worker(1).len(), 0);
+        assert_eq!(mgr.get_bgs_on_worker(2).len(), 0);
+    }
+
+    // ========== set_op_state tests ==========
+
+    #[test]
+    fn set_op_state_updates_runtime_state() {
+        let mgr = test_manager();
+        let info = make_bg(30, 1, vec![1]);
+        mgr.apply_create_bg(&BGEntry { op_ms: 0, info }).unwrap();
+        assert_eq!(mgr.get_bg(30).unwrap().op_state, BGOpState::Idle);
+
+        mgr.set_op_state(30, BGOpState::Recovering);
+        assert_eq!(mgr.get_bg(30).unwrap().op_state, BGOpState::Recovering);
+
+        mgr.set_op_state(30, BGOpState::Idle);
+        assert_eq!(mgr.get_bg(30).unwrap().op_state, BGOpState::Idle);
+    }
+
+    #[test]
+    fn set_op_state_nonexistent_bg_is_noop() {
+        let mgr = test_manager();
+        // Should not panic
+        mgr.set_op_state(999, BGOpState::Recovering);
+    }
+
+    // ========== Dirty BG tracking tests ==========
+
+    #[test]
+    fn mark_and_list_dirty_bgs() {
+        let mgr = test_manager();
+        let info = make_bg(40, 1, vec![1]);
+        mgr.apply_create_bg(&BGEntry { op_ms: 0, info }).unwrap();
+
+        mgr.mark_dirty(40, DirtyReason::NodeLost);
+        let dirty = mgr.list_dirty_bgs();
+        assert_eq!(dirty.len(), 1);
+        assert!(dirty[0].1.contains(&DirtyReason::NodeLost));
+
+        mgr.mark_dirty(40, DirtyReason::ReplicaChanged);
+        let dirty = mgr.list_dirty_bgs();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].1.len(), 2); // two reasons
+
+        mgr.clear_dirty(40);
+        assert!(mgr.list_dirty_bgs().is_empty());
+    }
+
+    // ========== get_bgs_with_expired_lease tests ==========
+
+    #[test]
+    fn expired_lease_detection() {
+        let mgr = test_manager();
+        // BG with lease expiring at 1000ms
+        let mut info = make_bg(50, 1, vec![1]);
+        info.lease_owner = Some(BGLease {
+            node_id: 1,
+            expire_time_ms: 1000,
+        });
+        mgr.apply_create_bg(&BGEntry { op_ms: 0, info }).unwrap();
+
+        // BG with no expiry (expire_time_ms = 0 means no expiry)
+        let mut info2 = make_bg(51, 1, vec![2]);
+        info2.lease_owner = Some(BGLease {
+            node_id: 2,
+            expire_time_ms: 0,
+        });
+        mgr.apply_create_bg(&BGEntry {
+            op_ms: 0,
+            info: info2,
+        })
+        .unwrap();
+
+        // At t=500, nothing expired
+        assert_eq!(mgr.get_bgs_with_expired_lease(500).len(), 0);
+
+        // At t=2000, bg 50 expired
+        let expired = mgr.get_bgs_with_expired_lease(2000);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].bg_id, 50);
+    }
+
+    // ========== Suspect BG tests ==========
+
+    #[test]
+    fn mark_and_take_suspect_bgs() {
+        let mgr = test_manager();
+        let info1 = make_bg(60, 1, vec![1]);
+        let info2 = make_bg(61, 1, vec![2]);
+        mgr.apply_create_bg(&BGEntry { op_ms: 0, info: info1 }).unwrap();
+        mgr.apply_create_bg(&BGEntry { op_ms: 0, info: info2 }).unwrap();
+
+        assert_eq!(mgr.suspect_count(), 0);
+
+        mgr.mark_suspect(60);
+        mgr.mark_suspect(61);
+        assert_eq!(mgr.suspect_count(), 2);
+
+        // take_suspect_bgs returns all suspect BGs and increments check_count
+        let suspects = mgr.take_suspect_bgs(5, 300_000);
+        assert_eq!(suspects.len(), 2);
+        // After take, count still 2 (entries are not removed, just incremented)
+        assert_eq!(mgr.suspect_count(), 2);
+    }
+
+    #[test]
+    fn suspect_expires_after_max_checks() {
+        let mgr = test_manager();
+        let info = make_bg(70, 1, vec![1]);
+        mgr.apply_create_bg(&BGEntry { op_ms: 0, info }).unwrap();
+
+        mgr.mark_suspect(70);
+        // max_checks=3: take increments check_count each call.
+        // After 3 takes, check_count=3; on the 4th take it's expired (>= max_checks).
+        let _ = mgr.take_suspect_bgs(3, 300_000); // check_count: 0->1
+        assert_eq!(mgr.suspect_count(), 1);
+        let _ = mgr.take_suspect_bgs(3, 300_000); // check_count: 1->2
+        assert_eq!(mgr.suspect_count(), 1);
+        let _ = mgr.take_suspect_bgs(3, 300_000); // check_count: 2->3
+        assert_eq!(mgr.suspect_count(), 1);
+        let _ = mgr.take_suspect_bgs(3, 300_000); // check_count=3 >= max_checks=3 -> expired
+        assert_eq!(mgr.suspect_count(), 0);
+    }
+
+    #[test]
+    fn clear_suspect_removes_entry() {
+        let mgr = test_manager();
+        let info = make_bg(80, 1, vec![1]);
+        mgr.apply_create_bg(&BGEntry { op_ms: 0, info }).unwrap();
+
+        mgr.mark_suspect(80);
+        assert_eq!(mgr.suspect_count(), 1);
+
+        mgr.clear_suspect(80);
+        assert_eq!(mgr.suspect_count(), 0);
+    }
+
+    #[test]
+    fn mark_worker_bgs_suspect_marks_all_bgs_on_worker() {
+        let mgr = test_manager();
+        let info1 = make_bg(90, 1, vec![1, 2]);
+        let info2 = make_bg(91, 1, vec![1, 3]);
+        let info3 = make_bg(92, 1, vec![3, 4]); // not on worker 1
+        mgr.apply_create_bg(&BGEntry { op_ms: 0, info: info1 }).unwrap();
+        mgr.apply_create_bg(&BGEntry { op_ms: 0, info: info2 }).unwrap();
+        mgr.apply_create_bg(&BGEntry { op_ms: 0, info: info3 }).unwrap();
+
+        mgr.mark_worker_bgs_suspect(1);
+        // BGs 90 and 91 are on worker 1, BG 92 is not
+        assert_eq!(mgr.suspect_count(), 2);
     }
 }

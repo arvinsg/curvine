@@ -35,6 +35,8 @@ pub struct PoolInfo {
 
     // ========== Non-persisted ==========
     #[serde(skip)]
+    pub allocatable_workers: HashSet<u32>,
+    #[serde(skip)]
     pub stats: PoolStats,
 }
 
@@ -46,6 +48,7 @@ impl PoolInfo {
             media,
             workers: HashSet::new(),
             epoch: 0,
+            allocatable_workers: HashSet::new(),
             stats: PoolStats::default(),
         }
     }

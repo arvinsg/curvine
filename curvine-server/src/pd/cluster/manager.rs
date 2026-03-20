@@ -17,16 +17,36 @@ use crate::pd::config::ConfigManager;
 use crate::pd::journal;
 use crate::pd::meta::MetaManager;
 use crate::pd::mount::MountManager;
-use crate::pd::node::{NodeEvent, NodeManager};
+use crate::pd::node::{DecommissionChecker, NodeManager};
 use crate::pd::pool::PoolManager;
+use crate::pd::schedule::operator_controller::OperatorController;
+use crate::pd::schedule::coordinator::LeaderChecker;
 use crate::pd::schedule::{Coordinator, CoordinatorContext};
 use curvine_common::state::{
-    HeartbeatRequest, HeartbeatResponse, HeartbeatResponsePayload, MetaHeartbeatResponse,
-    NodePayload, NodeState, NodeType, RegisterRequest, WorkerHeartbeatResponse,
+    HeartbeatRequest, HeartbeatResponse, HeartbeatResponsePayload,
+    MetaHeartbeatResponse, NodePayload, NodeState, RegisterRequest,
+    WorkerHeartbeatResponse,
 };
 use curvine_common::{FsError, FsResult};
-use log::info;
 use std::sync::Arc;
+
+/// Composite decommission checker that combines BG presence check (from BGManager)
+/// with in-flight operator check (from OperatorController).
+struct CompositeDecommissionChecker {
+    bg_manager: Arc<BGManager>,
+    operator_controller: Arc<OperatorController>,
+}
+
+impl DecommissionChecker for CompositeDecommissionChecker {
+    fn has_bgs_on_node(&self, node_id: u32) -> bool {
+        !self.bg_manager.get_bgs_on_worker(node_id).is_empty()
+    }
+
+    fn has_pending_operators_for_node(&self, node_id: u32) -> bool {
+        self.operator_controller
+            .has_running_operators_for_node(node_id)
+    }
+}
 
 /// Cluster manager: ties node, pool, bg, config, mount, meta (MetaNode Federation) and the schedule coordinator.
 pub struct ClusterManager {
@@ -49,6 +69,7 @@ impl ClusterManager {
         mount_manager: Arc<MountManager>,
         meta_manager: Option<Arc<MetaManager>>,
         journal_client: Arc<journal::Client>,
+        leader_checker: Arc<dyn LeaderChecker>,
     ) -> Self {
         let event_rx = node_manager.subscribe();
         let ctx = Arc::new(CoordinatorContext {
@@ -57,19 +78,18 @@ impl ClusterManager {
             bg_manager: bg_manager.clone(),
             config_manager: config_manager.clone(),
             journal_client: journal_client.clone(),
+            leader_checker,
         });
         let coordinator = Arc::new(Coordinator::new(ctx));
         coordinator.clone().run(event_rx);
 
-        // Spawn event listener for ClusterManager-level dispatching
-        let cm_event_rx = node_manager.subscribe();
-        let pm = pool_manager.clone();
-        let bgm = bg_manager.clone();
-        let coord2 = coordinator.clone();
-        let jc = journal_client.clone();
-        tokio::spawn(async move {
-            Self::event_loop(cm_event_rx, pm, bgm, coord2, jc).await;
+        // Wire up composite decommission checker (BG + operator awareness) and start liveness loop
+        let decom_checker = Arc::new(CompositeDecommissionChecker {
+            bg_manager: bg_manager.clone(),
+            operator_controller: coordinator.operator_controller(),
         });
+        node_manager.set_decommission_checker(decom_checker);
+        node_manager.clone().start_liveness_loop();
 
         let meta_manager = meta_manager.expect("MetaManager is required");
         Self {
@@ -84,93 +104,6 @@ impl ClusterManager {
         }
     }
 
-    async fn event_loop(
-        mut rx: tokio::sync::broadcast::Receiver<NodeEvent>,
-        pool_manager: Arc<PoolManager>,
-        bg_manager: Arc<BGManager>,
-        coordinator: Arc<Coordinator>,
-        journal_client: Arc<journal::Client>,
-    ) {
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    Self::handle_event(&event, &pool_manager, &bg_manager, &coordinator, &journal_client);
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    log::warn!("ClusterManager event loop lagged {} events", n);
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    info!("ClusterManager event channel closed");
-                    break;
-                }
-            }
-        }
-    }
-
-    fn handle_event(
-        event: &NodeEvent,
-        pool_manager: &PoolManager,
-        bg_manager: &BGManager,
-        coordinator: &Coordinator,
-        _journal_client: &journal::Client,
-    ) {
-        match event {
-            NodeEvent::Registered {
-                node_id,
-                node_type: NodeType::Worker,
-                ..
-            } => {
-                coordinator.on_worker_joined(*node_id, pool_manager.get_pools_by_worker(*node_id));
-            }
-            NodeEvent::StateChanged {
-                node_id,
-                node_type: NodeType::Worker,
-                old_state,
-                new_state,
-            } => {
-                match (old_state, new_state) {
-                    (NodeState::Starting, NodeState::Live)
-                    | (NodeState::Lost, NodeState::Live) => {
-                        // Worker came alive — assign to pools is done during register/heartbeat
-                        info!("Worker {} became Live", node_id);
-                    }
-                    (NodeState::Live, NodeState::Lost) => {
-                        let affected = bg_manager.get_bgs_on_worker(*node_id);
-                        for bg in &affected {
-                            if let Err(e) = bg_manager.propose_update_bg(
-                                crate::pd::journal::entry::BGUpdateEntry {
-                                    op_ms: orpc::common::LocalTime::mills(),
-                                    bg_id: bg.bg_id,
-                                    state: Some(curvine_common::state::BGState::Degraded),
-                                    replica_set: None,
-                                    lease_owner: None,
-                                },
-                            ) {
-                                log::warn!("Failed to degrade BG {}: {}", bg.bg_id, e);
-                            }
-                        }
-                        if !affected.is_empty() {
-                            log::warn!(
-                                "Worker {} lost, {} BGs degraded via event",
-                                node_id,
-                                affected.len()
-                            );
-                        }
-                    }
-                    (_, NodeState::Offline) => {
-                        let pool_ids = pool_manager.get_pools_by_worker(*node_id);
-                        if let Err(e) = pool_manager.remove_worker_from_pools(*node_id) {
-                            log::error!("remove_worker_from_pools {} failed: {}", node_id, e);
-                        }
-                        coordinator.on_worker_removed(*node_id, pool_ids);
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }
-
     // ========== Worker registration & heartbeat ==========
 
     pub fn handle_worker_register(&self, req: RegisterRequest) -> FsResult<HeartbeatResponse> {
@@ -182,25 +115,20 @@ impl ClusterManager {
         // NodeManager.register() validates, builds NodeInfo, and proposes via Raft.
         let (node_info, new_epoch) = self.node_manager.register(req)?;
 
-        let pool_ids = self
+        let _pool_ids = self
             .pool_manager
             .assign_worker_to_pools(node_info.base.node_id, &worker_payload.storage_specs)?;
 
-        self.coordinator
-            .on_worker_joined(node_info.base.node_id, pool_ids);
+        // Coordinator event_loop handles rebuild scheduling via NodeEvent::Registered
 
-        let assigned_bgs = self.bg_manager.list_bgs();
-        let worker_bgs: Vec<_> = assigned_bgs
-            .into_iter()
-            .filter(|bg| bg.replica_set.contains(&node_info.base.node_id))
-            .collect();
+        let worker_bgs = self.bg_manager.get_bgs_on_worker(node_info.base.node_id);
 
         Ok(HeartbeatResponse {
             error: None,
             epoch: new_epoch,
-            config_version: 0,
-            mount_version: 0,
-            bg_version: 0,
+            config_version: self.config_manager.version(),
+            mount_version: self.mount_manager.version(),
+            bg_version: self.bg_manager.max_table_epoch(),
             payload: HeartbeatResponsePayload::Worker(WorkerHeartbeatResponse {
                 add_bgs: worker_bgs,
                 remove_bgs: vec![],
@@ -240,9 +168,9 @@ impl ClusterManager {
         Ok(HeartbeatResponse {
             error: None,
             epoch: new_epoch,
-            config_version: 0,
-            mount_version: 0,
-            bg_version: 0,
+            config_version: self.config_manager.version(),
+            mount_version: self.mount_manager.version(),
+            bg_version: self.bg_manager.max_table_epoch(),
             payload: HeartbeatResponsePayload::Meta(meta_resp),
         })
     }
@@ -256,17 +184,10 @@ impl ClusterManager {
         Ok(resp)
     }
 
-    // ========== Worker offline ==========
-
-    pub fn on_worker_offline(&self, worker_id: u32) -> FsResult<()> {
-        let pool_ids = self.pool_manager.get_pools_by_worker(worker_id);
-        self.pool_manager.remove_worker_from_pools(worker_id)?;
-        self.coordinator.on_worker_removed(worker_id, pool_ids);
-        Ok(())
-    }
+    // ========== Decommission ==========
 
     pub fn handle_decommission(&self, node_id: u32, wait_migration: bool) -> FsResult<NodeState> {
-        let node = self
+        let _node = self
             .node_manager
             .get_node(node_id)
             .ok_or_else(|| FsError::common(format!("node {} not found", node_id)))?;
@@ -277,12 +198,10 @@ impl ClusterManager {
             NodeState::Offline
         };
 
+        // State transition emits the corresponding NodeEvent (Decommission or Offline),
+        // Coordinator event_loop handles all side-effects.
         self.node_manager
             .update_state_and_persist(node_id, target_state)?;
-
-        if !wait_migration && node.base.node_type == curvine_common::state::NodeType::Worker {
-            self.on_worker_offline(node_id)?;
-        }
 
         Ok(target_state)
     }

@@ -19,7 +19,7 @@ pub mod state_machine;
 mod store;
 mod table;
 
-pub use manager::BGManager;
+pub use manager::{BGManager, DirtyReason};
 pub use store::BGStore;
 pub use table::BGTable;
 pub use curvine_common::state::BGTableSummary;

@@ -23,6 +23,7 @@ use curvine_common::{FsError, FsResult};
 use log::info;
 use orpc::common::LocalTime;
 use rand::Rng;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -30,6 +31,7 @@ pub struct MountManager {
     index: Arc<RwLock<MountTableIndex>>,
     store: Arc<MountStore>,
     journal_client: Arc<journal::Client>,
+    version: AtomicU64,
 }
 
 impl MountManager {
@@ -39,6 +41,7 @@ impl MountManager {
             index: Arc::new(RwLock::new(MountTableIndex::new())),
             store,
             journal_client,
+            version: AtomicU64::new(0),
         }
     }
 
@@ -63,6 +66,7 @@ impl MountManager {
         self.store.put_mount(&info)?;
         let mut index = self.index.write().unwrap();
         index.insert(info);
+        self.version.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -74,6 +78,7 @@ impl MountManager {
         };
         drop(index);
         self.store.delete_mount(mount_id)?;
+        self.version.fetch_add(1, Ordering::Relaxed);
         info!("Apply unmount: {} (id={})", info.cv_path, mount_id);
         Ok(())
     }
@@ -219,5 +224,10 @@ impl MountManager {
             .get_by_id(mount_id)
             .cloned()
             .ok_or_else(|| FsError::common(format!("failed found {} entry", mount_id)))
+    }
+
+    /// Monotonic mount version (incremented on each mount/unmount apply).
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Relaxed)
     }
 }

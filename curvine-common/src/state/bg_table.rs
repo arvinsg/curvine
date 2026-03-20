@@ -65,13 +65,16 @@ mod tests {
         BlockGroupInfoView {
             bg_id,
             table_id,
-            epoch: 1,
+            bg_epoch: 1,
+            lease_epoch: 1,
             replica_set: vec![],
             state: BGState::Assigned,
-            lease_owner: BGLease {
+            flags: 0,
+            op_state: Default::default(),
+            lease_owner: Some(BGLease {
                 node_id: 0,
                 expire_time_ms: 0,
-            },
+            }),
         }
     }
 

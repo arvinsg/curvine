@@ -18,23 +18,24 @@ use curvine_common::{FsError, FsResult};
 /// Validate and execute BG state transitions:
 ///
 /// ```text
-/// Init ──assign──> Assigned
-///                      │
-///                      ├──worker lost──> Degraded ──recover──> Recovering ──done──> Assigned
-///                      │
-///                      ├──data migration──> Moving ──done──> Assigned
-///                      │
-///                      └──delete cmd──> Deleting
+/// Init ──assign──> Assigned/Active
+///                        │
+///                        ├──worker lost──> Degraded ──recover──> Recovering ──done──> Active
+///                        │
+///                        ├──table balance──> Rebalancing ──done──> Active
+///                        │
+///                        └──delete cmd──> Deleting
 /// ```
 pub fn validate_transition(current: BGState, target: BGState) -> FsResult<()> {
     let valid = match (current, target) {
         (BGState::Init, BGState::Assigned) => true,
+        (BGState::Assigned, BGState::Active) => true,
         (BGState::Assigned, BGState::Degraded) => true,
-        (BGState::Assigned, BGState::Moving) => true,
+        (BGState::Active, BGState::Degraded) => true,
+        (BGState::Active, BGState::Rebalancing) => true,
         (BGState::Degraded, BGState::Recovering) => true,
-        (BGState::Recovering, BGState::Assigned) => true,
-        (BGState::Moving, BGState::Assigned) => true,
-        // Any state can transition to Deleting
+        (BGState::Recovering, BGState::Active) => true,
+        (BGState::Rebalancing, BGState::Active) => true,
         (_, BGState::Deleting) => true,
         _ => false,
     };
@@ -64,10 +65,11 @@ pub fn is_reachable(current: BGState, target: BGState) -> bool {
 fn next_states(state: BGState) -> Vec<BGState> {
     match state {
         BGState::Init => vec![BGState::Assigned, BGState::Deleting],
-        BGState::Assigned => vec![BGState::Degraded, BGState::Moving, BGState::Deleting],
+        BGState::Assigned => vec![BGState::Active, BGState::Degraded, BGState::Deleting],
+        BGState::Active => vec![BGState::Degraded, BGState::Rebalancing, BGState::Deleting],
         BGState::Degraded => vec![BGState::Recovering, BGState::Deleting],
-        BGState::Recovering => vec![BGState::Assigned, BGState::Deleting],
-        BGState::Moving => vec![BGState::Assigned, BGState::Deleting],
+        BGState::Recovering => vec![BGState::Active, BGState::Deleting],
+        BGState::Rebalancing => vec![BGState::Active, BGState::Deleting],
         BGState::Deleting => vec![],
     }
 }
@@ -79,29 +81,32 @@ mod tests {
     #[test]
     fn valid_transitions() {
         assert!(validate_transition(BGState::Init, BGState::Assigned).is_ok());
+        assert!(validate_transition(BGState::Assigned, BGState::Active).is_ok());
         assert!(validate_transition(BGState::Assigned, BGState::Degraded).is_ok());
-        assert!(validate_transition(BGState::Assigned, BGState::Moving).is_ok());
+        assert!(validate_transition(BGState::Active, BGState::Degraded).is_ok());
+        assert!(validate_transition(BGState::Active, BGState::Rebalancing).is_ok());
         assert!(validate_transition(BGState::Degraded, BGState::Recovering).is_ok());
-        assert!(validate_transition(BGState::Recovering, BGState::Assigned).is_ok());
-        assert!(validate_transition(BGState::Moving, BGState::Assigned).is_ok());
+        assert!(validate_transition(BGState::Recovering, BGState::Active).is_ok());
+        assert!(validate_transition(BGState::Rebalancing, BGState::Active).is_ok());
     }
 
     #[test]
     fn any_to_deleting() {
         assert!(validate_transition(BGState::Init, BGState::Deleting).is_ok());
         assert!(validate_transition(BGState::Assigned, BGState::Deleting).is_ok());
+        assert!(validate_transition(BGState::Active, BGState::Deleting).is_ok());
         assert!(validate_transition(BGState::Degraded, BGState::Deleting).is_ok());
         assert!(validate_transition(BGState::Recovering, BGState::Deleting).is_ok());
-        assert!(validate_transition(BGState::Moving, BGState::Deleting).is_ok());
+        assert!(validate_transition(BGState::Rebalancing, BGState::Deleting).is_ok());
     }
 
     #[test]
     fn invalid_transitions() {
         assert!(validate_transition(BGState::Init, BGState::Degraded).is_err());
-        assert!(validate_transition(BGState::Init, BGState::Moving).is_err());
+        assert!(validate_transition(BGState::Init, BGState::Rebalancing).is_err());
         assert!(validate_transition(BGState::Assigned, BGState::Init).is_err());
         assert!(validate_transition(BGState::Degraded, BGState::Assigned).is_err());
-        assert!(validate_transition(BGState::Moving, BGState::Degraded).is_err());
+        assert!(validate_transition(BGState::Rebalancing, BGState::Degraded).is_err());
     }
 
     #[test]
