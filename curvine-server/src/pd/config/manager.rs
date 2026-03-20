@@ -92,6 +92,16 @@ impl DynamicConfigCache {
             .unwrap()
             .insert(item.key.clone(), item.clone());
     }
+
+    fn max_version(&self) -> u64 {
+        self.values
+            .read()
+            .unwrap()
+            .values()
+            .map(|v| v.version)
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 pub struct ConfigManager {
@@ -161,6 +171,15 @@ impl ConfigManager {
         self.config_value_str(key)
             .map(|s| s == "true" || s == "1")
             .unwrap_or(default)
+    }
+
+    pub fn get_string(&self, key: &str, default: &str) -> String {
+        self.config_value_str(key).unwrap_or_else(|| default.to_string())
+    }
+
+    /// Global config version (max version across all config items).
+    pub fn version(&self) -> u64 {
+        self.dynamic_cache.max_version()
     }
 
     fn config_value_str(&self, key: &str) -> Option<String> {
