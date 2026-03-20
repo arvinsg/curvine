@@ -24,10 +24,10 @@ mod worker_handler;
 mod meta_handler;
 
 pub use error::NodeError;
-pub use event::NodeEvent;
+pub use event::{NodeEvent, NodeEventType};
 pub use heartbeat::HeartbeatHandler;
 pub use index::NodeIndex;
-pub use manager::NodeManager;
+pub use manager::{DecommissionChecker, NodeManager};
 pub use registry::HandlerRegistry;
 pub use store::NodeStore;
 pub use worker_handler::WorkerHeartbeatHandler;

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::event::NodeEvent;
+use super::event::{NodeEvent, NodeEventType};
 use super::{HandlerRegistry, HeartbeatHandler, MetaHeartbeatHandler, WorkerHeartbeatHandler};
 use crate::pd::config::ConfigManager;
 use crate::pd::journal::entry::NodeEntry;
@@ -21,6 +21,7 @@ use curvine_common::state::{
     HeartbeatRequest, HeartbeatResponse, NodeInfo, NodeState, NodeType, RegisterRequest,
 };
 use curvine_common::{FsError, FsResult};
+use dashmap::DashMap;
 use log::info;
 use orpc::common::LocalTime;
 use std::sync::Arc;
@@ -32,6 +33,13 @@ use super::store::NodeStore;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
+/// Trait for checking whether a decommissioning node still has BGs or in-flight operators.
+/// Implemented by CompositeDecommissionChecker in cluster/manager.rs to avoid circular dependency.
+pub trait DecommissionChecker: Send + Sync {
+    fn has_bgs_on_node(&self, node_id: u32) -> bool;
+    fn has_pending_operators_for_node(&self, node_id: u32) -> bool;
+}
+
 pub struct NodeManager {
     index: Arc<RwLock<NodeIndex>>,
     store: Arc<NodeStore>,
@@ -39,6 +47,10 @@ pub struct NodeManager {
     config_manager: Arc<ConfigManager>,
     journal_client: Arc<journal::Client>,
     event_tx: broadcast::Sender<NodeEvent>,
+    /// Tracks when each node entered Lost state (node_id -> lost_time_ms)
+    lost_since: Arc<DashMap<u32, u64>>,
+    /// Checker for decommission completion (set after construction to break circular dep)
+    decommission_checker: RwLock<Option<Arc<dyn DecommissionChecker>>>,
 }
 
 impl NodeManager {
@@ -58,6 +70,8 @@ impl NodeManager {
             config_manager,
             journal_client,
             event_tx,
+            lost_since: Arc::new(DashMap::new()),
+            decommission_checker: RwLock::new(None),
         }
     }
 
@@ -118,10 +132,14 @@ impl NodeManager {
         self.journal_client
             .propose(PdEntry::RegisterNode(entry))?;
 
-        self.emit_event(NodeEvent::Registered {
+        self.emit_event(NodeEvent {
+            event_type: NodeEventType::Registered,
             node_id: node.base.node_id,
             node_type: node.base.node_type,
-            pool_ids: vec![],
+            old_state: None,
+            new_state: Some(node.state),
+            epoch: node.epoch,
+            event_time_ms: now,
         });
 
         Ok((node, new_epoch))
@@ -178,11 +196,19 @@ impl NodeManager {
 
             let snapshot = index.get_by_id(node_id).unwrap().clone();
             if state_changed {
-                self.emit_event(NodeEvent::StateChanged {
+                let event_type = match old_state {
+                    NodeState::Starting => NodeEventType::HeartbeatResumed,
+                    NodeState::Lost => NodeEventType::HeartbeatResumed,
+                    _ => NodeEventType::HeartbeatResumed,
+                };
+                self.emit_event(NodeEvent {
+                    event_type,
                     node_id,
                     node_type,
-                    old_state,
-                    new_state: NodeState::Live,
+                    old_state: Some(old_state),
+                    new_state: Some(NodeState::Live),
+                    epoch: snapshot.epoch,
+                    event_time_ms: now,
                 });
             }
             (snapshot, need_persist)
@@ -206,7 +232,7 @@ impl NodeManager {
         Ok(HeartbeatResponse {
             error: None,
             epoch: node_snapshot.epoch,
-            config_version: 0,
+            config_version: self.config_manager.version(),
             mount_version: 0,
             bg_version: 0,
             payload: response_payload,
@@ -219,6 +245,17 @@ impl NodeManager {
     pub fn apply_register_node(&self, entry: &NodeEntry) -> FsResult<()> {
         let mut node = entry.info.clone();
         node.last_persist_ms = entry.op_ms;
+
+        // Promote az/rack from WorkerNodePayload to labels (if not already present)
+        if let curvine_common::state::NodePayload::Worker(ref payload) = node.payload {
+            if let Some(ref az) = payload.az {
+                node.base.labels.entry("az".to_string()).or_insert_with(|| az.clone());
+            }
+            if let Some(ref rack) = payload.rack {
+                node.base.labels.entry("rack".to_string()).or_insert_with(|| rack.clone());
+            }
+        }
+
         self.store.put(&node)?;
         let mut index = self.index.write().unwrap();
         index.insert(node);
@@ -264,17 +301,29 @@ impl NodeManager {
     pub fn update_state_and_persist(&self, node_id: u32, new_state: NodeState) -> FsResult<()> {
         let old_info = {
             let mut index = self.index.write().unwrap();
-            let old_info = index.get_by_id(node_id).map(|n| (n.state, n.base.node_type));
+            let old_info = index
+                .get_by_id(node_id)
+                .map(|n| (n.state, n.base.node_type, n.epoch));
             index.update_state(node_id, new_state);
             old_info
         };
-        if let Some((old_state, node_type)) = old_info {
+        if let Some((old_state, node_type, epoch)) = old_info {
             if old_state != new_state {
-                self.emit_event(NodeEvent::StateChanged {
+                let event_type = match new_state {
+                    NodeState::Offline => NodeEventType::Offline,
+                    NodeState::Decommission => NodeEventType::DecommissionStarted,
+                    NodeState::Live => NodeEventType::HeartbeatResumed,
+                    NodeState::Lost => NodeEventType::Lost,
+                    _ => return self.persist_node(node_id),
+                };
+                self.emit_event(NodeEvent {
+                    event_type,
                     node_id,
                     node_type,
-                    old_state,
-                    new_state,
+                    old_state: Some(old_state),
+                    new_state: Some(new_state),
+                    epoch,
+                    event_time_ms: orpc::common::LocalTime::mills(),
                 });
             }
         }
@@ -331,11 +380,15 @@ impl NodeManager {
             if let Some(node_type) = timeout_info {
                 index.update_state(node_id, NodeState::Lost);
                 timed_out.push(node_id);
-                self.emit_event(NodeEvent::StateChanged {
+                let epoch = index.get_by_id(node_id).map(|n| n.epoch).unwrap_or(0);
+                self.emit_event(NodeEvent {
+                    event_type: NodeEventType::Lost,
                     node_id,
                     node_type,
-                    old_state: NodeState::Live,
-                    new_state: NodeState::Lost,
+                    old_state: Some(NodeState::Live),
+                    new_state: Some(NodeState::Lost),
+                    epoch,
+                    event_time_ms: now_ms,
                 });
             }
         }
@@ -354,5 +407,348 @@ impl NodeManager {
             crate::pd::config::keys::PD_NODE_PERSIST_INTERVAL_MS,
             crate::pd::config::keys::PD_NODE_PERSIST_INTERVAL_MS_DEFAULT,
         )
+    }
+
+    fn recovery_window_ms(&self) -> u64 {
+        self.config_manager.get_u64(
+            crate::pd::config::keys::PD_NODE_LOST_RECOVERY_WINDOW_MS,
+            crate::pd::config::keys::PD_NODE_LOST_RECOVERY_WINDOW_MS_DEFAULT,
+        )
+    }
+
+    /// Set the decommission checker (call after BGManager is constructed).
+    pub fn set_decommission_checker(&self, checker: Arc<dyn DecommissionChecker>) {
+        *self.decommission_checker.write().unwrap() = Some(checker);
+    }
+
+    // ========== Internal liveness loop ==========
+
+    /// Start the internal liveness detection loop.
+    /// This loop handles:
+    /// - Live→Lost detection (heartbeat timeout, memory-only)
+    /// - Lost→Offline promotion (recovery window exceeded, persisted via Raft)
+    /// - Decommission completion detection
+    pub fn start_liveness_loop(self: Arc<Self>) {
+        let mgr = self.clone();
+        tokio::spawn(async move {
+            mgr.liveness_loop().await;
+        });
+    }
+
+    async fn liveness_loop(&self) {
+        loop {
+            let check_interval = self.config_manager.get_u64(
+                crate::pd::config::keys::PD_NODE_LIVENESS_CHECK_INTERVAL_MS,
+                crate::pd::config::keys::PD_NODE_LIVENESS_CHECK_INTERVAL_MS_DEFAULT,
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(check_interval)).await;
+
+            let now = LocalTime::mills();
+
+            // 1. Detect heartbeat timeouts: Live→Lost (memory-only)
+            let timeout = self.heartbeat_timeout_ms();
+            let newly_lost = self.detect_heartbeat_timeout(now, timeout);
+            for &node_id in &newly_lost {
+                self.lost_since.insert(node_id, now);
+                log::warn!("Node {} marked Lost (heartbeat timeout)", node_id);
+            }
+
+            // 2. Promote Lost→Offline after recovery window
+            let recovery_window = self.recovery_window_ms();
+            let to_offline: Vec<u32> = self
+                .lost_since
+                .iter()
+                .filter(|entry| now.saturating_sub(*entry.value()) > recovery_window)
+                .map(|entry| *entry.key())
+                .collect();
+
+            for node_id in to_offline {
+                log::error!(
+                    "Node {} exceeded recovery window ({}ms), promoting to Offline",
+                    node_id,
+                    recovery_window
+                );
+                if let Err(e) = self.update_state_and_persist(node_id, NodeState::Offline) {
+                    log::error!("Failed to promote node {} to Offline: {}", node_id, e);
+                }
+                self.lost_since.remove(&node_id);
+            }
+
+            // 3. Cleanup recovered nodes (no longer Lost)
+            let recovered: Vec<u32> = self
+                .lost_since
+                .iter()
+                .filter(|entry| {
+                    self.get_node(*entry.key())
+                        .map(|n| n.state != NodeState::Lost)
+                        .unwrap_or(true)
+                })
+                .map(|entry| *entry.key())
+                .collect();
+
+            for node_id in recovered {
+                self.lost_since.remove(&node_id);
+                log::info!("Node {} recovered from Lost state", node_id);
+            }
+
+            // 4. Check decommission completion
+            self.check_decommission_complete();
+        }
+    }
+
+    /// Check decommissioning nodes: if no BGs remain and no in-flight operators, promote to Offline.
+    fn check_decommission_complete(&self) {
+        let checker = self.decommission_checker.read().unwrap().clone();
+        let checker = match checker {
+            Some(c) => c,
+            None => return,
+        };
+
+        let decommission_nodes = self.get_nodes_by_state(NodeState::Decommission);
+        for node in decommission_nodes {
+            let node_id = node.base.node_id;
+            if !checker.has_bgs_on_node(node_id)
+                && !checker.has_pending_operators_for_node(node_id)
+            {
+                log::info!(
+                    "Node {} decommission complete (no BGs remaining), promoting to Offline",
+                    node_id
+                );
+                // Emit DecommissionFinished before transitioning to Offline
+                self.emit_event(NodeEvent {
+                    event_type: NodeEventType::DecommissionFinished,
+                    node_id,
+                    node_type: node.base.node_type,
+                    old_state: Some(NodeState::Decommission),
+                    new_state: Some(NodeState::Offline),
+                    epoch: node.epoch,
+                    event_time_ms: LocalTime::mills(),
+                });
+                if let Err(e) = self.update_state_and_persist(node_id, NodeState::Offline) {
+                    log::error!(
+                        "Failed to finalize decommission for node {}: {}",
+                        node_id,
+                        e
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl NodeManager {
+    /// Insert a node directly into the in-memory index, bypassing store
+    /// serialization. Useful for tests where bincode cannot serialize
+    /// `#[serde(flatten)]` fields.
+    pub fn test_insert_node(&self, node: NodeInfo) {
+        let mut index = self.index.write().unwrap();
+        index.insert(node);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_common::state::{
+        MetaNodePayload, NodeAddress, NodeBase, NodeInfo, NodePayload, NodeState, NodeType,
+        WorkerNodePayload,
+    };
+    use std::sync::Arc;
+
+    fn test_store() -> Arc<dyn crate::pd::store::KvStore> {
+        Arc::new(crate::pd::store::memory_kv_engine::MemoryKvEngine::new())
+    }
+
+    fn test_manager_with_store(store: Arc<dyn crate::pd::store::KvStore>) -> NodeManager {
+        let node_store = Arc::new(super::super::store::NodeStore::new(store.clone()));
+        let raft = curvine_common::raft::RaftClient::from_conf(
+            curvine_common::conf::JournalConf::default().create_runtime(),
+            &curvine_common::conf::JournalConf::default(),
+        );
+        let jc = Arc::new(crate::pd::journal::Client::new(raft));
+        let config = Arc::new(crate::pd::config::ConfigManager::new(
+            store,
+            jc.clone(),
+            std::collections::HashMap::new(),
+        ));
+        NodeManager::new(node_store, config, jc)
+    }
+
+    fn test_manager() -> NodeManager {
+        test_manager_with_store(test_store())
+    }
+
+    fn make_node(id: u32, node_type: NodeType, state: NodeState) -> NodeInfo {
+        let payload = match node_type {
+            NodeType::Worker => NodePayload::Worker(WorkerNodePayload::default()),
+            NodeType::Meta => NodePayload::Meta(MetaNodePayload::default()),
+        };
+        NodeInfo {
+            base: NodeBase {
+                node_id: id,
+                node_type,
+                address: NodeAddress {
+                    hostname: format!("host-{}", id),
+                    ip: format!("10.0.0.{}", id),
+                    rpc_port: 8000 + id as u16,
+                    web_port: 9000 + id as u16,
+                },
+                ..Default::default()
+            },
+            state,
+            epoch: 1,
+            last_heartbeat_ms: orpc::common::LocalTime::mills(),
+            last_persist_ms: 0,
+            sys_stats: Default::default(),
+            payload,
+        }
+    }
+
+    /// Insert a node directly into the in-memory index, bypassing store
+    /// serialization (bincode cannot handle `#[serde(flatten)]` on NodeInfo).
+    fn insert_node(mgr: &NodeManager, node: &NodeInfo) {
+        let mut index = mgr.index.write().unwrap();
+        index.insert(node.clone());
+    }
+
+    /// Insert a node into both the in-memory index and the underlying KvStore.
+    /// Writes serialized bytes directly to the KvStore using the same key layout
+    /// as NodeStore, so that NodeStore::list_all can later deserialize them.
+    fn insert_node_persisted(
+        kv: &Arc<dyn crate::pd::store::KvStore>,
+        mgr: &NodeManager,
+        node: &NodeInfo,
+    ) {
+        let bytes =
+            curvine_common::utils::SerdeUtils::serialize(node).expect("serialize NodeInfo");
+        let mut key = [0u8; 5];
+        key[0] = 0x01; // NODE_INFO_PREFIX (same as in NodeStore)
+        key[1..5].copy_from_slice(&node.base.node_id.to_be_bytes());
+        kv.put("node", &key, &bytes).expect("KvStore put");
+        let mut index = mgr.index.write().unwrap();
+        index.insert(node.clone());
+    }
+
+    #[test]
+    fn apply_register_and_get_node() {
+        let mgr = test_manager();
+        let node = make_node(1, NodeType::Worker, NodeState::Starting);
+        insert_node(&mgr, &node);
+
+        let fetched = mgr.get_node(1).expect("node should exist");
+        assert_eq!(fetched.base.node_id, 1);
+        assert_eq!(fetched.state, NodeState::Starting);
+        assert_eq!(fetched.base.node_type, NodeType::Worker);
+    }
+
+    #[test]
+    fn get_nodes_by_type() {
+        let mgr = test_manager();
+        let w1 = make_node(1, NodeType::Worker, NodeState::Live);
+        let w2 = make_node(2, NodeType::Worker, NodeState::Live);
+        let m1 = make_node(3, NodeType::Meta, NodeState::Live);
+        insert_node(&mgr, &w1);
+        insert_node(&mgr, &w2);
+        insert_node(&mgr, &m1);
+
+        let workers = mgr.get_nodes_by_type(NodeType::Worker);
+        assert_eq!(workers.len(), 2);
+        assert!(workers.iter().all(|n| n.base.node_type == NodeType::Worker));
+
+        let metas = mgr.get_nodes_by_type(NodeType::Meta);
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].base.node_id, 3);
+    }
+
+    #[test]
+    fn get_nodes_by_state() {
+        let mgr = test_manager();
+        let n1 = make_node(1, NodeType::Worker, NodeState::Live);
+        let n2 = make_node(2, NodeType::Worker, NodeState::Lost);
+        let n3 = make_node(3, NodeType::Worker, NodeState::Live);
+        insert_node(&mgr, &n1);
+        insert_node(&mgr, &n2);
+        insert_node(&mgr, &n3);
+
+        let live = mgr.get_nodes_by_state(NodeState::Live);
+        assert_eq!(live.len(), 2);
+        assert!(live.iter().all(|n| n.state == NodeState::Live));
+
+        let lost = mgr.get_nodes_by_state(NodeState::Lost);
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].base.node_id, 2);
+    }
+
+    #[test]
+    fn detect_heartbeat_timeout_marks_lost() {
+        let mgr = test_manager();
+        let mut node = make_node(1, NodeType::Worker, NodeState::Live);
+        node.last_heartbeat_ms = 1000;
+        insert_node(&mgr, &node);
+
+        let timed_out = mgr.detect_heartbeat_timeout(20_000, 5_000);
+        assert_eq!(timed_out, vec![1]);
+
+        let updated = mgr.get_node(1).unwrap();
+        assert_eq!(updated.state, NodeState::Lost);
+    }
+
+    #[test]
+    fn detect_heartbeat_timeout_ignores_non_live() {
+        let mgr = test_manager();
+        let mut node = make_node(1, NodeType::Worker, NodeState::Lost);
+        node.last_heartbeat_ms = 1000;
+        insert_node(&mgr, &node);
+
+        let timed_out = mgr.detect_heartbeat_timeout(20_000, 5_000);
+        assert!(timed_out.is_empty());
+
+        let updated = mgr.get_node(1).unwrap();
+        assert_eq!(updated.state, NodeState::Lost);
+    }
+
+    #[test]
+    fn update_state_and_events() {
+        let mgr = test_manager();
+        let mut node = make_node(1, NodeType::Worker, NodeState::Live);
+        node.last_heartbeat_ms = 1000;
+        insert_node(&mgr, &node);
+
+        // Subscribe before the state change so we capture the event.
+        let mut rx = mgr.subscribe();
+
+        // detect_heartbeat_timeout transitions Live -> Lost and emits an event
+        // without requiring a Raft connection (unlike update_state_and_persist).
+        let timed_out = mgr.detect_heartbeat_timeout(20_000, 5_000);
+        assert_eq!(timed_out, vec![1]);
+
+        let event = rx.try_recv().expect("should have received an event");
+        assert_eq!(event.event_type, NodeEventType::Lost);
+        assert_eq!(event.node_id, 1);
+        assert_eq!(event.node_type, NodeType::Worker);
+        assert_eq!(event.old_state, Some(NodeState::Live));
+        assert_eq!(event.new_state, Some(NodeState::Lost));
+    }
+
+    #[test]
+    fn restore_loads_from_store() {
+        let kv = test_store();
+
+        // Persist a node to the KvStore via the first manager
+        let mgr1 = test_manager_with_store(kv.clone());
+        let node = make_node(1, NodeType::Worker, NodeState::Live);
+        insert_node_persisted(&kv, &mgr1, &node);
+        drop(mgr1);
+
+        // Create a fresh manager with the same backing store
+        let mgr2 = test_manager_with_store(kv);
+        assert!(mgr2.get_node(1).is_none(), "should be empty before restore");
+
+        mgr2.restore().unwrap();
+
+        let restored = mgr2.get_node(1).expect("node should be restored");
+        assert_eq!(restored.base.node_id, 1);
+        assert_eq!(restored.base.node_type, NodeType::Worker);
     }
 }

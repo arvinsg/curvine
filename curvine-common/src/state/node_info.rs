@@ -39,7 +39,6 @@ impl Default for NodePayload {
 /// Node info
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeInfo {
-    #[serde(flatten)]
     pub base: NodeBase,
     pub epoch: u64,
     pub state: NodeState,

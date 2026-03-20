@@ -126,3 +126,133 @@ impl Default for NodeIndex {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_common::state::{NodeAddress, NodeBase, NodePayload, WorkerNodePayload};
+
+    fn make_node(id: u32, node_type: NodeType, state: NodeState) -> NodeInfo {
+        NodeInfo {
+            base: NodeBase {
+                node_id: id,
+                node_type,
+                address: NodeAddress {
+                    hostname: "localhost".to_string(),
+                    ip: "127.0.0.1".to_string(),
+                    rpc_port: 8000 + id as u16,
+                    web_port: 9000 + id as u16,
+                },
+                ..Default::default()
+            },
+            state,
+            epoch: 1,
+            last_heartbeat_ms: 0,
+            last_persist_ms: 0,
+            payload: NodePayload::Worker(WorkerNodePayload::default()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn insert_and_get_by_id() {
+        let mut idx = NodeIndex::new();
+        let node = make_node(1, NodeType::Worker, NodeState::Live);
+        idx.insert(node);
+
+        let got = idx.get_by_id(1);
+        assert!(got.is_some());
+        assert_eq!(got.unwrap().base.node_id, 1);
+    }
+
+    #[test]
+    fn get_by_type() {
+        let mut idx = NodeIndex::new();
+        idx.insert(make_node(1, NodeType::Worker, NodeState::Live));
+        idx.insert(make_node(2, NodeType::Worker, NodeState::Live));
+        idx.insert(make_node(3, NodeType::Meta, NodeState::Live));
+
+        let workers = idx.get_by_type(NodeType::Worker);
+        assert_eq!(workers.len(), 2);
+        assert!(workers.iter().all(|n| n.base.node_type == NodeType::Worker));
+
+        let metas = idx.get_by_type(NodeType::Meta);
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].base.node_id, 3);
+    }
+
+    #[test]
+    fn get_by_state() {
+        let mut idx = NodeIndex::new();
+        idx.insert(make_node(1, NodeType::Worker, NodeState::Live));
+        idx.insert(make_node(2, NodeType::Worker, NodeState::Live));
+        idx.insert(make_node(3, NodeType::Worker, NodeState::Lost));
+
+        let live = idx.get_by_state(NodeState::Live);
+        assert_eq!(live.len(), 2);
+        assert!(live.iter().all(|n| n.state == NodeState::Live));
+
+        let lost = idx.get_by_state(NodeState::Lost);
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].base.node_id, 3);
+    }
+
+    #[test]
+    fn remove_cleans_all_indexes() {
+        let mut idx = NodeIndex::new();
+        idx.insert(make_node(1, NodeType::Worker, NodeState::Live));
+
+        let removed = idx.remove(1);
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().base.node_id, 1);
+
+        assert!(idx.get_by_id(1).is_none());
+        assert!(idx.get_by_type(NodeType::Worker).is_empty());
+        assert!(idx.get_by_state(NodeState::Live).is_empty());
+    }
+
+    #[test]
+    fn update_state_moves_between_indexes() {
+        let mut idx = NodeIndex::new();
+        idx.insert(make_node(1, NodeType::Worker, NodeState::Live));
+
+        let ok = idx.update_state(1, NodeState::Lost);
+        assert!(ok);
+
+        assert!(idx.get_by_state(NodeState::Live).is_empty());
+        let lost = idx.get_by_state(NodeState::Lost);
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].base.node_id, 1);
+        assert_eq!(idx.get_by_id(1).unwrap().state, NodeState::Lost);
+    }
+
+    #[test]
+    fn update_state_nonexistent_returns_false() {
+        let mut idx = NodeIndex::new();
+        assert!(!idx.update_state(999, NodeState::Live));
+    }
+
+    #[test]
+    fn update_heartbeat() {
+        let mut idx = NodeIndex::new();
+        idx.insert(make_node(1, NodeType::Worker, NodeState::Live));
+
+        assert_eq!(idx.get_by_id(1).unwrap().last_heartbeat_ms, 0);
+
+        let ok = idx.update_heartbeat(1, 12345);
+        assert!(ok);
+        assert_eq!(idx.get_by_id(1).unwrap().last_heartbeat_ms, 12345);
+    }
+
+    #[test]
+    fn all_node_ids() {
+        let mut idx = NodeIndex::new();
+        idx.insert(make_node(1, NodeType::Worker, NodeState::Live));
+        idx.insert(make_node(2, NodeType::Meta, NodeState::Live));
+        idx.insert(make_node(3, NodeType::Worker, NodeState::Lost));
+
+        let mut ids = idx.all_node_ids();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+}

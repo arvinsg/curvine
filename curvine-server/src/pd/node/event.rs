@@ -14,18 +14,24 @@
 
 use curvine_common::state::{NodeState, NodeType};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeEventType {
+    Registered,
+    HeartbeatResumed,
+    Lost,
+    Offline,
+    DecommissionStarted,
+    DecommissionFinished,
+}
+
 /// Events emitted by NodeManager for downstream subscribers.
 #[derive(Debug, Clone)]
-pub enum NodeEvent {
-    Registered {
-        node_id: u32,
-        node_type: NodeType,
-        pool_ids: Vec<u16>,
-    },
-    StateChanged {
-        node_id: u32,
-        node_type: NodeType,
-        old_state: NodeState,
-        new_state: NodeState,
-    },
+pub struct NodeEvent {
+    pub event_type: NodeEventType,
+    pub node_id: u32,
+    pub node_type: NodeType,
+    pub old_state: Option<NodeState>,
+    pub new_state: Option<NodeState>,
+    pub epoch: u64,
+    pub event_time_ms: u64,
 }

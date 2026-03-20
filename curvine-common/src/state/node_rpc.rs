@@ -23,6 +23,23 @@ use std::collections::HashMap;
 
 use super::{PeerInfo, RwPolicy};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ProgressStepResult {
+    Running,
+    Finished,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerProgressReport {
+    pub op_id: u64,
+    pub bg_id: u32,
+    pub worker_id: u32,
+    pub step_index: usize,
+    pub result: ProgressStepResult,
+    pub report_time_ms: u64,
+}
+
 /// Node register request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
@@ -62,6 +79,8 @@ pub struct WorkerHeartbeatPayload {
     /// BG epochs for staleness detection (bg_id -> epoch)
     #[serde(default)]
     pub bg_epochs: HashMap<u32, u64>,
+    #[serde(default)]
+    pub progress_reports: Vec<WorkerProgressReport>,
 }
 
 /// Meta heartbeat payload (is_leader, group_epoch, stats)
