@@ -26,7 +26,7 @@ pub fn table_id_pool_id(table_id: u32) -> u16 {
     (table_id >> 16) as u16
 }
 
-/// Built by PD from BGTable + NodeManager; used by client SDK.
+/// Built by PD from BGTable.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BGTableSummary {
     pub table_id: u32,
@@ -66,14 +66,14 @@ mod tests {
             bg_id,
             table_id,
             bg_epoch: 1,
-            lease_epoch: 1,
             replica_set: vec![],
             state: BGState::Assigned,
             flags: 0,
             op_state: Default::default(),
             lease_owner: Some(BGLease {
                 node_id: 0,
-                expire_time_ms: 0,
+                epoch: 1,
+                grant_time_ms: 0,
             }),
         }
     }

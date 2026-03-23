@@ -5,11 +5,10 @@ option java_package = "io.curvine.proto";
 option java_multiple_files = true;
 option java_outer_classname = "PdProto";
 
-// Get meta route summary (mode, version, path table, meta groups). Client caches by version.
+// Get meta route summary (mode, version, path table, meta groups). 
 message GetMetaRouteSummaryRequest {
 }
 
 message GetMetaRouteSummaryResponse {
-    // Bincode-serialized MetaRouteSummary (curvine_common::state::MetaRouteSummary).
     optional bytes summary = 1;
 }

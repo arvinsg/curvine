@@ -79,7 +79,7 @@ pub enum RpcCode {
     ListConfig = 102,
     SetConfig = 103,
 
-    // pd meta route.
+    // pd metanode route.
     GetMetaRouteSummary = 104,
 }
 

@@ -49,7 +49,7 @@ pub enum BGState {
     Assigned,
     /// Active and serving
     Active,
-    /// Recovering due to replica or lease issue
+    /// Degraded due to replica lost
     Degraded,
     /// Recovering, adding replicas
     Recovering,
@@ -63,7 +63,8 @@ pub enum BGState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BGLease {
     pub node_id: u32,
-    pub expire_time_ms: u64,
+    pub epoch: u64,
+    pub grant_time_ms: u64,
 }
 
 /// Replica detail for client response (address and state resolved from NodeManager at query time)
@@ -100,13 +101,11 @@ pub struct BlockGroupInfo {
     pub bg_id: u32,
     pub table_id: u32,
     pub bg_epoch: u64,
-    pub lease_epoch: u64,
     pub replica_set: Vec<u32>,
     pub state: BGState,
     pub flags: BGFlag,
     pub op_state: BGOpState,
     pub lease_owner: Option<BGLease>,
-    pub placement: PlacementPolicy,
 
     #[serde(skip)]
     pub stats: BGStats,
@@ -118,7 +117,6 @@ pub struct BlockGroupInfoView {
     pub bg_id: u32,
     pub table_id: u32,
     pub bg_epoch: u64,
-    pub lease_epoch: u64,
     pub replica_set: Vec<ReplicaInfo>,
     pub state: BGState,
     pub flags: BGFlag,

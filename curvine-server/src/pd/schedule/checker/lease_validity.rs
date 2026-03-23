@@ -43,7 +43,6 @@ impl super::Checker for LeaseValidityChecker {
     }
 
     fn check(&self, ctx: &CheckerContext<'_>) -> CheckResult {
-        let now = orpc::common::LocalTime::mills();
         let mut result = CheckResult::default();
         let mut processed_bg_ids = HashSet::new();
 
@@ -53,8 +52,7 @@ impl super::Checker for LeaseValidityChecker {
             if bg.op_state != BGOpState::Idle {
                 continue;
             }
-            let has_issue = self.has_lease_issue(bg, now);
-            if has_issue {
+            if bg.flags & BG_FLAG_LEASE_INVALID != 0 {
                 if let Some(op) = self.build_lease_transfer(bg, ctx) {
                     result.bg_operators.push(op);
                 }
@@ -64,22 +62,7 @@ impl super::Checker for LeaseValidityChecker {
             }
         }
 
-        // Phase 2: Full scan — lease expiry detection (time-based)
-        let expired = ctx.bg_manager.get_bgs_with_expired_lease(now);
-        for bg in expired {
-            if processed_bg_ids.contains(&bg.bg_id) {
-                continue;
-            }
-            if bg.op_state != BGOpState::Idle {
-                continue;
-            }
-            if let Some(op) = self.build_lease_transfer(&bg, ctx) {
-                processed_bg_ids.insert(bg.bg_id);
-                result.bg_operators.push(op);
-            }
-        }
-
-        // Phase 2 cont: LEASE_INVALID flag-based detection
+        // Phase 2: LEASE_INVALID flag-based detection
         let flagged_bgs: Vec<_> = ctx
             .bg_manager
             .list_bgs()
@@ -100,19 +83,6 @@ impl super::Checker for LeaseValidityChecker {
 }
 
 impl LeaseValidityChecker {
-    /// Check if a BG has a lease issue (expired or LEASE_INVALID flag).
-    fn has_lease_issue(&self, bg: &curvine_common::state::BlockGroupInfo, now: u64) -> bool {
-        if bg.flags & BG_FLAG_LEASE_INVALID != 0 {
-            return true;
-        }
-        if let Some(lease) = &bg.lease_owner {
-            if lease.expire_time_ms > 0 && lease.expire_time_ms < now {
-                return true;
-            }
-        }
-        false
-    }
-
     fn build_lease_transfer(
         &self,
         bg: &curvine_common::state::BlockGroupInfo,
@@ -148,7 +118,7 @@ mod tests {
     use super::*;
     use crate::pd::schedule::checker::{Checker, CheckerContext};
     use curvine_common::state::{
-        BGLease, BGState, BlockGroupInfo, PlacementPolicy, BG_FLAG_NONE,
+        BGLease, BGState, BlockGroupInfo, BG_FLAG_NONE,
     };
 
     fn test_ctx(
@@ -200,16 +170,15 @@ mod tests {
             bg_id,
             table_id,
             bg_epoch: 1,
-            lease_epoch: 1,
             replica_set,
             state: BGState::Assigned,
             flags,
             op_state: BGOpState::Idle,
             lease_owner: Some(BGLease {
                 node_id: leader,
-                expire_time_ms: 0,
+                epoch: 1,
+                grant_time_ms: 0,
             }),
-            placement: PlacementPolicy::Default,
             stats: Default::default(),
         }
     }
@@ -225,16 +194,12 @@ mod tests {
     }
 
     #[test]
-    fn expired_lease_no_available_workers_returns_empty() {
+    fn lease_invalid_flag_no_available_workers_returns_empty() {
         let ctx = test_ctx(std::collections::HashMap::new());
         let checker = LeaseValidityChecker::new(ctx.clone());
 
-        // Insert a BG with an expired lease (expire_time_ms = 1, which is < now)
-        let mut bg = make_bg(1, 0x0001_0001, vec![100, 101], BG_FLAG_NONE);
-        bg.lease_owner = Some(BGLease {
-            node_id: 100,
-            expire_time_ms: 1, // expired
-        });
+        // Insert a BG with LEASE_INVALID flag
+        let bg = make_bg(1, 0x0001_0001, vec![100, 101], BG_FLAG_LEASE_INVALID);
         ctx.bg_manager
             .apply_create_bg(&crate::pd::journal::entry::BGEntry {
                 op_ms: 0,
@@ -248,7 +213,7 @@ mod tests {
         // for all replicas -> no LeaseTransfer can be built
         assert!(
             result.bg_operators.is_empty(),
-            "expired lease with no available workers should produce no operators"
+            "lease invalid with no available workers should produce no operators"
         );
     }
 
@@ -257,12 +222,8 @@ mod tests {
         let ctx = test_ctx(std::collections::HashMap::new());
         let checker = LeaseValidityChecker::new(ctx.clone());
 
-        // Insert a BG with a valid (non-expired) lease and no LEASE_INVALID flag
-        let mut bg = make_bg(1, 0x0001_0001, vec![100, 101], BG_FLAG_NONE);
-        bg.lease_owner = Some(BGLease {
-            node_id: 100,
-            expire_time_ms: u64::MAX, // far in the future
-        });
+        // Insert a BG with no LEASE_INVALID flag (valid lease)
+        let bg = make_bg(1, 0x0001_0001, vec![100, 101], BG_FLAG_NONE);
         ctx.bg_manager
             .apply_create_bg(&crate::pd::journal::entry::BGEntry {
                 op_ms: 0,
@@ -286,10 +247,6 @@ mod tests {
         // Insert a BG with LEASE_INVALID flag but op_state != Idle
         let mut bg = make_bg(1, 0x0001_0001, vec![100, 101], BG_FLAG_LEASE_INVALID);
         bg.op_state = BGOpState::LeaseBalancing;
-        bg.lease_owner = Some(BGLease {
-            node_id: 100,
-            expire_time_ms: 1, // expired
-        });
         ctx.bg_manager
             .apply_create_bg(&crate::pd::journal::entry::BGEntry {
                 op_ms: 0,

@@ -272,10 +272,15 @@ impl MetaManager {
             std::collections::HashMap::new();
         for node in meta_nodes {
             if let NodePayload::Meta(ref p) = node.payload {
+                let is_leader = p
+                    .peers
+                    .iter()
+                    .find(|peer| peer.node_id == node.base.node_id)
+                    .and_then(|peer| peer.is_leader);
                 let peer = curvine_common::state::PeerInfo {
                     node_id: node.base.node_id,
                     address: node.base.address.clone(),
-                    is_leader: Some(p.is_leader),
+                    is_leader,
                 };
                 by_group.entry(p.group_id as u64).or_default().push(peer);
             }

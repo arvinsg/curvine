@@ -300,7 +300,7 @@ mod tests {
     use crate::pd::schedule::checker::{Checker, CheckerContext};
     use crate::pd::schedule::CoordinatorContext;
     use curvine_common::state::{
-        BGLease, BGState, BlockGroupInfo, PlacementPolicy, BG_FLAG_NONE,
+        BGLease, BGState, BlockGroupInfo, BG_FLAG_NONE,
     };
 
     fn test_ctx(
@@ -352,16 +352,15 @@ mod tests {
             bg_id,
             table_id,
             bg_epoch: 1,
-            lease_epoch: 1,
             replica_set,
             state: BGState::Assigned,
             flags,
             op_state: BGOpState::Idle,
             lease_owner: Some(BGLease {
                 node_id: leader,
-                expire_time_ms: 0,
+                epoch: 1,
+                grant_time_ms: 0,
             }),
-            placement: PlacementPolicy::Default,
             stats: Default::default(),
         }
     }

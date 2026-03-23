@@ -95,7 +95,7 @@ impl super::Checker for BGBalanceChecker {
                 }
 
                 // Placement Safeguard: check that moving doesn't worsen placement
-                let rules = ctx.bg_manager.get_pool_placement_rules(pool_id, bg.placement);
+                let rules = ctx.bg_manager.get_pool_placement_rules(pool_id);
                 if rules.iter().any(|r| !r.label_constraints.is_empty() || !r.location_labels.is_empty()) {
                     let worker_ids: Vec<u32> = {
                         let mut ids = bg.replica_set.clone();
@@ -273,7 +273,7 @@ mod tests {
     use crate::pd::schedule::checker::{Checker, CheckerContext};
     use crate::pd::schedule::CoordinatorContext;
     use curvine_common::state::{
-        BGLease, BGOpState, BGState, BlockGroupInfo, PlacementPolicy, BG_FLAG_NONE,
+        BGLease, BGOpState, BGState, BlockGroupInfo, BG_FLAG_NONE,
     };
 
     fn test_ctx() -> Arc<CoordinatorContext> {
@@ -323,16 +323,15 @@ mod tests {
             bg_id,
             table_id,
             bg_epoch: 1,
-            lease_epoch: 1,
             replica_set,
             state: BGState::Assigned,
             flags: BG_FLAG_NONE,
             op_state: BGOpState::Idle,
             lease_owner: Some(BGLease {
                 node_id: leader,
-                expire_time_ms: 0,
+                epoch: 1,
+                grant_time_ms: 0,
             }),
-            placement: PlacementPolicy::Default,
             stats: Default::default(),
         }
     }

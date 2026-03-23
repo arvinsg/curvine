@@ -15,7 +15,7 @@
 use super::BGTable;
 use crate::pd::schedule::placement::rule::PlacementRule;
 use curvine_common::state::{
-    BGLease, BGState, BlockGroupInfo, BlockGroupPolicy, PlacementPolicy, BG_FLAG_NONE,
+    BGLease, BGState, BlockGroupInfo, BlockGroupPolicy, BG_FLAG_NONE,
 };
 use curvine_common::FsError;
 use orpc::common::LocalTime;
@@ -111,16 +111,15 @@ pub fn build_table(
             bg_id,
             table_id,
             bg_epoch: 1,
-            lease_epoch: 1,
             replica_set,
             state: BGState::Assigned,
             flags: BG_FLAG_NONE,
             op_state: Default::default(),
             lease_owner: Some(BGLease {
                 node_id: leader,
-                expire_time_ms: 0,
+                epoch: 1,
+                grant_time_ms: 0,
             }),
-            placement: PlacementPolicy::Default,
             stats: Default::default(),
         };
         buckets.push(bg_id);

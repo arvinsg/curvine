@@ -58,7 +58,7 @@ impl super::Checker for PlacementRuleChecker {
             }
 
             let pool_id = (bg.table_id >> 16) as u16;
-            let rules = ctx.bg_manager.get_pool_placement_rules(pool_id, bg.placement);
+            let rules = ctx.bg_manager.get_pool_placement_rules(pool_id);
 
             if rules.iter().all(|r| r.label_constraints.is_empty() && r.location_labels.is_empty()) {
                 // No meaningful rules — clear the flag
@@ -218,7 +218,7 @@ mod tests {
     use super::*;
     use crate::pd::schedule::checker::{Checker, CheckerContext};
     use crate::pd::schedule::CoordinatorContext;
-    use curvine_common::state::{BGLease, BGOpState, BGState, BlockGroupInfo, PlacementPolicy, BG_FLAG_NONE};
+    use curvine_common::state::{BGLease, BGOpState, BGState, BlockGroupInfo, BG_FLAG_NONE};
 
     fn test_ctx() -> Arc<CoordinatorContext> {
         let store: Arc<dyn crate::pd::store::KvStore> =
@@ -267,16 +267,15 @@ mod tests {
             bg_id,
             table_id,
             bg_epoch: 1,
-            lease_epoch: 1,
             replica_set,
             state: BGState::Assigned,
             flags,
             op_state: BGOpState::Idle,
             lease_owner: Some(BGLease {
                 node_id: leader,
-                expire_time_ms: 0,
+                epoch: 1,
+                grant_time_ms: 0,
             }),
-            placement: PlacementPolicy::Default,
             stats: Default::default(),
         }
     }

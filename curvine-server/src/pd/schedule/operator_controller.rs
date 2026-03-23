@@ -534,21 +534,20 @@ mod tests {
         let (ctrl, _config, bg_mgr) = test_controller();
 
         // Create a BG with worker 1 in replica_set so AddReplica is_finish returns true
-        use curvine_common::state::{BGLease, BGState, PlacementPolicy, BG_FLAG_NONE};
+        use curvine_common::state::{BGLease, BGState, BG_FLAG_NONE};
         let bg = curvine_common::state::BlockGroupInfo {
             bg_id: 10,
             table_id: 1,
             bg_epoch: 1,
-            lease_epoch: 1,
             replica_set: vec![1],
             state: BGState::Active,
             flags: BG_FLAG_NONE,
             op_state: Default::default(),
             lease_owner: Some(BGLease {
                 node_id: 1,
-                expire_time_ms: 0,
+                epoch: 1,
+                grant_time_ms: 0,
             }),
-            placement: PlacementPolicy::Default,
             stats: Default::default(),
         };
         bg_mgr
@@ -660,21 +659,20 @@ mod tests {
         let (ctrl, _config, bg_mgr) = test_controller();
 
         // Create a BG so dispatch_to_worker can find it
-        use curvine_common::state::{BGLease, BGState, PlacementPolicy, BG_FLAG_NONE};
+        use curvine_common::state::{BGLease, BGState, BG_FLAG_NONE};
         let bg = curvine_common::state::BlockGroupInfo {
             bg_id: 20,
             table_id: 1,
             bg_epoch: 1,
-            lease_epoch: 1,
             replica_set: vec![1, 2],
             state: BGState::Active,
             flags: BG_FLAG_NONE,
             op_state: Default::default(),
             lease_owner: Some(BGLease {
                 node_id: 1,
-                expire_time_ms: 0,
+                epoch: 1,
+                grant_time_ms: 0,
             }),
-            placement: PlacementPolicy::Default,
             stats: Default::default(),
         };
         bg_mgr
@@ -706,21 +704,20 @@ mod tests {
     fn operator_success_resets_op_state_to_idle() {
         let (ctrl, _config, bg_mgr) = test_controller();
 
-        use curvine_common::state::{BGLease, BGState, PlacementPolicy, BG_FLAG_NONE};
+        use curvine_common::state::{BGLease, BGState, BG_FLAG_NONE};
         let bg = curvine_common::state::BlockGroupInfo {
             bg_id: 30,
             table_id: 1,
             bg_epoch: 1,
-            lease_epoch: 1,
             replica_set: vec![1],
             state: BGState::Active,
             flags: BG_FLAG_NONE,
             op_state: Default::default(),
             lease_owner: Some(BGLease {
                 node_id: 1,
-                expire_time_ms: 0,
+                epoch: 1,
+                grant_time_ms: 0,
             }),
-            placement: PlacementPolicy::Default,
             stats: Default::default(),
         };
         bg_mgr
@@ -750,21 +747,20 @@ mod tests {
     fn check_progress_cancels_stale_epoch() {
         let (ctrl, _config, bg_mgr) = test_controller();
 
-        use curvine_common::state::{BGLease, BGState, PlacementPolicy, BG_FLAG_NONE};
+        use curvine_common::state::{BGLease, BGState, BG_FLAG_NONE};
         let bg = curvine_common::state::BlockGroupInfo {
             bg_id: 40,
             table_id: 1,
             bg_epoch: 1,
-            lease_epoch: 1,
             replica_set: vec![1, 2],
             state: BGState::Active,
             flags: BG_FLAG_NONE,
             op_state: Default::default(),
             lease_owner: Some(BGLease {
                 node_id: 1,
-                expire_time_ms: 0,
+                epoch: 1,
+                grant_time_ms: 0,
             }),
-            placement: PlacementPolicy::Default,
             stats: Default::default(),
         };
         bg_mgr

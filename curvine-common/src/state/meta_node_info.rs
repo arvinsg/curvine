@@ -15,7 +15,7 @@
 use crate::state::node_state::NodeAddress;
 use serde::{Deserialize, Serialize};
 
-/// Peer info for MetaNode group (node_id unified as u32)
+/// Peer info for MetaNode group
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub node_id: u32,
@@ -23,7 +23,7 @@ pub struct PeerInfo {
     pub is_leader: Option<bool>,
 }
 
-/// MetaNode group info (group_id + peers; is_leader filled by PD)
+/// MetaNode group info (group_id + peers
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeGroupInfo {
     pub group_id: u64,
@@ -55,7 +55,6 @@ pub struct MetaNodePayload {
     pub group_id: u32,
     pub peers: Vec<PeerInfo>,
     pub rw_policy: RwPolicy,
-    pub is_leader: bool,
     pub group_epoch: u64,
 
     #[serde(skip)]

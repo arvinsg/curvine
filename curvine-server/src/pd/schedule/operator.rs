@@ -168,23 +168,22 @@ pub struct BGCommands {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use curvine_common::state::{BGLease, BGState, PlacementPolicy, BG_FLAG_NONE};
+    use curvine_common::state::{BGLease, BGState, BG_FLAG_NONE};
 
     fn make_bg(bg_id: u32, replica_set: Vec<u32>, lease_node: Option<u32>) -> BlockGroupInfo {
         BlockGroupInfo {
             bg_id,
             table_id: 1,
             bg_epoch: 1,
-            lease_epoch: 1,
             replica_set,
             state: BGState::Active,
             flags: BG_FLAG_NONE,
             op_state: BGOpState::Idle,
             lease_owner: lease_node.map(|n| BGLease {
                 node_id: n,
-                expire_time_ms: 0,
+                epoch: 1,
+                grant_time_ms: 0,
             }),
-            placement: PlacementPolicy::Default,
             stats: Default::default(),
         }
     }

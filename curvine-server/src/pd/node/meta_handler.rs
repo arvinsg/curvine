@@ -76,9 +76,14 @@ impl HeartbeatHandler for MetaHeartbeatHandler {
 
             if p.group_epoch != m.group_epoch {
                 p.group_epoch = m.group_epoch;
-                p.is_leader = m.is_leader;
                 p.rw_policy = m.rw_policy;
-                p.peers = m.peers.clone();
+                let mut peers = m.peers.clone();
+                // Ensure the current node's peer entry has is_leader set
+                let node_id = node.base.node_id;
+                if let Some(peer) = peers.iter_mut().find(|p| p.node_id == node_id) {
+                    peer.is_leader = Some(m.is_leader);
+                }
+                p.peers = peers;
                 changed = true;
                 log::info!(
                     "meta node change group_id:{}, group_epoch:{}",

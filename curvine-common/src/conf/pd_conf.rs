@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::read_to_string;
 
-/// MetaNode-related config: service mode and federation routing. Grouped for clarity.
+/// MetaNode-related config: service mode and federation routing.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct MetaNodeConf {
     /// Service mode: "proxy" | "shard" | "federation". Only federation is implemented.
@@ -66,7 +66,7 @@ pub struct PdConf {
     #[serde(default)]
     pub journal: JournalConf,
 
-    /// MetaNode mode and federation routing (see [metanode] section in TOML).
+    /// MetaNode mode and federation routing.
     #[serde(default)]
     pub metanode: MetaNodeConf,
 

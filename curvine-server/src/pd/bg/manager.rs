@@ -55,7 +55,6 @@ fn block_group_info_to_view(bg: &BlockGroupInfo, node_manager: &NodeManager) -> 
         bg_id: bg.bg_id,
         table_id: bg.table_id,
         bg_epoch: bg.bg_epoch,
-        lease_epoch: bg.lease_epoch,
         replica_set,
         state: bg.state,
         flags: bg.flags,
@@ -161,8 +160,10 @@ impl BGManager {
             self.mark_dirty(entry.bg_id, DirtyReason::ReplicaChanged);
         }
         if let Some(ref lease) = entry.lease_owner {
-            info.lease_owner = Some(lease.clone());
-            info.lease_epoch += 1;
+            let old_epoch = info.lease_owner.as_ref().map(|l| l.epoch).unwrap_or(0);
+            let mut new_lease = lease.clone();
+            new_lease.epoch = old_epoch + 1;
+            info.lease_owner = Some(new_lease);
             self.mark_dirty(entry.bg_id, DirtyReason::LeaseChanged);
         }
         self.store.put(&info)?;
@@ -246,8 +247,10 @@ impl BGManager {
                     bg.bg_epoch += 1;
                 }
                 if let Some(ref lease) = update.lease_owner {
-                    bg.lease_owner = Some(lease.clone());
-                    bg.lease_epoch += 1;
+                    let old_epoch = bg.lease_owner.as_ref().map(|l| l.epoch).unwrap_or(0);
+                    let mut new_lease = lease.clone();
+                    new_lease.epoch = old_epoch + 1;
+                    bg.lease_owner = Some(new_lease);
                 }
                 self.store.put(bg)?;
                 if table_id_to_bump.is_none() {
@@ -302,7 +305,7 @@ impl BGManager {
         };
 
         let worker_labels = self.pool_manager.get_worker_labels(workers);
-        let rules = self.get_pool_placement_rules(pool_id, PlacementPolicy::Default);
+        let rules = self.get_pool_placement_rules(pool_id);
 
         let result = super::placement::build_table(
             table_id,
@@ -448,7 +451,7 @@ impl BGManager {
 
         // Placement violation detection
         let pool_id = (bg.table_id >> 16) as u16;
-        let rules = self.get_pool_placement_rules(pool_id, bg.placement);
+        let rules = self.get_pool_placement_rules(pool_id);
         if rules.iter().any(|r| !r.label_constraints.is_empty() || !r.location_labels.is_empty()) {
             let worker_ids: Vec<u32> = bg.replica_set.clone();
             let worker_labels = self.pool_manager.get_worker_labels(&worker_ids);
@@ -609,22 +612,6 @@ impl BGManager {
             .collect()
     }
 
-    /// BGs whose lease has expired at the given time (for LeaseChecker).
-    pub fn get_bgs_with_expired_lease(&self, now_ms: u64) -> Vec<BlockGroupInfo> {
-        self.bgs
-            .read()
-            .unwrap()
-            .values()
-            .filter(|bg| {
-                bg.lease_owner
-                    .as_ref()
-                    .map(|lease| lease.expire_time_ms > 0 && lease.expire_time_ms < now_ms)
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect()
-    }
-
     /// Build client-facing summary (buckets as BlockGroupInfoView) for the given table.
     pub fn build_table_summary(
         &self,
@@ -749,14 +736,21 @@ impl BGManager {
         Ok(())
     }
 
-    /// Get placement rules for a pool. Falls back to expanding the PlacementPolicy.
+    /// Get placement rules for a pool. Derives placement from the table's policy.
     pub fn get_pool_placement_rules(
         &self,
-        _pool_id: u16,
-        placement: curvine_common::state::PlacementPolicy,
+        pool_id: u16,
     ) -> Vec<crate::pd::schedule::placement::PlacementRule> {
+        // Find the table for this pool to get its placement policy
+        let placement = self
+            .tables
+            .read()
+            .unwrap()
+            .values()
+            .find(|t| t.pool_id() == pool_id)
+            .map(|t| t.policy.placement)
+            .unwrap_or(curvine_common::state::PlacementPolicy::Default);
         // TODO: load custom rules from ConfigManager KV when supported
-        // For now, expand from PlacementPolicy
         vec![crate::pd::schedule::placement::PlacementRule::from_placement_policy(
             placement,
             &[], // no default_location_labels for now
@@ -816,16 +810,15 @@ mod tests {
                         bg_id,
                         table_id,
                         bg_epoch: 1,
-                        lease_epoch: 1,
                         replica_set,
                         state: BGState::Assigned,
                         flags: BG_FLAG_NONE,
                         op_state: Default::default(),
                         lease_owner: Some(BGLease {
                             node_id: leader,
-                            expire_time_ms: 0,
+                            epoch: 1,
+                            grant_time_ms: 0,
                         }),
-                        placement: curvine_common::state::PlacementPolicy::Default,
                         stats: Default::default(),
                     }
     }
@@ -890,13 +883,14 @@ mod tests {
             replica_set: None,
             lease_owner: Some(BGLease {
                 node_id: 501,
-                expire_time_ms: 99_000,
+                epoch: 0,
+                grant_time_ms: 99_000,
             }),
         })
         .unwrap();
         let got = mgr.get_bg(5).unwrap();
         assert_eq!(got.lease_owner.as_ref().unwrap().node_id, 501);
-        assert_eq!(got.lease_owner.as_ref().unwrap().expire_time_ms, 99_000);
+        assert_eq!(got.lease_owner.as_ref().unwrap().grant_time_ms, 99_000);
     }
 
     #[test]
@@ -966,7 +960,7 @@ mod tests {
             info: info.clone(),
         })
         .unwrap();
-        assert_eq!(mgr.get_bg(11).unwrap().lease_epoch, 1);
+        assert_eq!(mgr.get_bg(11).unwrap().lease_owner.as_ref().unwrap().epoch, 1);
 
         mgr.apply_update_bg(&BGUpdateEntry {
             op_ms: 1,
@@ -975,11 +969,12 @@ mod tests {
             replica_set: None,
             lease_owner: Some(BGLease {
                 node_id: 2,
-                expire_time_ms: 100_000,
+                epoch: 0,
+                grant_time_ms: 100_000,
             }),
         })
         .unwrap();
-        assert_eq!(mgr.get_bg(11).unwrap().lease_epoch, 2);
+        assert_eq!(mgr.get_bg(11).unwrap().lease_owner.as_ref().unwrap().epoch, 2);
     }
 
     #[test]
@@ -999,7 +994,10 @@ mod tests {
         .unwrap();
         let after = mgr.get_bg(12).unwrap();
         assert_eq!(before.bg_epoch, after.bg_epoch);
-        assert_eq!(before.lease_epoch, after.lease_epoch);
+        assert_eq!(
+            before.lease_owner.as_ref().unwrap().epoch,
+            after.lease_owner.as_ref().unwrap().epoch
+        );
     }
 
     #[test]
@@ -1103,40 +1101,6 @@ mod tests {
 
         mgr.clear_dirty(40);
         assert!(mgr.list_dirty_bgs().is_empty());
-    }
-
-    // ========== get_bgs_with_expired_lease tests ==========
-
-    #[test]
-    fn expired_lease_detection() {
-        let mgr = test_manager();
-        // BG with lease expiring at 1000ms
-        let mut info = make_bg(50, 1, vec![1]);
-        info.lease_owner = Some(BGLease {
-            node_id: 1,
-            expire_time_ms: 1000,
-        });
-        mgr.apply_create_bg(&BGEntry { op_ms: 0, info }).unwrap();
-
-        // BG with no expiry (expire_time_ms = 0 means no expiry)
-        let mut info2 = make_bg(51, 1, vec![2]);
-        info2.lease_owner = Some(BGLease {
-            node_id: 2,
-            expire_time_ms: 0,
-        });
-        mgr.apply_create_bg(&BGEntry {
-            op_ms: 0,
-            info: info2,
-        })
-        .unwrap();
-
-        // At t=500, nothing expired
-        assert_eq!(mgr.get_bgs_with_expired_lease(500).len(), 0);
-
-        // At t=2000, bg 50 expired
-        let expired = mgr.get_bgs_with_expired_lease(2000);
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].bg_id, 50);
     }
 
     // ========== Suspect BG tests ==========
