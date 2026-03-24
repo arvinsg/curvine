@@ -107,46 +107,43 @@ impl BGTableScheduler {
     /// Check if any active pool lacks a BGTable and create one.
     pub fn check_table_initialization(&self) {
         let active_pools = self.ctx.pool_manager.list_active_pools();
-        let bucket_count = self
-            .ctx
-            .config_manager
-            .get_u32("pd.bg.default_bucket_count", 1024);
-        let replica_count = self
-            .ctx
-            .config_manager
-            .get_u32("pd.bg.default_replica_count", 3) as u16;
+        let bucket_count = self.ctx.bg_manager.bucket_count();
+        let replica_counts = self.ctx.bg_manager.replica_counts().to_vec();
 
         for pool in active_pools {
-            if self.ctx.bg_manager.has_table_for_pool(pool.pool_id) {
-                continue;
-            }
-            let workers: Vec<u32> = pool
-                .workers
-                .iter()
-                .copied()
-                .filter(|w| self.ctx.pool_manager.is_worker_available(*w))
-                .collect();
-            if workers.len() < replica_count as usize {
-                continue;
-            }
-            log::info!(
-                "Initializing BGTable for pool {} with {} buckets, {} replicas, {} workers",
-                pool.pool_id,
-                bucket_count,
-                replica_count,
-                workers.len()
-            );
-            if let Err(e) = self.ctx.bg_manager.create_table(
-                pool.pool_id,
-                bucket_count,
-                replica_count,
-                &workers,
-            ) {
-                log::error!(
-                    "Failed to create BGTable for pool {}: {}",
+            for &replica_count in &replica_counts {
+                let table_id = ((pool.pool_id as u32) << 16) | (replica_count as u32);
+                if self.ctx.bg_manager.get_table(table_id).is_some() {
+                    continue;
+                }
+                let workers: Vec<u32> = pool
+                    .workers
+                    .iter()
+                    .copied()
+                    .filter(|w| self.ctx.pool_manager.is_worker_available(*w))
+                    .collect();
+                if workers.len() < replica_count as usize {
+                    continue;
+                }
+                log::info!(
+                    "Initializing BGTable for pool {} with {} buckets, {} replicas, {} workers",
                     pool.pool_id,
-                    e
+                    bucket_count,
+                    replica_count,
+                    workers.len()
                 );
+                if let Err(e) = self.ctx.bg_manager.create_table(
+                    pool.pool_id,
+                    bucket_count,
+                    replica_count,
+                    &workers,
+                ) {
+                    log::error!(
+                        "Failed to create BGTable for pool {}: {}",
+                        pool.pool_id,
+                        e
+                    );
+                }
             }
         }
     }
@@ -333,7 +330,7 @@ mod tests {
             jc.clone(),
         ));
         let bg_store = Arc::new(crate::pd::bg::BGStore::new(store));
-        let bg_mgr = Arc::new(crate::pd::bg::BGManager::new(bg_store, pool_mgr.clone(), jc.clone()));
+        let bg_mgr = Arc::new(crate::pd::bg::BGManager::new(bg_store, pool_mgr.clone(), jc.clone(), 1024, vec![3], vec![]));
         Arc::new(CoordinatorContext {
             node_manager: node_mgr,
             pool_manager: pool_mgr,

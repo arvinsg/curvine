@@ -70,6 +70,18 @@ pub struct PdConf {
     #[serde(default)]
     pub metanode: MetaNodeConf,
 
+    /// Default bucket count for new BGTables.
+    #[serde(default = "default_bucket_count")]
+    pub bucket_count: u32,
+
+    /// Replica counts for BGTables. Each count creates a separate table per pool.
+    #[serde(default = "default_replica_counts")]
+    pub replica_counts: Vec<u16>,
+
+    /// Default location labels for placement isolation (e.g. ["az", "rack", "host"]).
+    #[serde(default)]
+    pub location_labels: Vec<String>,
+
     /// Dynamic config defaults. key → default_value (String).
     #[serde(default)]
     pub dynamic_config: HashMap<String, String>,
@@ -90,6 +102,9 @@ impl Default for PdConf {
             data_dir: default_data_dir(),
             journal: JournalConf::default(),
             metanode: MetaNodeConf::default(),
+            bucket_count: default_bucket_count(),
+            replica_counts: default_replica_counts(),
+            location_labels: Vec::new(),
             // dynamic_config is populated from pd config file (if any).
             dynamic_config: HashMap::new(),
         }
@@ -170,4 +185,12 @@ impl PdConf {
 
 fn default_data_dir() -> String {
     "/data/pd/data".to_string()
+}
+
+fn default_bucket_count() -> u32 {
+    1024
+}
+
+fn default_replica_counts() -> Vec<u16> {
+    vec![3]
 }

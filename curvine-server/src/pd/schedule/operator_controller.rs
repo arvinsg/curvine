@@ -491,7 +491,7 @@ mod tests {
         let pool_store = Arc::new(crate::pd::pool::PoolStore::new(store.clone()));
         let pool_mgr = Arc::new(PoolManager::new(pool_store, node_mgr, jc.clone()));
         let bg_store = Arc::new(crate::pd::bg::BGStore::new(store));
-        let bg_mgr = Arc::new(BGManager::new(bg_store, pool_mgr, jc));
+        let bg_mgr = Arc::new(BGManager::new(bg_store, pool_mgr, jc, 1024, vec![3], vec![]));
         let ctrl = OperatorController::new(config.clone(), bg_mgr.clone());
         (ctrl, config, bg_mgr)
     }

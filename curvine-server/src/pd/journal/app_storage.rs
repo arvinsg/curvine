@@ -34,10 +34,10 @@ pub struct PdAppStorage {
     snapshot_dir: String,
     config_manager: Arc<ConfigManager>,
     mount_manager: Arc<MountManager>,
-    node_manager: Option<Arc<NodeManager>>,
-    pool_manager: Option<Arc<PoolManager>>,
-    bg_manager: Option<Arc<BGManager>>,
-    meta_manager: Option<Arc<MetaManager>>,
+    node_manager: Arc<NodeManager>,
+    pool_manager: Arc<PoolManager>,
+    bg_manager: Arc<BGManager>,
+    meta_manager: Arc<MetaManager>,
 }
 
 impl PdAppStorage {
@@ -46,10 +46,10 @@ impl PdAppStorage {
         snapshot_dir: String,
         config_manager: Arc<ConfigManager>,
         mount_manager: Arc<MountManager>,
-        node_manager: Option<Arc<NodeManager>>,
-        pool_manager: Option<Arc<PoolManager>>,
-        bg_manager: Option<Arc<BGManager>>,
-        meta_manager: Option<Arc<MetaManager>>,
+        node_manager: Arc<NodeManager>,
+        pool_manager: Arc<PoolManager>,
+        bg_manager: Arc<BGManager>,
+        meta_manager: Arc<MetaManager>,
     ) -> Self {
         Self {
             engine,
@@ -81,18 +81,14 @@ impl PdAppStorage {
                     "Apply RegisterNode node_id:{}, address:{:?}",
                     entry.info.base.node_id, entry.info.base.address
                 );
-                if let Some(ref nm) = self.node_manager {
-                    nm.apply_register_node(&entry)?;
-                }
+                self.node_manager.apply_register_node(&entry)?;
             }
             PdEntry::SaveNode(entry) => {
                 info!(
                     "Apply SaveNode node_id:{}, state:{:?}",
                     entry.info.base.node_id, entry.info.state
                 );
-                if let Some(ref nm) = self.node_manager {
-                    nm.apply_save_node(&entry)?;
-                }
+                self.node_manager.apply_save_node(&entry)?;
             }
             PdEntry::SavePool(entry) => {
                 info!(
@@ -100,27 +96,19 @@ impl PdAppStorage {
                     entry.info.pool_id,
                     entry.info.workers.len()
                 );
-                if let Some(ref pm) = self.pool_manager {
-                    pm.apply_save_pool(&entry)?;
-                }
+                self.pool_manager.apply_save_pool(&entry)?;
             }
             PdEntry::CreateBG(entry) => {
                 info!("Apply CreateBG bg_id={}", entry.info.bg_id);
-                if let Some(ref bm) = self.bg_manager {
-                    bm.apply_create_bg(&entry)?;
-                }
+                self.bg_manager.apply_create_bg(&entry)?;
             }
             PdEntry::UpdateBG(entry) => {
                 info!("Apply UpdateBG bg_id={}", entry.bg_id);
-                if let Some(ref bm) = self.bg_manager {
-                    bm.apply_update_bg(&entry)?;
-                }
+                self.bg_manager.apply_update_bg(&entry)?;
             }
             PdEntry::DeleteBG(bg_id) => {
                 info!("Apply DeleteBG bg_id={}", bg_id);
-                if let Some(ref bm) = self.bg_manager {
-                    bm.apply_delete_bg(bg_id)?;
-                }
+                self.bg_manager.apply_delete_bg(bg_id)?;
             }
             PdEntry::BatchBG(entry) => {
                 info!(
@@ -129,21 +117,15 @@ impl PdAppStorage {
                     entry.creates.len(),
                     entry.updates.len()
                 );
-                if let Some(ref bm) = self.bg_manager {
-                    bm.apply_batch_bg(&entry)?;
-                }
+                self.bg_manager.apply_batch_bg(&entry)?;
             }
             PdEntry::AddPathRoute(ref entry) => {
                 info!("Apply AddPathRoute path={}", entry.path);
-                if let Some(ref pt) = self.meta_manager {
-                    pt.apply_add_route(entry)?;
-                }
+                self.meta_manager.apply_add_route(entry)?;
             }
             PdEntry::RemovePathRoute(ref path) => {
                 info!("Apply RemovePathRoute path={}", path);
-                if let Some(ref pt) = self.meta_manager {
-                    pt.apply_remove_route(path)?;
-                }
+                self.meta_manager.apply_remove_route(path)?;
             }
         }
 
@@ -182,21 +164,11 @@ impl AppStorage for PdAppStorage {
         self.engine.restore(&files.dir)?;
         info!("Restored store from snapshot checkpoint {}", files.dir);
 
-        self.mount_manager
-            .restore()
-            .map_err(|e| RaftError::from(e.to_string()))?;
-        if let Some(ref nm) = self.node_manager {
-            nm.restore().map_err(|e| RaftError::from(e.to_string()))?;
-        }
-        if let Some(ref pm) = self.pool_manager {
-            pm.restore().map_err(|e| RaftError::from(e.to_string()))?;
-        }
-        if let Some(ref bm) = self.bg_manager {
-            bm.restore().map_err(|e| RaftError::from(e.to_string()))?;
-        }
-        if let Some(ref mm) = self.meta_manager {
-            mm.restore().map_err(|e| RaftError::from(e.to_string()))?;
-        }
+        self.mount_manager.restore()?;
+        self.node_manager.restore()?;
+        self.pool_manager.restore()?;
+        self.bg_manager.restore()?;
+        self.meta_manager.restore()?;
         Ok(())
     }
 

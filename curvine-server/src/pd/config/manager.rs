@@ -135,8 +135,6 @@ impl ConfigManager {
         self.dynamic_cache.is_valid_key(key)
     }
 
-    //  Raft apply callbacks (called by PdAppStorage)
-
     pub fn apply_set_config(&self, item: &ConfigInfo) -> FsResult<()> {
         if let Some(existing) = self.config_store.get(&item.key)? {
             if existing.version >= item.version {
@@ -152,8 +150,6 @@ impl ConfigManager {
         self.dynamic_cache.update_from_kv(item);
         Ok(())
     }
-
-    // -- Public API ----------------------------------------------------------
 
     pub fn get_u32(&self, key: &str, default: u32) -> u32 {
         self.config_value_str(key)
@@ -174,7 +170,8 @@ impl ConfigManager {
     }
 
     pub fn get_string(&self, key: &str, default: &str) -> String {
-        self.config_value_str(key).unwrap_or_else(|| default.to_string())
+        self.config_value_str(key)
+            .unwrap_or_else(|| default.to_string())
     }
 
     /// Global config version (max version across all config items).

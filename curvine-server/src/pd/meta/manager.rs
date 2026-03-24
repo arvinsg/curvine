@@ -74,8 +74,6 @@ impl MetaManager {
         Ok(())
     }
 
-    // ========== Raft apply callbacks ==========
-
     pub fn apply_add_route(&self, entry: &PathRouteEntry) -> FsResult<()> {
         if self.mode != MetaNodeMode::Federation
             || self.federation_route_mode != Some(FederationRouteMode::Static)
@@ -114,8 +112,6 @@ impl MetaManager {
         }
         Ok(())
     }
-
-    // ========== Routing ==========
 
     pub fn route(&self, path: &str) -> FsResult<u64> {
         match self.mode {
@@ -169,8 +165,7 @@ impl MetaManager {
             entry.create_time_ms = now;
         }
         entry.update_time_ms = now;
-        self.journal_client
-            .propose(PdEntry::AddPathRoute(entry))?;
+        self.journal_client.propose(PdEntry::AddPathRoute(entry))?;
         Ok(())
     }
 

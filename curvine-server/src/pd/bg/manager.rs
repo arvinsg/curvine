@@ -72,6 +72,9 @@ pub struct BGManager {
     store: Arc<BGStore>,
     pool_manager: Arc<PoolManager>,
     journal_client: Arc<journal::Client>,
+    bucket_count: u32,
+    replica_counts: Vec<u16>,
+    location_labels: Vec<String>,
 }
 
 /// Tracks a suspect BG for priority checking.
@@ -85,6 +88,9 @@ impl BGManager {
         store: Arc<BGStore>,
         pool_manager: Arc<PoolManager>,
         journal_client: Arc<journal::Client>,
+        bucket_count: u32,
+        replica_counts: Vec<u16>,
+        location_labels: Vec<String>,
     ) -> Self {
         Self {
             tables: RwLock::new(HashMap::new()),
@@ -95,6 +101,9 @@ impl BGManager {
             store,
             pool_manager,
             journal_client,
+            bucket_count,
+            replica_counts,
+            location_labels,
         }
     }
 
@@ -753,8 +762,16 @@ impl BGManager {
         // TODO: load custom rules from ConfigManager KV when supported
         vec![crate::pd::schedule::placement::PlacementRule::from_placement_policy(
             placement,
-            &[], // no default_location_labels for now
+            &self.location_labels,
         )]
+    }
+
+    pub fn bucket_count(&self) -> u32 {
+        self.bucket_count
+    }
+
+    pub fn replica_counts(&self) -> &[u16] {
+        &self.replica_counts
     }
 }
 
@@ -801,7 +818,7 @@ mod tests {
         ));
         let node_manager: Arc<NodeManager> = Arc::new(NodeManager::new(node_store, config_manager, jc.clone()));
         let pool_manager = Arc::new(PoolManager::new(pool_store, node_manager, jc.clone()));
-        BGManager::new(bg_store, pool_manager, jc)
+        BGManager::new(bg_store, pool_manager, jc, 1024, vec![3], vec![])
     }
 
     fn make_bg(bg_id: u32, table_id: u32, replica_set: Vec<u32>) -> BlockGroupInfo {

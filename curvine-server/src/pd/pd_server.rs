@@ -165,6 +165,9 @@ impl Pd {
             bg_store,
             pool_manager.clone(),
             journal_client.clone(),
+            conf.bucket_count,
+            conf.replica_counts.clone(),
+            conf.location_labels.clone(),
         ));
         bg_manager.restore()?;
 
@@ -186,10 +189,10 @@ impl Pd {
             snapshot_dir,
             config_manager.clone(),
             mount_manager.clone(),
-            Some(node_manager.clone()),
-            Some(pool_manager.clone()),
-            Some(bg_manager.clone()),
-            Some(meta_manager.clone()),
+            node_manager.clone(),
+            pool_manager.clone(),
+            bg_manager.clone(),
+            meta_manager.clone(),
         );
 
         let role_monitor = RoleMonitor::new();

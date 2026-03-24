@@ -20,8 +20,6 @@ use orpc::common::Utils;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-// ========== Meta node mode==========
-
 /// MetaNode service mode: Proxy, Shard, or Federation. Only one mode per cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum MetaNodeMode {
@@ -43,8 +41,6 @@ pub enum FederationRouteMode {
     #[default]
     Hash,
 }
-
-// ========== Path route (Federation Static) ==========
 
 /// Single path -> group_id entry (Federation Static).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

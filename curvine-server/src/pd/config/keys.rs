@@ -36,14 +36,6 @@ pub const PD_NODE_LOST_RECOVERY_WINDOW_MS_DEFAULT: u64 = 300_000;
 pub const PD_NODE_PERSIST_INTERVAL_MS: &str = "pd.node.persist_interval_ms";
 pub const PD_NODE_PERSIST_INTERVAL_MS_DEFAULT: u64 = 300_000;
 
-/// Default bucket count for new BGTables.
-pub const PD_BG_DEFAULT_BUCKET_COUNT: &str = "pd.bg.default_bucket_count";
-pub const PD_BG_DEFAULT_BUCKET_COUNT_DEFAULT: u32 = 1024;
-
-/// Default replica count for new BGTables.
-pub const PD_BG_DEFAULT_REPLICA_COUNT: &str = "pd.bg.default_replica_count";
-pub const PD_BG_DEFAULT_REPLICA_COUNT_DEFAULT: u32 = 3;
-
 /// Cooldown before executing a rebuild (in milliseconds).
 pub const PD_BG_REBUILD_COOLDOWN_MS: &str = "pd.bg.rebuild.cooldown_ms";
 pub const PD_BG_REBUILD_COOLDOWN_MS_DEFAULT: u64 = 60_000;
@@ -152,10 +144,6 @@ pub const PD_SCHEDULE_PLACEMENT_CHECK_ENABLED_DEFAULT: bool = true;
 pub const PD_SCHEDULE_PLACEMENT_CHECK_INTERVAL_MS: &str = "pd.schedule.placement_check_interval_ms";
 pub const PD_SCHEDULE_PLACEMENT_CHECK_INTERVAL_MS_DEFAULT: u64 = 30_000;
 
-/// Default location labels for isolation (comma-separated, e.g. "az,rack,host").
-pub const PD_POOL_DEFAULT_LOCATION_LABELS: &str = "pd.pool.default_location_labels";
-pub const PD_POOL_DEFAULT_LOCATION_LABELS_DEFAULT: &str = "";
-
 /// All registered dynamic config items.
 pub static DYNAMIC_CONFIG_ITEMS: &[DynamicConfigItem] = &[
     DynamicConfigItem {
@@ -172,16 +160,6 @@ pub static DYNAMIC_CONFIG_ITEMS: &[DynamicConfigItem] = &[
         key: PD_NODE_PERSIST_INTERVAL_MS,
         default: "300000",
         desc: "Interval between periodic persists of node info via Raft",
-    },
-    DynamicConfigItem {
-        key: PD_BG_DEFAULT_BUCKET_COUNT,
-        default: "1024",
-        desc: "Default bucket count for new BGTables",
-    },
-    DynamicConfigItem {
-        key: PD_BG_DEFAULT_REPLICA_COUNT,
-        default: "3",
-        desc: "Default replica count for new BGTables",
     },
     DynamicConfigItem {
         key: PD_BG_REBUILD_COOLDOWN_MS,
@@ -317,10 +295,5 @@ pub static DYNAMIC_CONFIG_ITEMS: &[DynamicConfigItem] = &[
         key: PD_SCHEDULE_PLACEMENT_CHECK_INTERVAL_MS,
         default: "30000",
         desc: "Placement rule check interval in milliseconds",
-    },
-    DynamicConfigItem {
-        key: PD_POOL_DEFAULT_LOCATION_LABELS,
-        default: "",
-        desc: "Default location labels for isolation (comma-separated)",
     },
 ];

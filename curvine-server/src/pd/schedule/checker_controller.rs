@@ -117,6 +117,9 @@ mod tests {
             bg_store,
             pool_mgr.clone(),
             jc.clone(),
+            1024,
+            vec![3],
+            vec![],
         ));
         let ctx = Arc::new(super::super::CoordinatorContext {
             node_manager: node_mgr,
