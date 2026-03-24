@@ -232,7 +232,6 @@ impl NodeManager {
         Ok(HeartbeatResponse {
             error: None,
             epoch: node_snapshot.epoch,
-            config_version: self.config_manager.version(),
             mount_version: 0,
             bg_version: 0,
             payload: response_payload,

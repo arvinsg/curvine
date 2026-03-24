@@ -19,7 +19,9 @@ use orpc::CommonResult;
 use std::sync::Arc;
 
 const NS: &str = "mount";
+const VERSION_PREFIX: u8 = 0x01;
 const MOUNT_PREFIX: u8 = 0x02;
+const VERSION_KEY: [u8; 5] = [VERSION_PREFIX, 0, 0, 0, 0];
 
 pub struct MountStore {
     store: Arc<dyn KvStore>,
@@ -28,6 +30,26 @@ pub struct MountStore {
 impl MountStore {
     pub fn new(store: Arc<dyn KvStore>) -> Self {
         Self { store }
+    }
+
+    pub fn get_version(&self) -> CommonResult<u64> {
+        match self.store.get(NS, &VERSION_KEY)? {
+            Some(v) => {
+                let bytes: [u8; 8] = v
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                        "invalid mount version bytes".into()
+                    })?;
+                Ok(u64::from_be_bytes(bytes))
+            }
+            None => Ok(0),
+        }
+    }
+
+    pub fn put_version(&self, version: u64) -> CommonResult<()> {
+        self.store.put(NS, &VERSION_KEY, &version.to_be_bytes())?;
+        Ok(())
     }
 
     fn make_key(&self, mount_id: u32) -> [u8; 5] {

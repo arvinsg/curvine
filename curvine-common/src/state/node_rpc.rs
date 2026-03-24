@@ -100,7 +100,6 @@ pub struct MetaHeartbeatPayload {
 pub struct HeartbeatResponse {
     pub error: Option<String>,
     pub epoch: u64,
-    pub config_version: u64,
     pub mount_version: u64,
     pub bg_version: u64,
     pub payload: HeartbeatResponsePayload,

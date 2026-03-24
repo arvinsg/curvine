@@ -55,6 +55,8 @@ impl MountManager {
             );
             index.insert(mnt);
         }
+        let version = self.store.get_version()?;
+        self.version.store(version, Ordering::Relaxed);
         Ok(())
     }
 
@@ -66,7 +68,8 @@ impl MountManager {
         self.store.put_mount(&info)?;
         let mut index = self.index.write().unwrap();
         index.insert(info);
-        self.version.fetch_add(1, Ordering::Relaxed);
+        let v = self.version.fetch_add(1, Ordering::Relaxed) + 1;
+        self.store.put_version(v)?;
         Ok(())
     }
 
@@ -78,7 +81,8 @@ impl MountManager {
         };
         drop(index);
         self.store.delete_mount(mount_id)?;
-        self.version.fetch_add(1, Ordering::Relaxed);
+        let v = self.version.fetch_add(1, Ordering::Relaxed) + 1;
+        self.store.put_version(v)?;
         info!("Apply unmount: {} (id={})", info.cv_path, mount_id);
         Ok(())
     }
