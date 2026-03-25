@@ -31,14 +31,7 @@ use tokio::sync::broadcast;
 use super::index::NodeIndex;
 use super::store::NodeStore;
 
-const EVENT_CHANNEL_CAPACITY: usize = 256;
-
-/// Trait for checking whether a decommissioning node still has BGs or in-flight operators.
-/// Implemented by CompositeDecommissionChecker in cluster/manager.rs to avoid circular dependency.
-pub trait DecommissionChecker: Send + Sync {
-    fn has_bgs_on_node(&self, node_id: u32) -> bool;
-    fn has_pending_operators_for_node(&self, node_id: u32) -> bool;
-}
+const EVENT_CHANNEL_CAPACITY: usize = 2048;
 
 pub struct NodeManager {
     index: Arc<RwLock<NodeIndex>>,
@@ -49,8 +42,6 @@ pub struct NodeManager {
     event_tx: broadcast::Sender<NodeEvent>,
     /// Tracks when each node entered Lost state (node_id -> lost_time_ms)
     lost_since: Arc<DashMap<u32, u64>>,
-    /// Checker for decommission completion (set after construction to break circular dep)
-    decommission_checker: RwLock<Option<Arc<dyn DecommissionChecker>>>,
 }
 
 impl NodeManager {
@@ -71,7 +62,6 @@ impl NodeManager {
             journal_client,
             event_tx,
             lost_since: Arc::new(DashMap::new()),
-            decommission_checker: RwLock::new(None),
         }
     }
 
@@ -92,8 +82,6 @@ impl NodeManager {
             .get(node_type)
             .ok_or_else(|| FsError::common(format!("unsupported node type: {:?}", node_type)))
     }
-
-    // ========== Registration ==========
 
     pub fn register(&self, req: RegisterRequest) -> FsResult<(NodeInfo, u64)> {
         let handler = self.get_handler(req.base.node_type)?;
@@ -129,8 +117,7 @@ impl NodeManager {
             op_ms: now,
             info: node.clone(),
         };
-        self.journal_client
-            .propose(PdEntry::RegisterNode(entry))?;
+        self.journal_client.propose(PdEntry::RegisterNode(entry))?;
 
         self.emit_event(NodeEvent {
             event_type: NodeEventType::Registered,
@@ -144,8 +131,6 @@ impl NodeManager {
 
         Ok((node, new_epoch))
     }
-
-    // ========== Heartbeat ==========
 
     pub fn handle_heartbeat(&self, req: HeartbeatRequest) -> FsResult<HeartbeatResponse> {
         let handler = self.get_handler(req.node_type)?;
@@ -165,9 +150,9 @@ impl NodeManager {
                 )));
             }
 
-            // Reject heartbeats from terminal states
+            // Reject heartbeats from terminal/decommissioning states
             match node.state {
-                NodeState::Offline | NodeState::Blacklist => {
+                NodeState::Offline | NodeState::Blacklist | NodeState::Decommission => {
                     return Err(FsError::common(format!(
                         "node {} is {:?}, must re-register",
                         req.node_id, node.state
@@ -184,9 +169,7 @@ impl NodeManager {
             let old_state = node.state;
             let state_changed = matches!(old_state, NodeState::Starting | NodeState::Lost);
 
-            let need_persist = critical_changed
-                || state_changed
-                || node.need_persist(now, persist_interval);
+            let need_persist = critical_changed || node.need_persist(now, persist_interval);
 
             let node_id = req.node_id;
             let node_type = node.base.node_type;
@@ -238,22 +221,10 @@ impl NodeManager {
         })
     }
 
-    // ========== Raft apply callbacks ==========
-
     /// Apply RegisterNode entry from Raft.
     pub fn apply_register_node(&self, entry: &NodeEntry) -> FsResult<()> {
         let mut node = entry.info.clone();
         node.last_persist_ms = entry.op_ms;
-
-        // Promote az/rack from WorkerNodePayload to labels (if not already present)
-        if let curvine_common::state::NodePayload::Worker(ref payload) = node.payload {
-            if let Some(ref az) = payload.az {
-                node.base.labels.entry("az".to_string()).or_insert_with(|| az.clone());
-            }
-            if let Some(ref rack) = payload.rack {
-                node.base.labels.entry("rack".to_string()).or_insert_with(|| rack.clone());
-            }
-        }
 
         self.store.put(&node)?;
         let mut index = self.index.write().unwrap();
@@ -273,8 +244,6 @@ impl NodeManager {
         index.insert(updated);
         Ok(())
     }
-
-    // ========== State management ==========
 
     /// Persist the current in-memory state of a node to Raft.
     pub fn persist_node(&self, node_id: u32) -> FsResult<()> {
@@ -296,8 +265,20 @@ impl NodeManager {
         Ok(())
     }
 
-    /// Update state in-memory and immediately persist via Raft.
-    pub fn update_state_and_persist(&self, node_id: u32, new_state: NodeState) -> FsResult<()> {
+    /// Start decommissioning a node.
+    pub fn start_decommission(&self, node_id: u32) -> FsResult<NodeState> {
+        let _node = self
+            .get_node(node_id)
+            .ok_or_else(|| FsError::common(format!("node {} not found", node_id)))?;
+
+        let target_state = NodeState::Decommission;
+        self.update_state(node_id, target_state);
+        self.persist_node(node_id)?;
+        Ok(target_state)
+    }
+
+    /// Update state in-memory and emit the corresponding event. Does NOT persist.
+    pub fn update_state(&self, node_id: u32, new_state: NodeState) {
         let old_info = {
             let mut index = self.index.write().unwrap();
             let old_info = index
@@ -313,7 +294,7 @@ impl NodeManager {
                     NodeState::Decommission => NodeEventType::DecommissionStarted,
                     NodeState::Live => NodeEventType::HeartbeatResumed,
                     NodeState::Lost => NodeEventType::Lost,
-                    _ => return self.persist_node(node_id),
+                    _ => return,
                 };
                 self.emit_event(NodeEvent {
                     event_type,
@@ -326,10 +307,7 @@ impl NodeManager {
                 });
             }
         }
-        self.persist_node(node_id)
     }
-
-    // ========== Restore & queries ==========
 
     /// Restore in-memory index from store (call on startup).
     pub fn restore(&self) -> FsResult<()> {
@@ -364,7 +342,7 @@ impl NodeManager {
     pub fn detect_heartbeat_timeout(&self, now_ms: u64, timeout_ms: u64) -> Vec<u32> {
         let mut index = self.index.write().unwrap();
         let all_ids = index.all_node_ids();
-        let mut timed_out = Vec::new();
+        let mut timeout_nodes = Vec::new();
         for node_id in all_ids {
             let timeout_info = index.get_by_id(node_id).and_then(|n| {
                 if n.state == NodeState::Live
@@ -378,7 +356,7 @@ impl NodeManager {
             });
             if let Some(node_type) = timeout_info {
                 index.update_state(node_id, NodeState::Lost);
-                timed_out.push(node_id);
+                timeout_nodes.push(node_id);
                 let epoch = index.get_by_id(node_id).map(|n| n.epoch).unwrap_or(0);
                 self.emit_event(NodeEvent {
                     event_type: NodeEventType::Lost,
@@ -391,10 +369,10 @@ impl NodeManager {
                 });
             }
         }
-        timed_out
+        timeout_nodes
     }
 
-    pub fn heartbeat_timeout_ms(&self) -> u64 {
+    fn heartbeat_timeout_ms(&self) -> u64 {
         self.config_manager.get_u64(
             crate::pd::config::keys::PD_NODE_HEARTBEAT_TIMEOUT_MS,
             crate::pd::config::keys::PD_NODE_HEARTBEAT_TIMEOUT_MS_DEFAULT,
@@ -408,6 +386,13 @@ impl NodeManager {
         )
     }
 
+    fn liveness_check_interval_ms(&self) -> u64 {
+        self.config_manager.get_u64(
+            crate::pd::config::keys::PD_NODE_LIVENESS_CHECK_INTERVAL_MS,
+            crate::pd::config::keys::PD_NODE_LIVENESS_CHECK_INTERVAL_MS_DEFAULT,
+        )
+    }
+
     fn recovery_window_ms(&self) -> u64 {
         self.config_manager.get_u64(
             crate::pd::config::keys::PD_NODE_LOST_RECOVERY_WINDOW_MS,
@@ -415,18 +400,13 @@ impl NodeManager {
         )
     }
 
-    /// Set the decommission checker (call after BGManager is constructed).
-    pub fn set_decommission_checker(&self, checker: Arc<dyn DecommissionChecker>) {
-        *self.decommission_checker.write().unwrap() = Some(checker);
-    }
-
+    // TODO: 是否使用统一的 async
     // ========== Internal liveness loop ==========
 
     /// Start the internal liveness detection loop.
     /// This loop handles:
     /// - Live→Lost detection (heartbeat timeout, memory-only)
     /// - Lost→Offline promotion (recovery window exceeded, persisted via Raft)
-    /// - Decommission completion detection
     pub fn start_liveness_loop(self: Arc<Self>) {
         let mgr = self.clone();
         tokio::spawn(async move {
@@ -436,15 +416,12 @@ impl NodeManager {
 
     async fn liveness_loop(&self) {
         loop {
-            let check_interval = self.config_manager.get_u64(
-                crate::pd::config::keys::PD_NODE_LIVENESS_CHECK_INTERVAL_MS,
-                crate::pd::config::keys::PD_NODE_LIVENESS_CHECK_INTERVAL_MS_DEFAULT,
-            );
+            let check_interval = self.liveness_check_interval_ms();
             tokio::time::sleep(std::time::Duration::from_millis(check_interval)).await;
 
             let now = LocalTime::mills();
 
-            // 1. Detect heartbeat timeouts: Live→Lost (memory-only)
+            // 1. Detect heartbeat timeouts: Live→Lost
             let timeout = self.heartbeat_timeout_ms();
             let newly_lost = self.detect_heartbeat_timeout(now, timeout);
             for &node_id in &newly_lost {
@@ -467,9 +444,7 @@ impl NodeManager {
                     node_id,
                     recovery_window
                 );
-                if let Err(e) = self.update_state_and_persist(node_id, NodeState::Offline) {
-                    log::error!("Failed to promote node {} to Offline: {}", node_id, e);
-                }
+                self.update_state(node_id, NodeState::Offline);
                 self.lost_since.remove(&node_id);
             }
 
@@ -489,57 +464,52 @@ impl NodeManager {
                 self.lost_since.remove(&node_id);
                 log::info!("Node {} recovered from Lost state", node_id);
             }
-
-            // 4. Check decommission completion
-            self.check_decommission_complete();
         }
     }
 
-    /// Check decommissioning nodes: if no BGs remain and no in-flight operators, promote to Offline.
-    fn check_decommission_complete(&self) {
-        let checker = self.decommission_checker.read().unwrap().clone();
-        let checker = match checker {
-            Some(c) => c,
-            None => return,
-        };
+    /// Finish decommission: emit event and propose DeleteNode via Raft.
+    pub fn finish_decommission(&self, node_id: u32) -> FsResult<()> {
+        let node = self
+            .get_node(node_id)
+            .ok_or_else(|| FsError::common(format!("node {} not found", node_id)))?;
 
-        let decommission_nodes = self.get_nodes_by_state(NodeState::Decommission);
-        for node in decommission_nodes {
-            let node_id = node.base.node_id;
-            if !checker.has_bgs_on_node(node_id)
-                && !checker.has_pending_operators_for_node(node_id)
-            {
-                log::info!(
-                    "Node {} decommission complete (no BGs remaining), promoting to Offline",
-                    node_id
-                );
-                // Emit DecommissionFinished before transitioning to Offline
-                self.emit_event(NodeEvent {
-                    event_type: NodeEventType::DecommissionFinished,
-                    node_id,
-                    node_type: node.base.node_type,
-                    old_state: Some(NodeState::Decommission),
-                    new_state: Some(NodeState::Offline),
-                    epoch: node.epoch,
-                    event_time_ms: LocalTime::mills(),
-                });
-                if let Err(e) = self.update_state_and_persist(node_id, NodeState::Offline) {
-                    log::error!(
-                        "Failed to finalize decommission for node {}: {}",
-                        node_id,
-                        e
-                    );
-                }
-            }
+        if node.state != NodeState::Decommission {
+            return Err(FsError::common(format!(
+                "node {} is {:?}, expected Decommission",
+                node_id, node.state
+            )));
         }
+
+        log::info!(
+            "Node {} decommission complete, deleting from cluster",
+            node_id
+        );
+
+        self.emit_event(NodeEvent {
+            event_type: NodeEventType::DecommissionFinished,
+            node_id,
+            node_type: node.base.node_type,
+            old_state: Some(NodeState::Decommission),
+            new_state: None,
+            epoch: node.epoch,
+            event_time_ms: LocalTime::mills(),
+        });
+
+        self.journal_client.propose(PdEntry::DeleteNode(node_id))
+    }
+
+    /// Apply DeleteNode entry from Raft — remove from store and in-memory index.
+    pub fn apply_delete_node(&self, node_id: u32) -> FsResult<()> {
+        self.store.delete(node_id)?;
+        let mut index = self.index.write().unwrap();
+        index.remove(node_id);
+        Ok(())
     }
 }
 
 #[cfg(test)]
 impl NodeManager {
-    /// Insert a node directly into the in-memory index, bypassing store
-    /// serialization. Useful for tests where bincode cannot serialize
-    /// `#[serde(flatten)]` fields.
+    /// Insert a node directly into the in-memory index, bypassing store serialization.
     pub fn test_insert_node(&self, node: NodeInfo) {
         let mut index = self.index.write().unwrap();
         index.insert(node);
@@ -604,8 +574,7 @@ mod tests {
         }
     }
 
-    /// Insert a node directly into the in-memory index, bypassing store
-    /// serialization (bincode cannot handle `#[serde(flatten)]` on NodeInfo).
+    /// Insert a node directly into the in-memory index, bypassing store serialization.
     fn insert_node(mgr: &NodeManager, node: &NodeInfo) {
         let mut index = mgr.index.write().unwrap();
         index.insert(node.clone());
@@ -619,8 +588,7 @@ mod tests {
         mgr: &NodeManager,
         node: &NodeInfo,
     ) {
-        let bytes =
-            curvine_common::utils::SerdeUtils::serialize(node).expect("serialize NodeInfo");
+        let bytes = curvine_common::utils::SerdeUtils::serialize(node).expect("serialize NodeInfo");
         let mut key = [0u8; 5];
         key[0] = 0x01; // NODE_INFO_PREFIX (same as in NodeStore)
         key[1..5].copy_from_slice(&node.base.node_id.to_be_bytes());

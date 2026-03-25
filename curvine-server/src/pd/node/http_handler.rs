@@ -16,10 +16,10 @@ use crate::pd::http::ApiResponse;
 use crate::pd::http_handler::PdHttpHandler;
 use crate::pd::node::NodeError;
 use axum::{extract::Path as PathParam, response::IntoResponse, Extension};
-use curvine_common::state::{NodeInfo, NodeType};
+use curvine_common::state::{NodeInfo, NodeState, NodeType};
 use std::sync::Arc;
 
-/// GET /api/v1/node/:node_type — list nodes by type ("worker" or "meta").
+/// GET /api/v1/node/:node_type — list nodes by type.
 pub async fn list_nodes_by_type_handler(
     Extension(instance): Extension<Arc<PdHttpHandler>>,
     PathParam(node_type): PathParam<String>,
@@ -52,6 +52,21 @@ pub async fn get_node_detail_handler(
         None => {
             let err = NodeError::node_not_found(node_id);
             ApiResponse::<NodeInfo>::error(err.code().into(), err.to_string(), err.status_code())
+        }
+    }
+}
+
+/// POST /api/v1/node/decommission/:node_id — start decommissioning a node.
+pub async fn decommission_node_handler(
+    Extension(instance): Extension<Arc<PdHttpHandler>>,
+    PathParam(node_id): PathParam<u32>,
+) -> impl IntoResponse {
+    let node_manager = instance.cluster_manager.node_manager();
+    match node_manager.start_decommission(node_id) {
+        Ok(state) => ApiResponse::success(state),
+        Err(e) => {
+            let err = NodeError::internal_error(e);
+            ApiResponse::<NodeState>::error(err.code().into(), err.to_string(), err.status_code())
         }
     }
 }

@@ -87,6 +87,7 @@ pub enum PdEntry {
     // Node management
     RegisterNode(NodeEntry),
     SaveNode(NodeEntry),
+    DeleteNode(u32),
 
     // Pool management
     SavePool(PoolEntry),

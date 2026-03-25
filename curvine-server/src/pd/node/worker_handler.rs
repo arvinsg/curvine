@@ -43,8 +43,18 @@ impl HeartbeatHandler for WorkerHeartbeatHandler {
             NodePayload::Worker(p) => p.clone(),
             _ => return Err(FsError::common("expected Worker payload")),
         };
+
+        let mut base = req.base.clone();
+        // Promote az/rack from WorkerNodePayload to base labels
+        if let Some(ref az) = payload.az {
+            base.labels.entry("az".to_string()).or_insert_with(|| az.clone());
+        }
+        if let Some(ref rack) = payload.rack {
+            base.labels.entry("rack".to_string()).or_insert_with(|| rack.clone());
+        }
+
         Ok(NodeInfo {
-            base: req.base.clone(),
+            base,
             epoch: 0,
             state: NodeState::Starting,
             last_heartbeat_ms: 0,

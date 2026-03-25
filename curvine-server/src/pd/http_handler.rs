@@ -64,6 +64,7 @@ impl RouterHandler for PdHttpHandler {
             // Node
             .route("/api/v1/node/:node_type", get(list_nodes_by_type_handler))
             .route("/api/v1/node/detail/:node_id", get(get_node_detail_handler))
+            .route("/api/v1/node/decommission/:node_id", post(decommission_node_handler))
             // Pool
             .route("/api/v1/pool", get(list_pools_handler))
             .route("/api/v1/pool/:pool_id", get(get_pool_handler))

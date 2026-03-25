@@ -60,7 +60,6 @@ impl HeartbeatHandler for MetaHeartbeatHandler {
         };
 
         let mut changed = false;
-
         node.sys_stats = m.sys_stats.clone();
 
         if let NodePayload::Meta(ref mut p) = node.payload {

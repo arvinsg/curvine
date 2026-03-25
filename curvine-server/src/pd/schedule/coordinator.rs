@@ -138,7 +138,7 @@ impl Coordinator {
         }
     }
 
-    /// Accessor for OperatorController (used by CompositeDecommissionChecker).
+    /// Accessor for OperatorController.
     pub fn operator_controller(&self) -> Arc<OperatorController> {
         self.operator_controller.clone()
     }
@@ -282,6 +282,7 @@ impl Coordinator {
             for cmd in push_commands {
                 self.pending_push_commands.insert(cmd.worker_id, cmd);
             }
+            self.check_decommission_complete();
         }
     }
 
@@ -304,6 +305,35 @@ impl Coordinator {
                 continue;
             }
             self.bg_table_scheduler.check_and_rebuild().await;
+        }
+    }
+
+    /// Check decommissioning nodes: if no BGs remain and no in-flight operators,
+    /// finish decommission (delete node from cluster via Raft).
+    fn check_decommission_complete(&self) {
+        let decommission_nodes = self
+            .ctx
+            .node_manager
+            .get_nodes_by_state(curvine_common::state::NodeState::Decommission);
+        for node in decommission_nodes {
+            let node_id = node.base.node_id;
+            let has_bgs = !self.ctx.bg_manager.get_bgs_on_worker(node_id).is_empty();
+            let has_ops = self
+                .operator_controller
+                .has_running_operators_for_node(node_id);
+            if !has_bgs && !has_ops {
+                log::info!(
+                    "Node {} decommission complete (no BGs, no operators), deleting",
+                    node_id
+                );
+                if let Err(e) = self.ctx.node_manager.finish_decommission(node_id) {
+                    log::error!(
+                        "Failed to finish decommission for node {}: {}",
+                        node_id,
+                        e
+                    );
+                }
+            }
         }
     }
 

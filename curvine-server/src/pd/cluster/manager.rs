@@ -17,9 +17,8 @@ use crate::pd::config::ConfigManager;
 use crate::pd::journal;
 use crate::pd::meta::MetaManager;
 use crate::pd::mount::MountManager;
-use crate::pd::node::{DecommissionChecker, NodeManager};
+use crate::pd::node::NodeManager;
 use crate::pd::pool::PoolManager;
-use crate::pd::schedule::operator_controller::OperatorController;
 use crate::pd::schedule::coordinator::LeaderChecker;
 use crate::pd::schedule::{Coordinator, CoordinatorContext};
 use curvine_common::state::{
@@ -29,24 +28,6 @@ use curvine_common::state::{
 };
 use curvine_common::{FsError, FsResult};
 use std::sync::Arc;
-
-/// Composite decommission checker that combines BG presence check (from BGManager)
-/// with in-flight operator check (from OperatorController).
-struct CompositeDecommissionChecker {
-    bg_manager: Arc<BGManager>,
-    operator_controller: Arc<OperatorController>,
-}
-
-impl DecommissionChecker for CompositeDecommissionChecker {
-    fn has_bgs_on_node(&self, node_id: u32) -> bool {
-        !self.bg_manager.get_bgs_on_worker(node_id).is_empty()
-    }
-
-    fn has_pending_operators_for_node(&self, node_id: u32) -> bool {
-        self.operator_controller
-            .has_running_operators_for_node(node_id)
-    }
-}
 
 /// Cluster manager: ties node, pool, bg, config, mount, meta (MetaNode Federation) and the schedule coordinator.
 pub struct ClusterManager {
@@ -83,12 +64,6 @@ impl ClusterManager {
         let coordinator = Arc::new(Coordinator::new(ctx));
         coordinator.clone().run(event_rx);
 
-        // Wire up composite decommission checker (BG + operator awareness) and start liveness loop
-        let decom_checker = Arc::new(CompositeDecommissionChecker {
-            bg_manager: bg_manager.clone(),
-            operator_controller: coordinator.operator_controller(),
-        });
-        node_manager.set_decommission_checker(decom_checker);
         node_manager.clone().start_liveness_loop();
 
         let meta_manager = meta_manager.expect("MetaManager is required");
@@ -186,24 +161,8 @@ impl ClusterManager {
 
     // ========== Decommission ==========
 
-    pub fn handle_decommission(&self, node_id: u32, wait_migration: bool) -> FsResult<NodeState> {
-        let _node = self
-            .node_manager
-            .get_node(node_id)
-            .ok_or_else(|| FsError::common(format!("node {} not found", node_id)))?;
-
-        let target_state = if wait_migration {
-            NodeState::Decommission
-        } else {
-            NodeState::Offline
-        };
-
-        // State transition emits the corresponding NodeEvent (Decommission or Offline),
-        // Coordinator event_loop handles all side-effects.
-        self.node_manager
-            .update_state_and_persist(node_id, target_state)?;
-
-        Ok(target_state)
+    pub fn handle_decommission(&self, node_id: u32) -> FsResult<NodeState> {
+        self.node_manager.start_decommission(node_id)
     }
 
     // ========== Accessors ==========

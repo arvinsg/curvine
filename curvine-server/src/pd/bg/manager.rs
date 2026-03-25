@@ -775,23 +775,6 @@ impl BGManager {
     }
 }
 
-impl crate::pd::node::DecommissionChecker for BGManager {
-    fn has_bgs_on_node(&self, node_id: u32) -> bool {
-        self.worker_to_bgs
-            .read()
-            .unwrap()
-            .get(&node_id)
-            .map(|s| !s.is_empty())
-            .unwrap_or(false)
-    }
-
-    fn has_pending_operators_for_node(&self, _node_id: u32) -> bool {
-        // BGManager alone cannot check operators.
-        // CompositeDecommissionChecker in cluster/manager.rs provides the real implementation.
-        false
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

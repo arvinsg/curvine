@@ -90,6 +90,10 @@ impl PdAppStorage {
                 );
                 self.node_manager.apply_save_node(&entry)?;
             }
+            PdEntry::DeleteNode(node_id) => {
+                info!("Apply DeleteNode node_id:{}", node_id);
+                self.node_manager.apply_delete_node(node_id)?;
+            }
             PdEntry::SavePool(entry) => {
                 info!(
                     "Apply SavePool pool_id:{}, workers:{}",
