@@ -237,11 +237,34 @@ impl NodeManager {
         self.store.put(&entry.info)?;
         let mut index = self.index.write().unwrap();
         let mut updated = entry.info.clone();
+        let old_state = index.get_by_id(entry.info.base.node_id).map(|n| n.state);
         if let Some(existing) = index.get_by_id(entry.info.base.node_id) {
             updated.preserve_memory_fields(existing);
         }
         updated.last_persist_ms = entry.op_ms;
         index.insert(updated);
+        drop(index);
+
+        // Emit event on state change
+        let new_state = entry.info.state;
+        if old_state.is_some() && old_state != Some(new_state) {
+            let event_type = match new_state {
+                NodeState::Offline => NodeEventType::Offline,
+                NodeState::Decommission => NodeEventType::DecommissionStarted,
+                NodeState::Live => NodeEventType::HeartbeatResumed,
+                NodeState::Lost => NodeEventType::Lost,
+                _ => return Ok(()),
+            };
+            self.emit_event(NodeEvent {
+                event_type,
+                node_id: entry.info.base.node_id,
+                node_type: entry.info.base.node_type,
+                old_state,
+                new_state: Some(new_state),
+                epoch: entry.info.epoch,
+                event_time_ms: entry.op_ms,
+            });
+        }
         Ok(())
     }
 
@@ -257,24 +280,23 @@ impl NodeManager {
             op_ms: now,
             info: node,
         };
-        self.journal_client.propose(PdEntry::SaveNode(entry))?;
-        let mut index = self.index.write().unwrap();
-        if let Some(n) = index.get_by_id_mut(node_id) {
-            n.last_persist_ms = now;
-        }
-        Ok(())
+        self.journal_client.propose(PdEntry::SaveNode(entry))
     }
 
     /// Start decommissioning a node.
     pub fn start_decommission(&self, node_id: u32) -> FsResult<NodeState> {
-        let _node = self
+        let node = self
             .get_node(node_id)
             .ok_or_else(|| FsError::common(format!("node {} not found", node_id)))?;
 
-        let target_state = NodeState::Decommission;
-        self.update_state(node_id, target_state);
-        self.persist_node(node_id)?;
-        Ok(target_state)
+        let mut updated = node.clone();
+        updated.state = NodeState::Decommission;
+        let now = LocalTime::mills();
+        self.journal_client.propose(PdEntry::SaveNode(NodeEntry {
+            op_ms: now,
+            info: updated,
+        }))?;
+        Ok(NodeState::Decommission)
     }
 
     /// Update state in-memory and emit the corresponding event. Does NOT persist.

@@ -283,6 +283,7 @@ impl Coordinator {
                 self.pending_push_commands.insert(cmd.worker_id, cmd);
             }
             self.check_decommission_complete();
+            self.ctx.pool_manager.refresh_pool_stats();
         }
     }
 

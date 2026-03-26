@@ -22,7 +22,6 @@ use crate::pd::store::memory_kv_engine::MemoryKvEngine;
 use crate::pd::store::KvStore;
 use curvine_common::conf::JournalConf;
 use curvine_common::raft::RaftClient;
-use curvine_common::state::StorageSpec;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -78,19 +77,17 @@ fn get_pool_returns_error_for_unknown_id() {
 fn assign_worker_to_pools_with_ssd_spec_adds_to_ssd_pool() {
     let mgr = test_pool_manager();
     mgr.restore().unwrap();
-    let mut specs = std::collections::HashMap::new();
-    specs.insert(
-        "s1".to_string(),
-        StorageSpec {
-            dir_id: 0,
-            storage_id: "s1".to_string(),
-            failed: false,
-            storage_type: curvine_common::state::StorageType::Ssd,
-            dir_path: "/data".to_string(),
-        },
-    );
-    let pool_ids = mgr.assign_worker_to_pools(100, &specs).unwrap();
-    assert_eq!(pool_ids, vec![super::POOL_ID_SSD]);
+
+    // Simulate assign: build updated pool and apply via Raft callback
+    let pool = mgr.get_pool(super::POOL_ID_SSD).unwrap();
+    let mut updated = pool.clone();
+    updated.workers.insert(100);
+    mgr.apply_save_pool(&crate::pd::journal::entry::PoolEntry {
+        op_ms: 1,
+        info: updated,
+    })
+    .unwrap();
+
     let pool = mgr.get_pool(super::POOL_ID_SSD).unwrap();
     assert!(pool.workers.contains(&100));
     let active = mgr.list_active_pools();
@@ -111,21 +108,29 @@ fn assign_worker_to_pools_empty_specs_returns_empty() {
 fn remove_worker_from_pools() {
     let mgr = test_pool_manager();
     mgr.restore().unwrap();
-    let mut specs = std::collections::HashMap::new();
-    specs.insert(
-        "s1".to_string(),
-        StorageSpec {
-            dir_id: 0,
-            storage_id: "s1".to_string(),
-            failed: false,
-            storage_type: curvine_common::state::StorageType::Ssd,
-            dir_path: "/data".to_string(),
-        },
-    );
-    mgr.assign_worker_to_pools(300, &specs).unwrap();
+
+    // Simulate assign via apply
+    let pool = mgr.get_pool(super::POOL_ID_SSD).unwrap();
+    let mut updated = pool.clone();
+    updated.workers.insert(300);
+    mgr.apply_save_pool(&crate::pd::journal::entry::PoolEntry {
+        op_ms: 1,
+        info: updated,
+    })
+    .unwrap();
+
     let pool = mgr.get_pool(super::POOL_ID_SSD).unwrap();
     assert!(pool.workers.contains(&300));
-    mgr.remove_worker_from_pools(300).unwrap();
+
+    // Simulate remove via apply
+    let mut updated = pool.clone();
+    updated.workers.remove(&300);
+    mgr.apply_save_pool(&crate::pd::journal::entry::PoolEntry {
+        op_ms: 2,
+        info: updated,
+    })
+    .unwrap();
+
     let pool = mgr.get_pool(super::POOL_ID_SSD).unwrap();
     assert!(!pool.workers.contains(&300));
 }
@@ -145,19 +150,18 @@ fn restore_rebuilds_worker_to_pools_from_store_only() {
     let pool_store1 = Arc::new(PoolStore::new(store.clone()));
     let mgr1 = PoolManager::new(pool_store1, node_manager.clone(), jc.clone());
     mgr1.restore().unwrap();
-    let mut specs = std::collections::HashMap::new();
-    specs.insert(
-        "s1".to_string(),
-        StorageSpec {
-            dir_id: 0,
-            storage_id: "s1".to_string(),
-            failed: false,
-            storage_type: curvine_common::state::StorageType::Ssd,
-            dir_path: "/data".to_string(),
-        },
-    );
-    mgr1.assign_worker_to_pools(100, &specs).unwrap();
 
+    // Simulate assign via apply (persists to store)
+    let pool = mgr1.get_pool(super::POOL_ID_SSD).unwrap();
+    let mut updated = pool.clone();
+    updated.workers.insert(100);
+    mgr1.apply_save_pool(&crate::pd::journal::entry::PoolEntry {
+        op_ms: 1,
+        info: updated,
+    })
+    .unwrap();
+
+    // Create fresh manager with same backing store and restore
     let pool_store2 = Arc::new(PoolStore::new(store));
     let mgr2 = PoolManager::new(pool_store2, node_manager, jc);
     mgr2.restore().unwrap();

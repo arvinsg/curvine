@@ -19,7 +19,16 @@ use crate::pd::node::NodeManager;
 use curvine_common::state::{NodeInfo, NodePayload, NodeType, StorageSpec};
 use curvine_common::state::{PlacementPolicy, PoolInfo, PoolStats, StorageType};
 use curvine_common::{FsError, FsResult};
+use orpc::common::LocalTime;
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::RwLock;
 
+pub const POOL_ID_MEM: u16 = 1;
+pub const POOL_ID_SSD: u16 = 2;
+pub const POOL_ID_HDD: u16 = 3;
+
+// TODO: remove
 /// Compute isolation penalty between two workers along placement rules' location labels.
 /// Lower = more isolated.
 fn compute_pair_isolation_penalty(
@@ -42,14 +51,6 @@ fn compute_pair_isolation_penalty(
     }
     penalty
 }
-use orpc::common::LocalTime;
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::sync::RwLock;
-
-pub const POOL_ID_MEM: u16 = 1;
-pub const POOL_ID_SSD: u16 = 2;
-pub const POOL_ID_HDD: u16 = 3;
 
 fn pool_id_for_media(media: StorageType) -> Option<u16> {
     match media {
@@ -81,9 +82,38 @@ impl PoolManager {
         }
     }
 
+    /// Restore from store.
+    pub fn restore(&self) -> FsResult<()> {
+        let pools = self.store.list_pools()?;
+        let mut index = self.index.write().unwrap();
+        index.clear();
+        for info in pools {
+            index.insert_pool(info);
+        }
+        drop(index);
+
+        if self.store.list_pools()?.is_empty() {
+            self.init_default_pools()?;
+        }
+        Ok(())
+    }
+
+    fn init_default_pools(&self) -> FsResult<()> {
+        let default = [
+            (POOL_ID_MEM, "mem_pool".to_string(), StorageType::Mem),
+            (POOL_ID_SSD, "ssd_pool".to_string(), StorageType::Ssd),
+            (POOL_ID_HDD, "hdd_pool".to_string(), StorageType::Hdd),
+        ];
+        for (pool_id, name, media) in default {
+            let info = PoolInfo::new(pool_id, name, media);
+            self.store.put_pool(&info)?;
+            self.index.write().unwrap().insert_pool(info);
+        }
+        Ok(())
+    }
+
     /// Assign worker to pools based on storage_specs (unique storage_type -> pool).
     /// Returns list of pool_ids the worker was added to.
-    /// Updates index in-memory and proposes SavePool via Raft for persistence.
     pub fn assign_worker_to_pools(
         &self,
         worker_id: u32,
@@ -98,35 +128,40 @@ impl PoolManager {
         if pool_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let mut index = self.index.write().unwrap();
-        for &pool_id in &pool_ids {
-            index.add_worker_to_pool(pool_id, worker_id);
-        }
-        let pool_ids_vec: Vec<u16> = pool_ids.into_iter().collect();
 
         let now = LocalTime::mills();
-        for pid in &pool_ids_vec {
-            if let Some(pool) = index.get_pool(*pid).cloned() {
-                self.journal_client
-                    .propose(PdEntry::SavePool(PoolEntry { op_ms: now, info: pool }))?;
+        let index = self.index.read().unwrap();
+        let pool_ids_vec: Vec<u16> = pool_ids.into_iter().collect();
+        for &pid in &pool_ids_vec {
+            if let Some(pool) = index.get_pool(pid) {
+                let mut updated = pool.clone();
+                updated.workers.insert(worker_id);
+                self.journal_client.propose(PdEntry::SavePool(PoolEntry {
+                    op_ms: now,
+                    info: updated,
+                }))?;
             }
         }
         Ok(pool_ids_vec)
     }
 
     /// Remove worker from all pools (e.g. on worker offline).
-    /// Updates index in-memory and proposes SavePool via Raft for persistence.
     pub fn remove_worker_from_pools(&self, worker_id: u32) -> FsResult<()> {
-        let mut index = self.index.write().unwrap();
-        let pool_ids = { index.remove_worker(worker_id) };
-        let Some(pool_ids) = pool_ids else {
-            return Ok(());
+        let index = self.index.read().unwrap();
+        let pool_ids = match index.get_pools_by_worker(worker_id) {
+            Some(ids) => ids.iter().copied().collect::<Vec<_>>(),
+            None => return Ok(()),
         };
         let now = LocalTime::mills();
-        for pool_id in &pool_ids {
-            if let Some(pool) = index.get_pool(*pool_id).cloned() {
-                self.journal_client
-                    .propose(PdEntry::SavePool(PoolEntry { op_ms: now, info: pool }))?;
+        for pool_id in pool_ids {
+            if let Some(pool) = index.get_pool(pool_id) {
+                let mut updated = pool.clone();
+                updated.workers.remove(&worker_id);
+                updated.allocatable_workers.remove(&worker_id);
+                self.journal_client.propose(PdEntry::SavePool(PoolEntry {
+                    op_ms: now,
+                    info: updated,
+                }))?;
             }
         }
         Ok(())
@@ -175,7 +210,7 @@ impl PoolManager {
             .unwrap_or_default()
     }
 
-    /// Get pool IDs that contain this worker (for schedule/coordinator).
+    /// Get pool IDs that contain this worker.
     pub fn get_pools_by_worker(&self, worker_id: u32) -> Vec<u16> {
         let index = self.index.read().unwrap();
         index
@@ -191,20 +226,51 @@ impl PoolManager {
         Ok(())
     }
 
-    /// Restore from store.
-    pub fn restore(&self) -> FsResult<()> {
-        let pools = self.store.list_pools()?;
-        let mut index = self.index.write().unwrap();
-        index.clear();
-        for info in pools {
-            index.insert_pool(info);
-        }
-        drop(index);
+    /// Refresh stats for all pools by aggregating worker storage_stats.
+    /// For each pool, sums capacity/available/used from workers whose storage_specs
+    /// match the pool's media type.
+    pub fn refresh_pool_stats(&self) {
+        let pool_ids = {
+            let index = self.index.read().unwrap();
+            index.all_pool_ids()
+        };
 
-        if self.store.list_pools()?.is_empty() {
-            self.init_default_pools()?;
+        for pool_id in pool_ids {
+            let (workers, media) = {
+                let index = self.index.read().unwrap();
+                match index.get_pool(pool_id) {
+                    Some(pool) => (pool.workers.clone(), pool.media),
+                    None => continue,
+                }
+            };
+
+            let mut stats = PoolStats::default();
+            for worker_id in &workers {
+                let Some(node) = self.node_manager.get_node(*worker_id) else {
+                    continue;
+                };
+                let NodePayload::Worker(ref payload) = node.payload else {
+                    continue;
+                };
+                // Find storage_ids that match this pool's media type
+                let matching_ids: Vec<&String> = payload
+                    .storage_specs
+                    .iter()
+                    .filter(|(_, spec)| spec.storage_type == media)
+                    .map(|(id, _)| id)
+                    .collect();
+                for sid in matching_ids {
+                    if let Some(ss) = payload.storage_stats.get(sid) {
+                        stats.capacity_bytes += ss.capacity as u64;
+                        stats.available_bytes += ss.available as u64;
+                        stats.used_bytes += ss.fs_used as u64;
+                    }
+                }
+            }
+
+            let mut index = self.index.write().unwrap();
+            index.update_pool_stats(pool_id, stats);
         }
-        Ok(())
     }
 
     /// Rebuild allocatable_workers from current node states after restore.
@@ -241,20 +307,7 @@ impl PoolManager {
         }
     }
 
-    fn init_default_pools(&self) -> FsResult<()> {
-        let default = [
-            (POOL_ID_MEM, "mem_pool".to_string(), StorageType::Mem),
-            (POOL_ID_SSD, "ssd_pool".to_string(), StorageType::Ssd),
-            (POOL_ID_HDD, "hdd_pool".to_string(), StorageType::Hdd),
-        ];
-        for (pool_id, name, media) in default {
-            let info = PoolInfo::new(pool_id, name, media);
-            self.store.put_pool(&info)?;
-            self.index.write().unwrap().insert_pool(info);
-        }
-        Ok(())
-    }
-
+    /// TODO:
     /// Select workers for BG replica set with placement-aware multi-level relaxation.
     ///
     /// Level 1 (CONSIDER_ALL): filter by label_constraints + sort by isolation from exclude_workers.
@@ -297,7 +350,11 @@ impl PoolManager {
         }
 
         // If no rules, return simple selection (Level 3 behavior)
-        if rules.is_empty() || rules.iter().all(|r| r.label_constraints.is_empty() && r.location_labels.is_empty()) {
+        if rules.is_empty()
+            || rules
+                .iter()
+                .all(|r| r.label_constraints.is_empty() && r.location_labels.is_empty())
+        {
             return Ok(candidates.into_iter().take(n).collect());
         }
 
@@ -310,9 +367,9 @@ impl PoolManager {
             .filter(|&wid| {
                 let empty = std::collections::HashMap::new();
                 let labels = worker_labels.get(&wid).unwrap_or(&empty);
-                rules.iter().all(|rule| {
-                    rule.label_constraints.iter().all(|c| c.matches(labels))
-                })
+                rules
+                    .iter()
+                    .all(|rule| rule.label_constraints.iter().all(|c| c.matches(labels)))
             })
             .collect();
 
@@ -323,12 +380,17 @@ impl PoolManager {
                 .map(|&wid| {
                     let empty = std::collections::HashMap::new();
                     let labels = worker_labels.get(&wid).unwrap_or(&empty);
-                    let isolation_penalty: f64 = exclude_workers.iter().map(|&ew| {
-                        let ew_labels_map = self.node_manager.get_node(ew)
-                            .map(|n| n.base.labels.clone())
-                            .unwrap_or_default();
-                        compute_pair_isolation_penalty(labels, &ew_labels_map, rules)
-                    }).sum();
+                    let isolation_penalty: f64 = exclude_workers
+                        .iter()
+                        .map(|&ew| {
+                            let ew_labels_map = self
+                                .node_manager
+                                .get_node(ew)
+                                .map(|n| n.base.labels.clone())
+                                .unwrap_or_default();
+                            compute_pair_isolation_penalty(labels, &ew_labels_map, rules)
+                        })
+                        .sum();
                     (wid, isolation_penalty)
                 })
                 .collect();
@@ -406,7 +468,10 @@ impl PoolManager {
     }
 
     /// Get labels for a set of workers.
-    pub fn get_worker_labels(&self, worker_ids: &[u32]) -> std::collections::HashMap<u32, std::collections::HashMap<String, String>> {
+    pub fn get_worker_labels(
+        &self,
+        worker_ids: &[u32],
+    ) -> std::collections::HashMap<u32, std::collections::HashMap<String, String>> {
         worker_ids
             .iter()
             .filter_map(|&wid| {
