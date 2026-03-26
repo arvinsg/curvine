@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod http_handler;
 mod manager;
 pub mod placement;
 pub mod state_machine;

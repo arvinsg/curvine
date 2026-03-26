@@ -12,15 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::pd::bg::http_handler::*;
+use crate::pd::cluster::http_handler::*;
 use crate::pd::cluster::ClusterManager;
 use crate::pd::config::http_handler::*;
 use crate::pd::config::ConfigManager;
 use crate::pd::meta::http_handler::*;
 use crate::pd::mount::http_handler::*;
 use crate::pd::mount::MountManager;
-use crate::pd::node::http_handler::*;
-use crate::pd::pool::http_handler::*;
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Router};
 use curvine_web::router::RouterHandler;

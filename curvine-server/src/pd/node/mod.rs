@@ -12,10 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod error;
 pub mod event;
 mod heartbeat;
-pub(crate) mod http_handler;
 mod index;
 mod manager;
 mod registry;
@@ -23,7 +21,6 @@ mod store;
 mod worker_handler;
 mod meta_handler;
 
-pub use error::NodeError;
 pub use event::{NodeEvent, NodeEventType};
 pub use heartbeat::HeartbeatHandler;
 pub use index::NodeIndex;

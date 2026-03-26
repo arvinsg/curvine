@@ -28,7 +28,6 @@ pub struct BGTable {
 }
 
 impl BGTable {
-    /// Lookup bg_id by key (MurmurHash3(key) % bucket_count).
     pub fn lookup(&self, key: &[u8]) -> u32 {
         if self.buckets.is_empty() {
             return 0;

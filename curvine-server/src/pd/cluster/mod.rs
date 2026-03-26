@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod error;
+pub(crate) mod http_handler;
 pub mod manager;
 
+pub use error::ClusterError;
 pub use manager::ClusterManager;
