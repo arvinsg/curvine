@@ -18,9 +18,9 @@ use curvine_common::utils::SerdeUtils as Serde;
 use orpc::CommonResult;
 use std::sync::Arc;
 
-const NS: &str = "mount";
-const VERSION_PREFIX: u8 = 0x01;
-const MOUNT_PREFIX: u8 = 0x02;
+const NS: &str = "meta";
+const VERSION_PREFIX: u8 = 0x40;
+const MOUNT_PREFIX: u8 = 0x41;
 const VERSION_KEY: [u8; 5] = [VERSION_PREFIX, 0, 0, 0, 0];
 
 pub struct MountStore {

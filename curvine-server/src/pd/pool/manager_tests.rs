@@ -43,13 +43,35 @@ fn test_pool_manager() -> PoolManager {
     let node_store = Arc::new(NodeStore::new(store.clone()));
     let node_manager = Arc::new(NodeManager::new(node_store, config_manager, jc.clone()));
     let pool_store = Arc::new(PoolStore::new(store));
-    PoolManager::new(pool_store, node_manager, jc)
+    let mgr = PoolManager::new(pool_store, node_manager, jc);
+    // Seed default pools via apply (simulating Raft-committed entries).
+    seed_default_pools(&mgr);
+    mgr
+}
+
+/// Seed default pools via apply_save_pool (bypasses Raft for tests).
+fn seed_default_pools(mgr: &PoolManager) {
+    use curvine_common::state::{PoolInfo, StorageType};
+    let defaults = [
+        (super::POOL_ID_MEM, "mem_pool", StorageType::Mem),
+        (super::POOL_ID_SSD, "ssd_pool", StorageType::Ssd),
+        (super::POOL_ID_HDD, "hdd_pool", StorageType::Hdd),
+    ];
+    for (pool_id, name, media) in defaults {
+        let info = PoolInfo::new(pool_id, name.to_string(), media);
+        mgr.apply_save_pool(&crate::pd::journal::entry::PoolEntry {
+            op_ms: 0,
+            info,
+        })
+        .unwrap();
+    }
 }
 
 #[test]
-fn restore_inits_default_pools() {
+fn restore_loads_seeded_pools() {
     let mgr = test_pool_manager();
     mgr.restore().unwrap();
+    // Default pools were seeded via apply in test_pool_manager()
     assert!(mgr.get_pool_by_media(curvine_common::state::StorageType::Mem).is_ok());
     assert!(mgr.get_pool_by_media(curvine_common::state::StorageType::Ssd).is_ok());
     assert!(mgr.get_pool_by_media(curvine_common::state::StorageType::Hdd).is_ok());
@@ -149,6 +171,7 @@ fn restore_rebuilds_worker_to_pools_from_store_only() {
     let node_manager = Arc::new(NodeManager::new(node_store, config_manager, jc.clone()));
     let pool_store1 = Arc::new(PoolStore::new(store.clone()));
     let mgr1 = PoolManager::new(pool_store1, node_manager.clone(), jc.clone());
+    seed_default_pools(&mgr1);
     mgr1.restore().unwrap();
 
     // Simulate assign via apply (persists to store)

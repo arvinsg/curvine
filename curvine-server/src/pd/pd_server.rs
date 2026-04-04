@@ -114,14 +114,7 @@ impl Pd {
             FileUtils::delete_path(&db_conf.data_dir, true)?;
         }
 
-        // TODO:
-        db_conf = db_conf
-            .add_cf("config")
-            .add_cf("mount")
-            .add_cf("node")
-            .add_cf("pool")
-            .add_cf("bg")
-            .add_cf("meta");
+        db_conf = db_conf.add_cf("meta").add_cf("data");
         let db = DBEngine::new(db_conf, false)?;
         let engine = Arc::new(RocksKvEngine::new(db));
         let store: Arc<dyn KvStore> = engine.clone();
@@ -158,7 +151,6 @@ impl Pd {
             journal_client.clone(),
         ));
         pool_manager.restore()?;
-        pool_manager.rebuild_allocatable();
 
         let bg_store = Arc::new(BGStore::new(store.clone()));
         let bg_manager = Arc::new(BGManager::new(
@@ -197,8 +189,7 @@ impl Pd {
 
         let role_monitor = RoleMonitor::new();
         let role_ctl = role_monitor.read_ctl();
-        let leader_checker: Arc<dyn LeaderChecker> =
-            Arc::new(RaftLeaderChecker::new(role_ctl));
+        let leader_checker: Arc<dyn LeaderChecker> = Arc::new(RaftLeaderChecker::new(role_ctl));
 
         let cluster_manager = Arc::new(ClusterManager::new(
             node_manager,

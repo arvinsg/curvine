@@ -19,9 +19,9 @@ use orpc::CommonResult;
 use std::sync::Arc;
 
 /// Namespace for path route table (Federation Static).
-const NS: &str = "path_route";
-const ROUTE_PREFIX: u8 = 0x01;
-const VERSION_KEY: &[u8] = &[0u8];
+const NS: &str = "meta";
+const ROUTE_PREFIX: u8 = 0x51;
+const VERSION_KEY: &[u8] = &[0x50];
 
 /// Store for meta route data
 pub struct RouteStore {

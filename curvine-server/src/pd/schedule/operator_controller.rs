@@ -218,9 +218,25 @@ impl OperatorController {
             .get_u32("pd.schedule.max_waiting_operators", 100);
 
         let mut queue = self.waiting_operators.lock().unwrap();
-        if self.running_operators.contains_key(&op.bg_id) {
-            return false;
+
+        // Priority replacement: if a running operator exists for this BG,
+        // replace it only if the new operator has higher priority.
+        if let Some(existing) = self.running_operators.get(&op.bg_id) {
+            if op.priority > existing.priority {
+                // New operator has higher priority -> replace
+                drop(existing);
+                if let Some((_, mut old_op)) = self.running_operators.remove(&op.bg_id) {
+                    old_op.status = OpStatus::Replaced;
+                    self.decrement_worker_counts(&old_op);
+                    self.bg_manager
+                        .set_op_state(op.bg_id, curvine_common::state::BGOpState::Idle);
+                    self.bg_manager.mark_suspect(op.bg_id);
+                }
+            } else {
+                return false;
+            }
         }
+
         if queue.len() >= max_waiting as usize {
             return false;
         }
@@ -394,10 +410,6 @@ impl OperatorController {
                 self.decrement_worker_counts(&op);
                 // Reset op_state to Idle so checkers can re-evaluate this BG
                 self.bg_manager.set_op_state(bg_id, BGOpState::Idle);
-                if op.status == OpStatus::Success {
-                    // Refresh flags to clear resolved issues
-                    let _ = self.bg_manager.refresh_bg_flags(bg_id);
-                }
                 // Mark BG as suspect so checkers re-evaluate it promptly
                 self.bg_manager.mark_suspect(bg_id);
             }
@@ -430,6 +442,26 @@ impl OperatorController {
     /// Generate next operator id
     pub fn next_operator_id(&self) -> u64 {
         self.next_op_id.fetch_add(1, AtomicOrdering::SeqCst)
+    }
+
+    /// Get the net BG count influence of all running operators on a worker.
+    pub fn get_bg_influence(&self, worker_id: u32) -> i32 {
+        let mut delta = 0i32;
+        for entry in self.running_operators.iter() {
+            let influence = entry.value().compute_influence();
+            delta += influence.bg_count_delta.get(&worker_id).copied().unwrap_or(0);
+        }
+        delta
+    }
+
+    /// Get the net leader count influence of all running operators on a worker.
+    pub fn get_leader_influence(&self, worker_id: u32) -> i32 {
+        let mut delta = 0i32;
+        for entry in self.running_operators.iter() {
+            let influence = entry.value().compute_influence();
+            delta += influence.leader_count_delta.get(&worker_id).copied().unwrap_or(0);
+        }
+        delta
     }
 
     // ========== Per-worker concurrency helpers ==========
@@ -534,14 +566,13 @@ mod tests {
         let (ctrl, _config, bg_mgr) = test_controller();
 
         // Create a BG with worker 1 in replica_set so AddReplica is_finish returns true
-        use curvine_common::state::{BGLease, BGState, BG_FLAG_NONE};
+        use curvine_common::state::{BGLease, BGState};
         let bg = curvine_common::state::BlockGroupInfo {
             bg_id: 10,
             table_id: 1,
             bg_epoch: 1,
             replica_set: vec![1],
             state: BGState::Active,
-            flags: BG_FLAG_NONE,
             op_state: Default::default(),
             lease_owner: Some(BGLease {
                 node_id: 1,
@@ -659,14 +690,13 @@ mod tests {
         let (ctrl, _config, bg_mgr) = test_controller();
 
         // Create a BG so dispatch_to_worker can find it
-        use curvine_common::state::{BGLease, BGState, BG_FLAG_NONE};
+        use curvine_common::state::{BGLease, BGState};
         let bg = curvine_common::state::BlockGroupInfo {
             bg_id: 20,
             table_id: 1,
             bg_epoch: 1,
             replica_set: vec![1, 2],
             state: BGState::Active,
-            flags: BG_FLAG_NONE,
             op_state: Default::default(),
             lease_owner: Some(BGLease {
                 node_id: 1,
@@ -704,14 +734,13 @@ mod tests {
     fn operator_success_resets_op_state_to_idle() {
         let (ctrl, _config, bg_mgr) = test_controller();
 
-        use curvine_common::state::{BGLease, BGState, BG_FLAG_NONE};
+        use curvine_common::state::{BGLease, BGState};
         let bg = curvine_common::state::BlockGroupInfo {
             bg_id: 30,
             table_id: 1,
             bg_epoch: 1,
             replica_set: vec![1],
             state: BGState::Active,
-            flags: BG_FLAG_NONE,
             op_state: Default::default(),
             lease_owner: Some(BGLease {
                 node_id: 1,
@@ -747,14 +776,13 @@ mod tests {
     fn check_progress_cancels_stale_epoch() {
         let (ctrl, _config, bg_mgr) = test_controller();
 
-        use curvine_common::state::{BGLease, BGState, BG_FLAG_NONE};
+        use curvine_common::state::{BGLease, BGState};
         let bg = curvine_common::state::BlockGroupInfo {
             bg_id: 40,
             table_id: 1,
             bg_epoch: 1,
             replica_set: vec![1, 2],
             state: BGState::Active,
-            flags: BG_FLAG_NONE,
             op_state: Default::default(),
             lease_owner: Some(BGLease {
                 node_id: 1,
@@ -782,6 +810,7 @@ mod tests {
                 replica_set: Some(vec![1, 2, 3]),
                 state: None,
                 lease_owner: None,
+                bg_epoch: None,
             })
             .unwrap();
         // bg_epoch should now be 2

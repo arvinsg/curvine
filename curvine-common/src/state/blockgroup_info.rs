@@ -15,16 +15,6 @@
 use super::{NodeAddress, NodeState, StorageType};
 use serde::{Deserialize, Serialize};
 
-pub type BGFlag = u32;
-pub const BG_FLAG_NONE: BGFlag = 0;
-pub const BG_FLAG_UNDER_REPLICATED: BGFlag = 1 << 0;
-pub const BG_FLAG_OVER_REPLICATED: BGFlag = 1 << 1;
-pub const BG_FLAG_UNAVAILABLE: BGFlag = 1 << 2;
-pub const BG_FLAG_LEASE_INVALID: BGFlag = 1 << 3;
-pub const BG_FLAG_ASSIGNMENT_MISMATCH: BGFlag = 1 << 4;
-pub const BG_FLAG_ON_DECOMMISSION_NODE: BGFlag = 1 << 5;
-pub const BG_FLAG_PLACEMENT_VIOLATION: BGFlag = 1 << 6;
-
 /// Placement policy for replica selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlacementPolicy {
@@ -103,7 +93,6 @@ pub struct BlockGroupInfo {
     pub bg_epoch: u64,
     pub replica_set: Vec<u32>,
     pub state: BGState,
-    pub flags: BGFlag,
     pub op_state: BGOpState,
     pub lease_owner: Option<BGLease>,
 
@@ -119,7 +108,6 @@ pub struct BlockGroupInfoView {
     pub bg_epoch: u64,
     pub replica_set: Vec<ReplicaInfo>,
     pub state: BGState,
-    pub flags: BGFlag,
     pub op_state: BGOpState,
     pub lease_owner: Option<BGLease>,
 }

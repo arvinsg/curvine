@@ -17,7 +17,7 @@ use crate::state::meta_node_mode::PathRouteEntry;
 use crate::state::node_info::{NodePayload, SystemStats};
 use crate::state::node_state::{NodeAddress, NodeBase, NodeType};
 use crate::state::worker_node_info::StorageStats;
-use crate::state::BlockGroupInfo;
+use crate::state::{BGStats, BlockGroupInfo};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -81,6 +81,8 @@ pub struct WorkerHeartbeatPayload {
     pub bg_epochs: HashMap<u32, u64>,
     #[serde(default)]
     pub progress_reports: Vec<WorkerProgressReport>,
+    #[serde(default)]
+    pub bg_stats: HashMap<u32, BGStats>,
 }
 
 /// Meta heartbeat payload (is_leader, group_epoch, stats)
@@ -101,7 +103,8 @@ pub struct HeartbeatResponse {
     pub error: Option<String>,
     pub epoch: u64,
     pub mount_version: u64,
-    pub bg_version: u64,
+    #[serde(default)]
+    pub table_epochs: HashMap<u32, u64>,
     pub payload: HeartbeatResponsePayload,
 }
 

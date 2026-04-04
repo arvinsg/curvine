@@ -14,6 +14,7 @@
 
 use curvine_common::state::{BGOpState, BlockGroupInfo};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Operator kind: what type of scheduling operation this is
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +35,8 @@ pub enum OpStatus {
     Failed,
     Timeout,
     Cancelled,
+    /// Replaced by a higher-priority operator for the same BG.
+    Replaced,
 }
 
 /// A single step of an operator
@@ -46,17 +49,15 @@ pub enum OpStep {
 
 impl OpStep {
     /// Check whether this step is finished based on the actual BG state.
-    /// Inspired by TiKV PD's `step.IsFinish(region)` pattern.
     pub fn is_finish(&self, bg: &BlockGroupInfo) -> bool {
         match self {
             OpStep::AddReplica { worker_id } => bg.replica_set.contains(worker_id),
             OpStep::RemoveReplica { worker_id } => !bg.replica_set.contains(worker_id),
-            OpStep::TransferLease { to_worker, .. } => {
-                bg.lease_owner
-                    .as_ref()
-                    .map(|l| l.node_id == *to_worker)
-                    .unwrap_or(false)
-            }
+            OpStep::TransferLease { to_worker, .. } => bg
+                .lease_owner
+                .as_ref()
+                .map(|l| l.node_id == *to_worker)
+                .unwrap_or(false),
         }
     }
 }
@@ -118,8 +119,10 @@ impl OperatorBuilder {
     }
 
     pub fn transfer_lease(mut self, from_worker: u32, to_worker: u32) -> Self {
-        self.steps
-            .push(OpStep::TransferLease { from_worker, to_worker });
+        self.steps.push(OpStep::TransferLease {
+            from_worker,
+            to_worker,
+        });
         self
     }
 
@@ -156,6 +159,41 @@ impl BGOperator {
             OperatorKind::Delete => BGOpState::Deleting,
         }
     }
+
+    /// Compute the influence of this operator on each worker.
+    pub fn compute_influence(&self) -> OpInfluence {
+        let mut influence = OpInfluence::default();
+        for step in &self.steps {
+            match step {
+                OpStep::AddReplica { worker_id } => {
+                    *influence.bg_count_delta.entry(*worker_id).or_default() += 1;
+                }
+                OpStep::RemoveReplica { worker_id } => {
+                    *influence.bg_count_delta.entry(*worker_id).or_default() -= 1;
+                }
+                OpStep::TransferLease {
+                    from_worker,
+                    to_worker,
+                } => {
+                    *influence
+                        .leader_count_delta
+                        .entry(*from_worker)
+                        .or_default() -= 1;
+                    *influence.leader_count_delta.entry(*to_worker).or_default() += 1;
+                }
+            }
+        }
+        influence
+    }
+}
+
+/// Tracks the in-flight influence of running operators on each worker.
+#[derive(Debug, Clone, Default)]
+pub struct OpInfluence {
+    /// worker_id -> BG count change (positive = adding, negative = removing).
+    pub bg_count_delta: HashMap<u32, i32>,
+    /// worker_id -> leader count change.
+    pub leader_count_delta: HashMap<u32, i32>,
 }
 
 /// Commands for a worker (add/remove BGs), returned via heartbeat response
@@ -168,7 +206,7 @@ pub struct BGCommands {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use curvine_common::state::{BGLease, BGState, BG_FLAG_NONE};
+    use curvine_common::state::{BGLease, BGState};
 
     fn make_bg(bg_id: u32, replica_set: Vec<u32>, lease_node: Option<u32>) -> BlockGroupInfo {
         BlockGroupInfo {
@@ -177,7 +215,6 @@ mod tests {
             bg_epoch: 1,
             replica_set,
             state: BGState::Active,
-            flags: BG_FLAG_NONE,
             op_state: BGOpState::Idle,
             lease_owner: lease_node.map(|n| BGLease {
                 node_id: n,
@@ -217,37 +254,31 @@ mod tests {
     #[test]
     fn transfer_lease_is_finish_when_lease_matches_target() {
         let bg = make_bg(1, vec![10, 20], Some(20));
-        assert!(
-            OpStep::TransferLease {
-                from_worker: 10,
-                to_worker: 20
-            }
-            .is_finish(&bg)
-        );
+        assert!(OpStep::TransferLease {
+            from_worker: 10,
+            to_worker: 20
+        }
+        .is_finish(&bg));
     }
 
     #[test]
     fn transfer_lease_not_finish_when_lease_still_on_source() {
         let bg = make_bg(1, vec![10, 20], Some(10));
-        assert!(
-            !OpStep::TransferLease {
-                from_worker: 10,
-                to_worker: 20
-            }
-            .is_finish(&bg)
-        );
+        assert!(!OpStep::TransferLease {
+            from_worker: 10,
+            to_worker: 20
+        }
+        .is_finish(&bg));
     }
 
     #[test]
     fn transfer_lease_not_finish_when_no_lease() {
         let bg = make_bg(1, vec![10, 20], None);
-        assert!(
-            !OpStep::TransferLease {
-                from_worker: 10,
-                to_worker: 20
-            }
-            .is_finish(&bg)
-        );
+        assert!(!OpStep::TransferLease {
+            from_worker: 10,
+            to_worker: 20
+        }
+        .is_finish(&bg));
     }
 
     #[test]

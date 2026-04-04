@@ -102,7 +102,7 @@ pub async fn get_bg_table_handler(
     match instance
         .cluster_manager
         .bg_manager()
-        .build_table_summary(table_id, &instance.cluster_manager.node_manager())
+        .build_table_summary(table_id)
     {
         Some(summary) => ApiResponse::success(summary),
         None => ApiResponse::<BGTableSummary>::success_with_status_code(StatusCode::NOT_FOUND),

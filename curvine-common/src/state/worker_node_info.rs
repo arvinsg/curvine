@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::StorageType;
+use super::BGStats;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -20,14 +21,14 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkerNodePayload {
     pub storage_specs: HashMap<String, StorageSpec>,
-    pub az: Option<String>,
-    pub rack: Option<String>,
 
     /// BGs currently held by the worker (updated from heartbeat, not persisted)
     #[serde(skip)]
     pub bg_ids: Vec<u32>,
     #[serde(skip)]
     pub storage_stats: HashMap<String, StorageStats>,
+    #[serde(skip)]
+    pub bg_stats: HashMap<u32, BGStats>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

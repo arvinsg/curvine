@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::pd::bg::{BGManager, DirtyReason};
+use crate::pd::bg::BGManager;
 use crate::pd::config::ConfigManager;
 use crate::pd::journal::entry::BGUpdateEntry;
 use crate::pd::journal::{self, PdEntry};
@@ -26,19 +26,18 @@ use orpc::sync::StateCtl;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::bg_table_scheduler::BGTableScheduler;
 use super::checker::BGPushCommand;
 use super::checker_controller::CheckerController;
 use super::operator::BGCommands;
 use super::operator_controller::OperatorController;
+use super::scheduler_controller::SchedulerController;
 
 /// Trait for checking PD leader status.
-/// Real implementation wires to Raft; tests can mock.
 pub trait LeaderChecker: Send + Sync {
     fn is_leader(&self) -> bool;
 }
 
-/// Raft-based leader checker: wires to RoleMonitor via StateCtl.
+/// Raft-based leader checker.
 pub struct RaftLeaderChecker {
     role_ctl: StateCtl,
 }
@@ -56,7 +55,6 @@ impl LeaderChecker for RaftLeaderChecker {
     }
 }
 
-/// Always-leader checker for tests.
 #[cfg(test)]
 pub struct AlwaysLeader;
 
@@ -67,7 +65,7 @@ impl LeaderChecker for AlwaysLeader {
     }
 }
 
-/// Shared context for schedule (checkers, scheduler, coordinator)
+/// Shared context for all scheduling components.
 pub struct CoordinatorContext {
     pub node_manager: Arc<NodeManager>,
     pub pool_manager: Arc<PoolManager>,
@@ -81,7 +79,7 @@ impl CoordinatorContext {
     pub fn is_leader(&self) -> bool {
         self.leader_checker.is_leader()
     }
-    /// Propose BG state change (e.g. Degraded). Caller should be PD leader.
+
     pub fn propose_bg_state(
         &self,
         bg_id: u32,
@@ -93,11 +91,11 @@ impl CoordinatorContext {
             state: Some(state),
             replica_set: None,
             lease_owner: None,
+            bg_epoch: None,
         };
         self.journal_client.propose(PdEntry::UpdateBG(entry))
     }
 
-    /// Propose BG lease owner change (e.g. transfer lease to another replica). Caller should be PD leader.
     pub fn propose_bg_lease(&self, bg_id: u32, lease: BGLease) -> FsResult<()> {
         let entry = BGUpdateEntry {
             op_ms: LocalTime::mills(),
@@ -105,19 +103,18 @@ impl CoordinatorContext {
             state: None,
             replica_set: None,
             lease_owner: Some(lease),
+            bg_epoch: None,
         };
         self.journal_client.propose(PdEntry::UpdateBG(entry))
     }
 }
 
-/// Schedule coordinator: the single owner of all event-driven scheduling logic.
-/// Runs checkers, operator controller, BGTable scheduler, and handles all
-/// NodeEvent side-effects (pool liveness, BG flag refresh, rebuild scheduling).
+/// Central orchestrator: runs checkers, schedulers,
 pub struct Coordinator {
     ctx: Arc<CoordinatorContext>,
-    checker_controller: std::sync::Mutex<CheckerController>,
+    checker_controller: CheckerController,
+    scheduler_controller: SchedulerController,
     operator_controller: Arc<OperatorController>,
-    bg_table_scheduler: Arc<BGTableScheduler>,
     pending_push_commands: dashmap::DashMap<u32, BGPushCommand>,
 }
 
@@ -127,25 +124,28 @@ impl Coordinator {
             ctx.config_manager.clone(),
             ctx.bg_manager.clone(),
         ));
-        let checker_controller = std::sync::Mutex::new(CheckerController::new(operator_controller.clone(), ctx.clone()));
-        let bg_table_scheduler = Arc::new(BGTableScheduler::new(ctx.clone()));
+        let checker_controller = CheckerController::new(operator_controller.clone(), ctx.clone());
+        let scheduler_controller =
+            SchedulerController::new(ctx.clone(), operator_controller.clone());
         Self {
             ctx,
             checker_controller,
+            scheduler_controller,
             operator_controller,
-            bg_table_scheduler,
             pending_push_commands: dashmap::DashMap::new(),
         }
     }
 
-    /// Accessor for OperatorController.
     pub fn operator_controller(&self) -> Arc<OperatorController> {
         self.operator_controller.clone()
     }
 
-    /// Start background loops. Call once after creation.
+    pub fn scheduler_controller(&self) -> &SchedulerController {
+        &self.scheduler_controller
+    }
+
+    /// Start 3 background loops. Call once after creation.
     pub fn run(self: Arc<Self>, mut event_rx: tokio::sync::broadcast::Receiver<NodeEvent>) {
-        // Full reconcile at startup (leader check inside)
         if self.ctx.is_leader() {
             self.full_reconcile();
         }
@@ -156,11 +156,7 @@ impl Coordinator {
         });
         let coord = self.clone();
         tokio::spawn(async move {
-            coord.operator_check_loop().await;
-        });
-        let coord = self.clone();
-        tokio::spawn(async move {
-            coord.rebuild_loop().await;
+            coord.schedule_loop().await;
         });
         let coord = self.clone();
         tokio::spawn(async move {
@@ -168,22 +164,18 @@ impl Coordinator {
         });
     }
 
-    /// Full reconcile: startup catch-all to ensure consistent state.
     fn full_reconcile(&self) {
         log::info!("Coordinator: running full reconcile");
 
-        // 1. Refresh all BG flags from current cluster state
-        self.ctx.bg_manager.refresh_all_bg_flags();
+        // Ensure default pools exist (via Raft, leader-only).
+        if let Err(e) = self.ctx.pool_manager.ensure_default_pools() {
+            log::error!("Failed to ensure default pools: {}", e);
+        }
 
-        // 2. Run one patrol cycle to generate initial operators
-        let (_ops, push_commands) = self.checker_controller.lock().unwrap().patrol();
+        let (_ops, push_commands) = self.checker_controller.patrol();
         for cmd in push_commands {
             self.pending_push_commands.insert(cmd.worker_id, cmd);
         }
-
-        // 3. Ensure BGTables exist for all active pools
-        self.bg_table_scheduler.check_table_initialization();
-
         log::info!("Coordinator: full reconcile completed");
     }
 
@@ -199,118 +191,98 @@ impl Coordinator {
                     log::warn!("Coordinator event loop lagged {} events", n);
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    log::info!("Coordinator event channel closed, exiting event loop");
+                    log::info!("Coordinator event channel closed");
                     break;
                 }
             }
         }
     }
 
-    /// Central event handler: all worker event side-effects are handled here.
-    /// This is the single source of truth for event-driven scheduling.
     fn handle_event(&self, event: &NodeEvent) {
         if event.node_type != NodeType::Worker {
             return;
         }
         match event.event_type {
-            NodeEventType::Registered => {
-                // BGTableScheduler handles rebuild scheduling via on_event below
-            }
+            NodeEventType::Registered => {}
             NodeEventType::HeartbeatResumed => {
                 log::info!("Worker {} resumed heartbeat", event.node_id);
-                self.ctx.pool_manager.mark_allocatable(event.node_id);
-                self.ctx.bg_manager.refresh_bg_flags_for_worker(
-                    event.node_id,
-                    DirtyReason::NodeRecovered,
-                );
+                self.ctx.bg_manager.mark_worker_bgs_suspect(event.node_id);
             }
             NodeEventType::Lost => {
                 log::info!("Worker {} lost", event.node_id);
-                self.ctx.pool_manager.mark_unallocatable(event.node_id);
-                self.ctx
-                    .bg_manager
-                    .refresh_bg_flags_for_worker(event.node_id, DirtyReason::NodeLost);
                 self.ctx.bg_manager.mark_worker_bgs_suspect(event.node_id);
             }
             NodeEventType::DecommissionStarted => {
                 log::info!("Worker {} decommission started", event.node_id);
-                self.ctx.pool_manager.mark_unallocatable(event.node_id);
-                self.ctx.bg_manager.refresh_bg_flags_for_worker(
-                    event.node_id,
-                    DirtyReason::NodeDecommission,
-                );
                 self.ctx.bg_manager.mark_worker_bgs_suspect(event.node_id);
             }
             NodeEventType::Offline => {
                 log::info!("Worker {} offline", event.node_id);
-                if let Err(e) = self.ctx.pool_manager.remove_worker_from_pools(event.node_id) {
+                if let Err(e) = self
+                    .ctx
+                    .pool_manager
+                    .remove_worker_from_pools(event.node_id)
+                {
                     log::error!("remove_worker_from_pools {} failed: {}", event.node_id, e);
                 }
-                self.ctx
-                    .bg_manager
-                    .refresh_bg_flags_for_worker(event.node_id, DirtyReason::NodeOffline);
                 self.ctx.bg_manager.mark_worker_bgs_suspect(event.node_id);
-                // BGTableScheduler handles rebuild scheduling via on_event below
             }
             NodeEventType::DecommissionFinished => {
                 log::info!("Worker {} decommission finished", event.node_id);
-                if let Err(e) = self.ctx.pool_manager.remove_worker_from_pools(event.node_id) {
+                if let Err(e) = self
+                    .ctx
+                    .pool_manager
+                    .remove_worker_from_pools(event.node_id)
+                {
                     log::error!("remove_worker_from_pools {} failed: {}", event.node_id, e);
                 }
-                self.ctx
-                    .bg_manager
-                    .refresh_bg_flags_for_worker(event.node_id, DirtyReason::NodeOffline);
                 self.ctx.bg_manager.mark_worker_bgs_suspect(event.node_id);
-                // BGTableScheduler handles rebuild scheduling via on_event below
             }
             _ => {}
         }
-        // Forward to BGTableScheduler for rebuild scheduling (Registered, Offline, DecommissionFinished)
-        use super::checker::Scheduler;
-        self.bg_table_scheduler.on_event(event);
+        // Forward to scheduler controller (BGTableScheduler handles rebuild scheduling)
+        self.scheduler_controller.on_event(event);
     }
 
     // ========== Background loops ==========
 
+    /// Patrol loop: runs checkers for correctness (every 1s).
     async fn patrol_loop(&self) {
         loop {
             tokio::time::sleep(Duration::from_millis(1000)).await;
             if !self.ctx.is_leader() {
                 continue;
             }
-            let (_ops, push_commands) = self.checker_controller.lock().unwrap().patrol();
+            let (_ops, push_commands) = self.checker_controller.patrol();
             for cmd in push_commands {
                 self.pending_push_commands.insert(cmd.worker_id, cmd);
             }
             self.check_decommission_complete();
-            self.ctx.pool_manager.refresh_pool_stats();
         }
     }
 
-    async fn operator_check_loop(&self) {
+    /// Schedule loop: runs schedulers for optimization + operator lifecycle (every 100ms).
+    async fn schedule_loop(&self) {
         loop {
-            tokio::time::sleep(Duration::from_millis(1000)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
             if !self.ctx.is_leader() {
                 continue;
             }
+
+            // Run schedulers (balance, bg_table, stats)
+            let ops = self.scheduler_controller.schedule_tick();
+            for mut op in ops {
+                op.id = self.operator_controller.next_operator_id();
+                self.operator_controller.add_operator(op);
+            }
+
+            // Operator lifecycle: check progress + dispatch next
             let now = orpc::common::LocalTime::mills();
             self.operator_controller.check_progress(now);
             self.operator_controller.dispatch_next();
         }
     }
 
-    async fn rebuild_loop(&self) {
-        loop {
-            tokio::time::sleep(Duration::from_millis(5000)).await;
-            if !self.ctx.is_leader() {
-                continue;
-            }
-            self.bg_table_scheduler.check_and_rebuild().await;
-        }
-    }
-
-    /// Check decommissioning nodes: if no BGs remain and no in-flight operators,
-    /// finish decommission (delete node from cluster via Raft).
     fn check_decommission_complete(&self) {
         let decommission_nodes = self
             .ctx
@@ -328,11 +300,7 @@ impl Coordinator {
                     node_id
                 );
                 if let Err(e) = self.ctx.node_manager.finish_decommission(node_id) {
-                    log::error!(
-                        "Failed to finish decommission for node {}: {}",
-                        node_id,
-                        e
-                    );
+                    log::error!("Failed to finish decommission for node {}: {}", node_id, e);
                 }
             }
         }
@@ -342,7 +310,6 @@ impl Coordinator {
 
     pub fn dispatch_operators(&self, worker_id: u32) -> BGCommands {
         let mut commands = self.operator_controller.dispatch_to_worker(worker_id);
-
         if let Some((_, push_cmd)) = self.pending_push_commands.remove(&worker_id) {
             commands.add_bgs.extend(push_cmd.add_bgs);
             commands.remove_bgs.extend(push_cmd.remove_bgs);

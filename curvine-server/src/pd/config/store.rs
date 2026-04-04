@@ -19,8 +19,8 @@ use log::info;
 use orpc::{err_box, CommonResult};
 use std::sync::Arc;
 
-const NS: &str = "config";
-const CONFIG_PREFIX: u8 = 0x01;
+const NS: &str = "meta";
+const CONFIG_PREFIX: u8 = 0x10;
 
 pub struct ConfigStore {
     store: Arc<dyn KvStore>,

@@ -12,43 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::placement::{
+    select_workers_for_bg, NormalizedSelector, PlacementRule, RandomSelector, WorkerCandidate,
+    WorkerSelector,
+};
 use super::state_machine;
 use super::{BGStore, BGTable};
-use crate::pd::journal::entry::{BatchBGEntry, BGEntry, BGUpdateEntry};
+use crate::pd::journal::entry::{BGEntry, BGUpdateEntry, BatchBGEntry};
 use crate::pd::journal::{self, PdEntry};
-use crate::pd::node::NodeManager;
 use crate::pd::pool::PoolManager;
 use curvine_common::state::{
-    BGOpState, BlockGroupInfo, BlockGroupInfoView, ReplicaInfo, BGTableSummary,
-    BG_FLAG_LEASE_INVALID, BG_FLAG_NONE, BG_FLAG_ON_DECOMMISSION_NODE, BG_FLAG_OVER_REPLICATED,
-    BG_FLAG_PLACEMENT_VIOLATION, BG_FLAG_UNAVAILABLE, BG_FLAG_UNDER_REPLICATED,
+    BGOpState, BGStats, BGTableSummary, BlockGroupInfo, BlockGroupInfoView, ReplicaInfo,
 };
 use curvine_common::{FsError, FsResult};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DirtyReason {
-    NodeLost,
-    NodeOffline,
-    NodeDecommission,
-    NodeRecovered,
-    ReplicaChanged,
-    LeaseChanged,
-}
-
-/// Expand BlockGroupInfo to view (replica_set with address and state). BG module owns this; node module stays agnostic of pool/BG.
-fn block_group_info_to_view(bg: &BlockGroupInfo, node_manager: &NodeManager) -> BlockGroupInfoView {
+/// Expand BlockGroupInfo to view (replica_set with address and state). BG module owns this.
+fn block_group_info_to_view(bg: &BlockGroupInfo, pool_manager: &PoolManager) -> BlockGroupInfoView {
     let replica_set: Vec<ReplicaInfo> = bg
         .replica_set
         .iter()
         .filter_map(|&node_id| {
-            node_manager.get_node(node_id).map(|node| ReplicaInfo {
-                node_id,
-                address: node.base.address.clone(),
-                state: node.state,
-            })
+            pool_manager
+                .get_worker_address_and_state(node_id)
+                .map(|(address, state)| ReplicaInfo {
+                    node_id,
+                    address,
+                    state,
+                })
         })
         .collect();
     BlockGroupInfoView {
@@ -57,9 +51,93 @@ fn block_group_info_to_view(bg: &BlockGroupInfo, node_manager: &NodeManager) -> 
         bg_epoch: bg.bg_epoch,
         replica_set,
         state: bg.state,
-        flags: bg.flags,
         op_state: bg.op_state,
         lease_owner: bg.lease_owner.clone(),
+    }
+}
+
+/// Pre-allocates BG ID ranges to reduce Raft proposal frequency.
+pub struct IdAllocator {
+    store: Arc<BGStore>,
+    journal_client: Arc<journal::Client>,
+    /// Next available ID in the current pre-allocated range.
+    next: AtomicU32,
+    /// End of the current pre-allocated range (exclusive).
+    end: AtomicU32,
+    /// Pre-allocation batch size.
+    step: u32,
+    /// Serialize realloc operations.
+    alloc_lock: Mutex<()>,
+}
+
+impl IdAllocator {
+    const DEFAULT_STEP: u32 = 4096;
+
+    pub fn new(store: Arc<BGStore>, journal_client: Arc<journal::Client>) -> Self {
+        Self {
+            store,
+            journal_client,
+            next: AtomicU32::new(0),
+            end: AtomicU32::new(0),
+            step: Self::DEFAULT_STEP,
+            alloc_lock: Mutex::new(()),
+        }
+    }
+
+    /// Initialize from persisted state. Called during restore.
+    pub fn restore(&self) -> FsResult<()> {
+        let base = self.store.get_next_bg_id()?;
+        // Start with an empty range; first alloc() will trigger realloc.
+        self.next.store(base, Ordering::SeqCst);
+        self.end.store(base, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Allocate `count` contiguous IDs. Returns the starting ID.
+    pub fn alloc(&self, count: u32) -> FsResult<u32> {
+        loop {
+            let next = self.next.load(Ordering::SeqCst);
+            let end = self.end.load(Ordering::SeqCst);
+            if next + count <= end {
+                if self
+                    .next
+                    .compare_exchange(next, next + count, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    return Ok(next);
+                }
+                continue; // CAS failed, retry
+            }
+            // Range exhausted, need to pre-allocate more
+            self.realloc(count)?;
+        }
+    }
+
+    fn realloc(&self, min_count: u32) -> FsResult<()> {
+        let _lock = self.alloc_lock.lock().unwrap();
+        // Double-check: another thread may have reallocated
+        let next = self.next.load(Ordering::SeqCst);
+        let end = self.end.load(Ordering::SeqCst);
+        if next + min_count <= end {
+            return Ok(());
+        }
+        let alloc_size = self.step.max(min_count);
+        let base = self.store.get_next_bg_id()?;
+        let new_end = base + alloc_size;
+
+        // Persist the new end via Raft so all nodes agree.
+        let entry = BatchBGEntry {
+            op_ms: orpc::common::LocalTime::mills(),
+            table: None,
+            creates: vec![],
+            updates: vec![],
+            next_bg_id: Some(new_end),
+        };
+        self.journal_client.propose(PdEntry::BatchBG(entry))?;
+
+        self.next.store(base, Ordering::SeqCst);
+        self.end.store(new_end, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -67,14 +145,15 @@ pub struct BGManager {
     tables: RwLock<HashMap<u32, BGTable>>,
     bgs: RwLock<HashMap<u32, BlockGroupInfo>>,
     worker_to_bgs: RwLock<HashMap<u32, HashSet<u32>>>,
-    dirty_bgs: RwLock<HashMap<u32, HashSet<DirtyReason>>>,
     suspect_bgs: RwLock<HashMap<u32, SuspectEntry>>,
     store: Arc<BGStore>,
     pool_manager: Arc<PoolManager>,
     journal_client: Arc<journal::Client>,
+    id_allocator: IdAllocator,
     bucket_count: u32,
     replica_counts: Vec<u16>,
     location_labels: Vec<String>,
+    worker_selector: Arc<RwLock<Box<dyn WorkerSelector>>>,
 }
 
 /// Tracks a suspect BG for priority checking.
@@ -92,18 +171,20 @@ impl BGManager {
         replica_counts: Vec<u16>,
         location_labels: Vec<String>,
     ) -> Self {
+        let id_allocator = IdAllocator::new(store.clone(), journal_client.clone());
         Self {
             tables: RwLock::new(HashMap::new()),
             bgs: RwLock::new(HashMap::new()),
             worker_to_bgs: RwLock::new(HashMap::new()),
-            dirty_bgs: RwLock::new(HashMap::new()),
             suspect_bgs: RwLock::new(HashMap::new()),
             store,
             pool_manager,
             journal_client,
+            id_allocator,
             bucket_count,
             replica_counts,
             location_labels,
+            worker_selector: Arc::new(RwLock::new(Box::new(NormalizedSelector::default()))),
         }
     }
 
@@ -125,9 +206,11 @@ impl BGManager {
             }
             b.insert(bg.bg_id, bg);
         }
+        self.id_allocator.restore()?;
         Ok(())
     }
 
+    // TODO: 存在问题，apply 过程不应该涉及 epoch 修改
     pub fn apply_create_bg(&self, entry: &BGEntry) -> FsResult<()> {
         let info = &entry.info;
         self.store.put(&info)?;
@@ -140,18 +223,49 @@ impl BGManager {
     }
 
     pub fn apply_update_bg(&self, entry: &BGUpdateEntry) -> FsResult<()> {
-        let mut bgs = self.bgs.write().unwrap();
-        let mut info = bgs
+        // 1. Read + clone
+        let mut info = self
+            .bgs
+            .read()
+            .unwrap()
             .get(&entry.bg_id)
             .cloned()
             .ok_or_else(|| FsError::common(format!("bg {} not found for update", entry.bg_id)))?;
+
+        // if entry carries a bg_epoch and the current epoch is already ahead, this entry was already applied.
+        if let Some(entry_epoch) = entry.bg_epoch {
+            if info.bg_epoch > entry_epoch {
+                return Ok(());
+            }
+        }
+
+        let old_replica_set = info.replica_set.clone();
+
+        // 2. Apply mutations to clone
         if let Some(s) = entry.state {
             state_machine::validate_transition(info.state, s)?;
             info.state = s;
+            info.bg_epoch += 1;
         }
         if let Some(ref rs) = entry.replica_set {
-            let old_set: HashSet<u32> = info.replica_set.iter().copied().collect();
-            let new_set: HashSet<u32> = rs.iter().copied().collect();
+            info.replica_set = rs.clone();
+            info.bg_epoch += 1;
+        }
+        if let Some(ref lease) = entry.lease_owner {
+            let old_epoch = info.lease_owner.as_ref().map(|l| l.epoch).unwrap_or(0);
+            let mut new_lease = lease.clone();
+            new_lease.epoch = old_epoch + 1;
+            info.lease_owner = Some(new_lease);
+        }
+
+        // 3. Store first
+        self.store.put(&info)?;
+
+        // 4. Memory update
+        self.bgs.write().unwrap().insert(entry.bg_id, info.clone());
+        if entry.replica_set.is_some() {
+            let old_set: HashSet<u32> = old_replica_set.iter().copied().collect();
+            let new_set: HashSet<u32> = info.replica_set.iter().copied().collect();
             let mut w2b = self.worker_to_bgs.write().unwrap();
             for &removed in old_set.difference(&new_set) {
                 if let Some(set) = w2b.get_mut(&removed) {
@@ -164,26 +278,19 @@ impl BGManager {
             for &added in new_set.difference(&old_set) {
                 w2b.entry(added).or_default().insert(entry.bg_id);
             }
-            info.replica_set = rs.clone();
-            info.bg_epoch += 1;
-            self.mark_dirty(entry.bg_id, DirtyReason::ReplicaChanged);
         }
-        if let Some(ref lease) = entry.lease_owner {
-            let old_epoch = info.lease_owner.as_ref().map(|l| l.epoch).unwrap_or(0);
-            let mut new_lease = lease.clone();
-            new_lease.epoch = old_epoch + 1;
-            info.lease_owner = Some(new_lease);
-            self.mark_dirty(entry.bg_id, DirtyReason::LeaseChanged);
+        // Bump table epoch only on topology changes (replica_set)
+        if entry.replica_set.is_some() {
+            self.bump_table_epoch(info.table_id)?;
         }
-        self.store.put(&info)?;
-        bgs.insert(entry.bg_id, info.clone());
-        drop(bgs);
-        self.bump_table_epoch(info.table_id)?;
         Ok(())
     }
 
     pub fn apply_delete_bg(&self, bg_id: u32) -> FsResult<()> {
         let table_id = self.bgs.read().unwrap().get(&bg_id).map(|b| b.table_id);
+        // Store first
+        self.store.delete(bg_id)?;
+        // Then update memory
         let removed = self.bgs.write().unwrap().remove(&bg_id);
         if let Some(bg) = removed {
             let mut w2b = self.worker_to_bgs.write().unwrap();
@@ -196,17 +303,17 @@ impl BGManager {
                 }
             }
         }
-        self.store.delete(bg_id)?;
-        self.dirty_bgs.write().unwrap().remove(&bg_id);
         if let Some(tid) = table_id {
             let _ = self.bump_table_epoch(tid);
         }
         Ok(())
     }
 
+    // TODO: 和上面一样，存在相同的问题
     /// Apply a batch of BG operations atomically (from Raft).
     /// Table is created/updated first, then creates, then updates.
-    /// Table epoch is bumped once at the end.
+    /// Table epoch is bumped once at the end only if topology changed
+    /// (table/BG creates or replica_set updates).
     pub fn apply_batch_bg(&self, entry: &BatchBGEntry) -> FsResult<()> {
         let mut table_id_to_bump = None;
 
@@ -232,45 +339,58 @@ impl BGManager {
         }
 
         for update in &entry.updates {
-            let mut bgs = self.bgs.write().unwrap();
-            if let Some(bg) = bgs.get_mut(&update.bg_id) {
-                if let Some(s) = update.state {
-                    bg.state = s;
-                }
-                if let Some(ref rs) = update.replica_set {
-                    let old_set: HashSet<u32> = bg.replica_set.iter().copied().collect();
-                    let new_set: HashSet<u32> = rs.iter().copied().collect();
-                    let mut w2b = self.worker_to_bgs.write().unwrap();
-                    for &removed in old_set.difference(&new_set) {
-                        if let Some(set) = w2b.get_mut(&removed) {
-                            set.remove(&update.bg_id);
-                            if set.is_empty() {
-                                w2b.remove(&removed);
-                            }
+            let mut info = match self.bgs.read().unwrap().get(&update.bg_id).cloned() {
+                Some(bg) => bg,
+                None => continue,
+            };
+            if let Some(s) = update.state {
+                info.state = s;
+                info.bg_epoch += 1;
+            }
+            let old_replica_set = info.replica_set.clone();
+            if let Some(ref rs) = update.replica_set {
+                info.replica_set = rs.clone();
+                info.bg_epoch += 1;
+            }
+            if let Some(ref lease) = update.lease_owner {
+                let old_epoch = info.lease_owner.as_ref().map(|l| l.epoch).unwrap_or(0);
+                let mut new_lease = lease.clone();
+                new_lease.epoch = old_epoch + 1;
+                info.lease_owner = Some(new_lease);
+            }
+            self.store.put(&info)?;
+            self.bgs.write().unwrap().insert(update.bg_id, info.clone());
+            if update.replica_set.is_some() {
+                let old_set: HashSet<u32> = old_replica_set.iter().copied().collect();
+                let new_set: HashSet<u32> = info.replica_set.iter().copied().collect();
+                let mut w2b = self.worker_to_bgs.write().unwrap();
+                for &removed in old_set.difference(&new_set) {
+                    if let Some(set) = w2b.get_mut(&removed) {
+                        set.remove(&update.bg_id);
+                        if set.is_empty() {
+                            w2b.remove(&removed);
                         }
                     }
-                    for &added in new_set.difference(&old_set) {
-                        w2b.entry(added).or_default().insert(update.bg_id);
-                    }
-                    bg.replica_set = rs.clone();
-                    bg.bg_epoch += 1;
                 }
-                if let Some(ref lease) = update.lease_owner {
-                    let old_epoch = bg.lease_owner.as_ref().map(|l| l.epoch).unwrap_or(0);
-                    let mut new_lease = lease.clone();
-                    new_lease.epoch = old_epoch + 1;
-                    bg.lease_owner = Some(new_lease);
+                for &added in new_set.difference(&old_set) {
+                    w2b.entry(added).or_default().insert(update.bg_id);
                 }
-                self.store.put(bg)?;
-                if table_id_to_bump.is_none() {
-                    table_id_to_bump = Some(bg.table_id);
-                }
+            }
+            // Only bump table epoch on topology changes (replica_set)
+            if update.replica_set.is_some() && table_id_to_bump.is_none() {
+                table_id_to_bump = Some(info.table_id);
             }
         }
 
         if let Some(tid) = table_id_to_bump {
             self.bump_table_epoch(tid)?;
         }
+
+        // Atomically advance the BG ID counter if specified.
+        if let Some(next_id) = entry.next_bg_id {
+            self.store.set_next_bg_id(next_id)?;
+        }
+
         Ok(())
     }
 
@@ -286,6 +406,7 @@ impl BGManager {
 
     /// Create a new BGTable for a pool. Uses the placement algorithm to assign BGs
     /// to workers, then proposes the entire result as a single BatchBG Raft entry.
+    /// BG IDs are pre-allocated via the IdAllocator for performance.
     pub fn create_table(
         &self,
         pool_id: u16,
@@ -306,15 +427,19 @@ impl BGManager {
 
         let pool = self.pool_manager.get_pool(pool_id)?;
 
-        let next_bg_id = self.store.get_next_bg_id()?;
+        // Pre-allocate IDs via Raft (no direct RocksDB write).
+        let next_bg_id = self.id_allocator.alloc(bucket_count)?;
+
+        // TODO: policy 需要可配置
         let policy = BlockGroupPolicy {
             storage_type: pool.media,
             replicas: replica_count,
             placement: PlacementPolicy::Default,
         };
 
-        let worker_labels = self.pool_manager.get_worker_labels(workers);
+        let worker_labels = self.pool_manager.get_workers_labels(workers);
         let rules = self.get_pool_placement_rules(pool_id);
+        let selector = self.worker_selector.read().unwrap();
 
         let result = super::placement::build_table(
             table_id,
@@ -325,16 +450,15 @@ impl BGManager {
             next_bg_id,
             &worker_labels,
             &rules,
+            selector.as_ref(),
         )?;
-
-        let new_next_id = next_bg_id + bucket_count;
-        self.store.set_next_bg_id(new_next_id)?;
 
         let entry = BatchBGEntry {
             op_ms: orpc::common::LocalTime::mills(),
             table: Some(result.table),
             creates: result.bgs,
             updates: vec![],
+            next_bg_id: None, // ID already advanced by IdAllocator's realloc
         };
         self.propose_batch_bg(entry)
     }
@@ -349,11 +473,13 @@ impl BGManager {
     }
 
     fn bump_table_epoch(&self, table_id: u32) -> FsResult<()> {
-        let mut tables = self.tables.write().unwrap();
-        if let Some(table) = tables.get_mut(&table_id) {
-            table.inc_epoch();
-            self.store.put_table(table)?;
-        }
+        let mut table = match self.tables.read().unwrap().get(&table_id).cloned() {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        table.inc_epoch();
+        self.store.put_table(&table)?;
+        self.tables.write().unwrap().insert(table_id, table);
         Ok(())
     }
 
@@ -378,152 +504,57 @@ impl BGManager {
         self.tables.read().unwrap().values().cloned().collect()
     }
 
-    /// Max table epoch across all tables (used as bg_version in heartbeat responses).
-    pub fn max_table_epoch(&self) -> u64 {
+    /// Per-table epoch map: table_id -> epoch. Used in heartbeat responses.
+    pub fn get_table_epochs(&self) -> HashMap<u32, u64> {
         self.tables
             .read()
             .unwrap()
-            .values()
-            .map(|t| t.epoch)
-            .max()
-            .unwrap_or(0)
+            .iter()
+            .map(|(&id, t)| (id, t.epoch))
+            .collect()
     }
 
     pub fn list_bgs(&self) -> Vec<BlockGroupInfo> {
         self.bgs.read().unwrap().values().cloned().collect()
     }
 
-    /// Set BG operation state (runtime-only, not persisted via Raft).
-    /// Used by OperatorController to mark BGs as being operated on.
+    /// Set BG operation state (runtime-only).
     pub fn set_op_state(&self, bg_id: u32, op_state: BGOpState) {
         if let Some(bg) = self.bgs.write().unwrap().get_mut(&bg_id) {
             bg.op_state = op_state;
         }
     }
 
-    /// Add a flag to a BG (runtime-only, not persisted via Raft).
-    /// Used by checkers to mark transient conditions like assignment mismatch.
-    pub fn add_bg_flag(&self, bg_id: u32, flag: u32) {
-        if let Some(bg) = self.bgs.write().unwrap().get_mut(&bg_id) {
-            bg.flags |= flag;
-        }
-    }
-
-    /// Clear a flag from a BG (runtime-only).
-    pub fn clear_bg_flag(&self, bg_id: u32, flag: u32) {
-        if let Some(bg) = self.bgs.write().unwrap().get_mut(&bg_id) {
-            bg.flags &= !flag;
-        }
-    }
-
-    pub fn refresh_bg_flags(&self, bg_id: u32) -> FsResult<()> {
+    /// Update per-BG stats from worker heartbeat.
+    pub fn update_bg_stats(&self, bg_stats: &HashMap<u32, BGStats>) {
+        let now = orpc::common::LocalTime::mills();
         let mut bgs = self.bgs.write().unwrap();
-        let bg = bgs
-            .get_mut(&bg_id)
-            .ok_or_else(|| FsError::common(format!("bg {} not found", bg_id)))?;
-
-        let mut flags = BG_FLAG_NONE;
-        let alive_count = bg
-            .replica_set
-            .iter()
-            .filter(|w| self.pool_manager.is_worker_available(**w))
-            .count();
-        let desired_count = ((bg.table_id & 0xffff) as usize).max(1);
-
-        if alive_count == 0 {
-            flags |= BG_FLAG_UNAVAILABLE;
-        } else if alive_count < desired_count {
-            flags |= BG_FLAG_UNDER_REPLICATED;
-        } else if alive_count > desired_count {
-            flags |= BG_FLAG_OVER_REPLICATED;
-        }
-
-        if let Some(lease) = bg.lease_owner.as_ref() {
-            if !bg.replica_set.contains(&lease.node_id) || !self.pool_manager.is_worker_available(lease.node_id) {
-                flags |= BG_FLAG_LEASE_INVALID;
-            }
-        } else {
-            flags |= BG_FLAG_LEASE_INVALID;
-        }
-
-        if bg.state == curvine_common::state::BGState::Degraded {
-            flags |= BG_FLAG_UNDER_REPLICATED;
-        }
-
-        if bg
-            .replica_set
-            .iter()
-            .any(|w| self.pool_manager.get_worker_node(*w).map(|n| n.state == curvine_common::state::NodeState::Decommission).unwrap_or(false))
-        {
-            flags |= BG_FLAG_ON_DECOMMISSION_NODE;
-        }
-
-        // Placement violation detection
-        let pool_id = (bg.table_id >> 16) as u16;
-        let rules = self.get_pool_placement_rules(pool_id);
-        if rules.iter().any(|r| !r.label_constraints.is_empty() || !r.location_labels.is_empty()) {
-            let worker_ids: Vec<u32> = bg.replica_set.clone();
-            let worker_labels = self.pool_manager.get_worker_labels(&worker_ids);
-            let fit = crate::pd::schedule::placement::fit::fit_bg(&bg.replica_set, &rules, &worker_labels);
-            if fit.has_violation() {
-                flags |= BG_FLAG_PLACEMENT_VIOLATION;
-            }
-        }
-
-        bg.flags = flags;
-        Ok(())
-    }
-
-    pub fn refresh_all_bg_flags(&self) {
-        let bg_ids: Vec<u32> = self.bgs.read().unwrap().keys().copied().collect();
-        for bg_id in bg_ids {
-            let _ = self.refresh_bg_flags(bg_id);
-        }
-    }
-
-    /// Refresh flags for all BGs on a specific worker (event-driven, targeted).
-    /// Marks changed BGs as dirty with the given reason.
-    pub fn refresh_bg_flags_for_worker(&self, worker_id: u32, reason: DirtyReason) {
-        let bg_ids: Vec<u32> = self
-            .worker_to_bgs
-            .read()
-            .unwrap()
-            .get(&worker_id)
-            .map(|s| s.iter().copied().collect())
-            .unwrap_or_default();
-        for bg_id in bg_ids {
-            let old_flags = self.bgs.read().unwrap().get(&bg_id).map(|bg| bg.flags);
-            if self.refresh_bg_flags(bg_id).is_ok() {
-                let new_flags = self.bgs.read().unwrap().get(&bg_id).map(|bg| bg.flags);
-                if old_flags != new_flags {
-                    self.mark_dirty(bg_id, reason);
-                }
+        for (bg_id, stats) in bg_stats {
+            if let Some(bg) = bgs.get_mut(bg_id) {
+                bg.stats = stats.clone();
+                bg.stats.last_report_ms = now;
             }
         }
     }
 
-    // ========== Dirty BG management ==========
-
-    pub fn mark_dirty(&self, bg_id: u32, reason: DirtyReason) {
-        self.dirty_bgs
-            .write()
-            .unwrap()
-            .entry(bg_id)
-            .or_default()
-            .insert(reason);
-    }
-
-    pub fn clear_dirty(&self, bg_id: u32) {
-        self.dirty_bgs.write().unwrap().remove(&bg_id);
-    }
-
-    pub fn list_dirty_bgs(&self) -> Vec<(u32, HashSet<DirtyReason>)> {
-        self.dirty_bgs
-            .read()
-            .unwrap()
-            .iter()
-            .map(|(k, v)| (*k, v.clone()))
-            .collect()
+    /// Aggregate stats for a table from its BGs (runtime computation).
+    pub fn compute_table_stats(&self, table_id: u32) -> BGStats {
+        let tables = self.tables.read().unwrap();
+        let table = match tables.get(&table_id) {
+            Some(t) => t,
+            None => return BGStats::default(),
+        };
+        let bgs = self.bgs.read().unwrap();
+        let mut agg = BGStats::default();
+        for &bg_id in &table.buckets {
+            if let Some(bg) = bgs.get(&bg_id) {
+                agg.used_bytes += bg.stats.used_bytes;
+                agg.free_bytes += bg.stats.free_bytes;
+                agg.block_count += bg.stats.block_count;
+                agg.last_report_ms = agg.last_report_ms.max(bg.stats.last_report_ms);
+            }
+        }
+        agg
     }
 
     // ========== Suspect BG tracking ==========
@@ -622,18 +653,14 @@ impl BGManager {
     }
 
     /// Build client-facing summary (buckets as BlockGroupInfoView) for the given table.
-    pub fn build_table_summary(
-        &self,
-        table_id: u32,
-        node_manager: &NodeManager,
-    ) -> Option<BGTableSummary> {
+    pub fn build_table_summary(&self, table_id: u32) -> Option<BGTableSummary> {
         let table = self.tables.read().unwrap().get(&table_id).cloned()?;
         let bgs = self.bgs.read().unwrap();
         let buckets: Vec<_> = table
             .buckets
             .iter()
             .filter_map(|&bg_id| bgs.get(&bg_id).cloned())
-            .map(|bg| block_group_info_to_view(&bg, node_manager))
+            .map(|bg| block_group_info_to_view(&bg, &self.pool_manager))
             .collect();
         drop(bgs);
         if buckets.len() != table.buckets.len() {
@@ -648,6 +675,75 @@ impl BGManager {
         })
     }
 
+    /// Select workers for BG replica placement.
+    /// Combines worker_to_bgs (BG load) + pool storage stats + placement rules.
+    pub fn select_workers(&self, pool_id: u16, count: u16, exclude: &[u32]) -> FsResult<Vec<u32>> {
+        let pool = self.pool_manager.get_pool(pool_id)?;
+        let exclude_set: HashSet<u32> = exclude.iter().copied().collect();
+        let live_workers = self.pool_manager.get_live_workers(pool_id);
+        let allocatable: Vec<u32> = live_workers
+            .into_iter()
+            .filter(|w| !exclude_set.contains(w))
+            .collect();
+
+        let n = count as usize;
+        if allocatable.len() < n {
+            return Err(FsError::common(format!(
+                "not enough workers in pool {}: need {} have {}",
+                pool_id,
+                n,
+                allocatable.len()
+            )));
+        }
+
+        let w2b = self.worker_to_bgs.read().unwrap();
+        let candidates: Vec<WorkerCandidate> = allocatable
+            .iter()
+            .map(|&wid| {
+                let bg_count = w2b.get(&wid).map(|s| s.len() as u32).unwrap_or(0);
+                let (capacity_bytes, used_bytes) = self
+                    .pool_manager
+                    .get_worker_storage_stats(wid, pool.media)
+                    .unwrap_or((0, 0));
+                let labels = self.pool_manager.get_worker_labels(wid).unwrap_or_default();
+                WorkerCandidate {
+                    worker_id: wid,
+                    bg_count,
+                    capacity_bytes,
+                    used_bytes,
+                    labels,
+                }
+            })
+            .collect();
+        drop(w2b);
+
+        let rules = self.get_pool_placement_rules(pool_id);
+        let worker_labels = self
+            .pool_manager
+            .get_workers_labels(&allocatable.iter().copied().collect::<Vec<_>>());
+        let selector = self.worker_selector.read().unwrap();
+        let result = select_workers_for_bg(
+            &candidates,
+            n,
+            &exclude_set,
+            exclude,
+            &rules,
+            selector.as_ref(),
+            &worker_labels,
+        );
+
+        if result.len() < n {
+            return Err(FsError::common(format!(
+                "selector returned {} workers, need {}",
+                result.len(),
+                n
+            )));
+        }
+
+        Ok(result)
+    }
+
+    // TODO:
     /// Rebuild table buckets: for each bucket, verify the BG's replica_set workers are still alive.
     /// If any BG has insufficient replicas, attempt to select new workers via PoolManager.
     /// All changes are batched into a single Raft entry for consistency.
@@ -660,7 +756,7 @@ impl BGManager {
                 .ok_or_else(|| FsError::common(format!("table {} not found", table_id)))?
         };
 
-        let repair_list: Vec<(u32, Vec<u32>, Vec<u32>)> = {
+        let repair_list: Vec<(u32, Vec<u32>, Vec<u32>, u64)> = {
             let bgs = self.bgs.read().unwrap();
             table
                 .buckets
@@ -678,7 +774,7 @@ impl BGManager {
                         .collect();
                     let desired = table.replica_count() as usize;
                     if alive.len() < desired && !alive.is_empty() {
-                        Some((bg_id, alive, bg.replica_set.clone()))
+                        Some((bg_id, alive, bg.replica_set.clone(), bg.bg_epoch))
                     } else {
                         None
                     }
@@ -691,14 +787,9 @@ impl BGManager {
         }
 
         let mut updates = Vec::new();
-        for (bg_id, alive, old_replica_set) in &repair_list {
+        for (bg_id, alive, old_replica_set, bg_epoch) in &repair_list {
             let needed = table.replica_count() as u16 - alive.len() as u16;
-            let new_workers = match self.pool_manager.select_workers_for_bg(
-                table.pool_id(),
-                needed,
-                table.policy.placement,
-                old_replica_set,
-            ) {
+            let new_workers = match self.select_workers(table.pool_id(), needed, old_replica_set) {
                 Ok(w) => w,
                 Err(_) => continue,
             };
@@ -714,6 +805,7 @@ impl BGManager {
                 state: None,
                 replica_set: Some(new_replicas),
                 lease_owner: None,
+                bg_epoch: Some(*bg_epoch),
             });
         }
 
@@ -723,6 +815,7 @@ impl BGManager {
                 table: None,
                 creates: vec![],
                 updates,
+                next_bg_id: None,
             };
             self.propose_batch_bg(entry)?;
         }
@@ -746,10 +839,7 @@ impl BGManager {
     }
 
     /// Get placement rules for a pool. Derives placement from the table's policy.
-    pub fn get_pool_placement_rules(
-        &self,
-        pool_id: u16,
-    ) -> Vec<crate::pd::schedule::placement::PlacementRule> {
+    pub fn get_pool_placement_rules(&self, pool_id: u16) -> Vec<PlacementRule> {
         // Find the table for this pool to get its placement policy
         let placement = self
             .tables
@@ -760,10 +850,39 @@ impl BGManager {
             .map(|t| t.policy.placement)
             .unwrap_or(curvine_common::state::PlacementPolicy::Default);
         // TODO: load custom rules from ConfigManager KV when supported
-        vec![crate::pd::schedule::placement::PlacementRule::from_placement_policy(
+        vec![PlacementRule::from_placement_policy(
             placement,
             &self.location_labels,
         )]
+    }
+
+    // TODO: 应该通过动态参数设置
+    /// Switch the worker selection strategy at runtime.
+    pub fn set_selector_strategy(&self, name: &str) -> FsResult<()> {
+        let selector: Box<dyn WorkerSelector> = match name {
+            "normalized" => Box::new(NormalizedSelector::default()),
+            "random" => Box::new(RandomSelector),
+            _ => {
+                return Err(FsError::common(format!(
+                    "unknown selector strategy: {}",
+                    name
+                )))
+            }
+        };
+        *self.worker_selector.write().unwrap() = selector;
+        Ok(())
+    }
+
+    /// Count leases per worker across all BGs (used by LeaseValidityChecker).
+    pub fn get_worker_lease_counts(&self) -> HashMap<u32, u32> {
+        let bgs = self.bgs.read().unwrap();
+        let mut counts: HashMap<u32, u32> = HashMap::new();
+        for bg in bgs.values() {
+            if let Some(ref lease) = bg.lease_owner {
+                *counts.entry(lease.node_id).or_default() += 1;
+            }
+        }
+        counts
     }
 
     pub fn bucket_count(&self) -> u32 {
@@ -799,28 +918,29 @@ mod tests {
             jc.clone(),
             std::collections::HashMap::new(),
         ));
-        let node_manager: Arc<NodeManager> = Arc::new(NodeManager::new(node_store, config_manager, jc.clone()));
+        let node_manager: Arc<crate::pd::node::NodeManager> = Arc::new(
+            crate::pd::node::NodeManager::new(node_store, config_manager, jc.clone()),
+        );
         let pool_manager = Arc::new(PoolManager::new(pool_store, node_manager, jc.clone()));
         BGManager::new(bg_store, pool_manager, jc, 1024, vec![3], vec![])
     }
 
     fn make_bg(bg_id: u32, table_id: u32, replica_set: Vec<u32>) -> BlockGroupInfo {
         let leader = replica_set.first().copied().unwrap_or(0);
-                    BlockGroupInfo {
-                        bg_id,
-                        table_id,
-                        bg_epoch: 1,
-                        replica_set,
-                        state: BGState::Assigned,
-                        flags: BG_FLAG_NONE,
-                        op_state: Default::default(),
-                        lease_owner: Some(BGLease {
-                            node_id: leader,
-                            epoch: 1,
-                            grant_time_ms: 0,
-                        }),
-                        stats: Default::default(),
-                    }
+        BlockGroupInfo {
+            bg_id,
+            table_id,
+            bg_epoch: 1,
+            replica_set,
+            state: BGState::Assigned,
+            op_state: Default::default(),
+            lease_owner: Some(BGLease {
+                node_id: leader,
+                epoch: 1,
+                grant_time_ms: 0,
+            }),
+            stats: Default::default(),
+        }
     }
 
     #[test]
@@ -848,6 +968,7 @@ mod tests {
             state: Some(BGState::Degraded),
             replica_set: None,
             lease_owner: None,
+            bg_epoch: None,
         })
         .unwrap();
         let got = mgr.get_bg(2).unwrap();
@@ -865,6 +986,7 @@ mod tests {
             state: None,
             replica_set: Some(vec![301, 302]),
             lease_owner: None,
+            bg_epoch: None,
         })
         .unwrap();
         let got = mgr.get_bg(3).unwrap();
@@ -886,6 +1008,7 @@ mod tests {
                 epoch: 0,
                 grant_time_ms: 99_000,
             }),
+            bg_epoch: None,
         })
         .unwrap();
         let got = mgr.get_bg(5).unwrap();
@@ -935,6 +1058,7 @@ mod tests {
             state: None,
             replica_set: Some(vec![1, 2, 4]),
             lease_owner: None,
+            bg_epoch: None,
         })
         .unwrap();
         assert_eq!(mgr.get_bg(10).unwrap().bg_epoch, 2);
@@ -946,6 +1070,7 @@ mod tests {
             state: None,
             replica_set: Some(vec![1, 5, 4]),
             lease_owner: None,
+            bg_epoch: None,
         })
         .unwrap();
         assert_eq!(mgr.get_bg(10).unwrap().bg_epoch, 3);
@@ -960,7 +1085,10 @@ mod tests {
             info: info.clone(),
         })
         .unwrap();
-        assert_eq!(mgr.get_bg(11).unwrap().lease_owner.as_ref().unwrap().epoch, 1);
+        assert_eq!(
+            mgr.get_bg(11).unwrap().lease_owner.as_ref().unwrap().epoch,
+            1
+        );
 
         mgr.apply_update_bg(&BGUpdateEntry {
             op_ms: 1,
@@ -972,13 +1100,17 @@ mod tests {
                 epoch: 0,
                 grant_time_ms: 100_000,
             }),
+            bg_epoch: None,
         })
         .unwrap();
-        assert_eq!(mgr.get_bg(11).unwrap().lease_owner.as_ref().unwrap().epoch, 2);
+        assert_eq!(
+            mgr.get_bg(11).unwrap().lease_owner.as_ref().unwrap().epoch,
+            2
+        );
     }
 
     #[test]
-    fn state_change_does_not_increment_epoch() {
+    fn state_change_increments_bg_epoch() {
         let mgr = test_manager();
         let info = make_bg(12, 1, vec![1]);
         mgr.apply_create_bg(&BGEntry { op_ms: 0, info }).unwrap();
@@ -990,10 +1122,12 @@ mod tests {
             state: Some(BGState::Degraded),
             replica_set: None,
             lease_owner: None,
+            bg_epoch: None,
         })
         .unwrap();
         let after = mgr.get_bg(12).unwrap();
-        assert_eq!(before.bg_epoch, after.bg_epoch);
+        assert_eq!(after.bg_epoch, before.bg_epoch + 1);
+        // Lease epoch should not change
         assert_eq!(
             before.lease_owner.as_ref().unwrap().epoch,
             after.lease_owner.as_ref().unwrap().epoch
@@ -1014,6 +1148,7 @@ mod tests {
             state: Some(BGState::Recovering),
             replica_set: None,
             lease_owner: None,
+            bg_epoch: None,
         });
         assert!(result.is_err());
     }
@@ -1038,6 +1173,7 @@ mod tests {
             state: None,
             replica_set: Some(vec![1, 3]),
             lease_owner: None,
+            bg_epoch: None,
         })
         .unwrap();
 
@@ -1081,28 +1217,6 @@ mod tests {
         mgr.set_op_state(999, BGOpState::Recovering);
     }
 
-    // ========== Dirty BG tracking tests ==========
-
-    #[test]
-    fn mark_and_list_dirty_bgs() {
-        let mgr = test_manager();
-        let info = make_bg(40, 1, vec![1]);
-        mgr.apply_create_bg(&BGEntry { op_ms: 0, info }).unwrap();
-
-        mgr.mark_dirty(40, DirtyReason::NodeLost);
-        let dirty = mgr.list_dirty_bgs();
-        assert_eq!(dirty.len(), 1);
-        assert!(dirty[0].1.contains(&DirtyReason::NodeLost));
-
-        mgr.mark_dirty(40, DirtyReason::ReplicaChanged);
-        let dirty = mgr.list_dirty_bgs();
-        assert_eq!(dirty.len(), 1);
-        assert_eq!(dirty[0].1.len(), 2); // two reasons
-
-        mgr.clear_dirty(40);
-        assert!(mgr.list_dirty_bgs().is_empty());
-    }
-
     // ========== Suspect BG tests ==========
 
     #[test]
@@ -1110,8 +1224,16 @@ mod tests {
         let mgr = test_manager();
         let info1 = make_bg(60, 1, vec![1]);
         let info2 = make_bg(61, 1, vec![2]);
-        mgr.apply_create_bg(&BGEntry { op_ms: 0, info: info1 }).unwrap();
-        mgr.apply_create_bg(&BGEntry { op_ms: 0, info: info2 }).unwrap();
+        mgr.apply_create_bg(&BGEntry {
+            op_ms: 0,
+            info: info1,
+        })
+        .unwrap();
+        mgr.apply_create_bg(&BGEntry {
+            op_ms: 0,
+            info: info2,
+        })
+        .unwrap();
 
         assert_eq!(mgr.suspect_count(), 0);
 
@@ -1164,9 +1286,21 @@ mod tests {
         let info1 = make_bg(90, 1, vec![1, 2]);
         let info2 = make_bg(91, 1, vec![1, 3]);
         let info3 = make_bg(92, 1, vec![3, 4]); // not on worker 1
-        mgr.apply_create_bg(&BGEntry { op_ms: 0, info: info1 }).unwrap();
-        mgr.apply_create_bg(&BGEntry { op_ms: 0, info: info2 }).unwrap();
-        mgr.apply_create_bg(&BGEntry { op_ms: 0, info: info3 }).unwrap();
+        mgr.apply_create_bg(&BGEntry {
+            op_ms: 0,
+            info: info1,
+        })
+        .unwrap();
+        mgr.apply_create_bg(&BGEntry {
+            op_ms: 0,
+            info: info2,
+        })
+        .unwrap();
+        mgr.apply_create_bg(&BGEntry {
+            op_ms: 0,
+            info: info3,
+        })
+        .unwrap();
 
         mgr.mark_worker_bgs_suspect(1);
         // BGs 90 and 91 are on worker 1, BG 92 is not

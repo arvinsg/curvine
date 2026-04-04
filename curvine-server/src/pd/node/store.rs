@@ -18,8 +18,8 @@ use curvine_common::utils::SerdeUtils as Serde;
 use orpc::CommonResult;
 use std::sync::Arc;
 
-const NS: &str = "node";
-const NODE_INFO_PREFIX: u8 = 0x01;
+const NS: &str = "meta";
+const NODE_INFO_PREFIX: u8 = 0x20;
 
 pub struct NodeStore {
     store: Arc<dyn KvStore>,

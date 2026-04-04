@@ -19,7 +19,7 @@ use curvine_common::utils::SerdeUtils as Serde;
 use orpc::CommonResult;
 use std::sync::Arc;
 
-const NS: &str = "bg";
+const NS: &str = "data";
 const BG_INFO_PREFIX: u8 = 0x01;
 const BG_NEXT_ID_KEY: &[u8] = &[0x02];
 const BG_TABLE_PREFIX: u8 = 0x03;

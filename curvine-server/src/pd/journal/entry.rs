@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use curvine_common::state::BGLease;
-use curvine_common::state::{BlockGroupInfo, ConfigInfo, MountInfo, NodeInfo, PathRouteEntry, PoolInfo};
+use curvine_common::state::{
+    BlockGroupInfo, ConfigInfo, MountInfo, NodeInfo, PathRouteEntry, PoolInfo,
+};
 use serde::{Deserialize, Serialize};
 
 // mount
@@ -66,15 +68,20 @@ pub struct BGUpdateEntry {
     pub state: Option<curvine_common::state::BGState>,
     pub replica_set: Option<Vec<u32>>,
     pub lease_owner: Option<BGLease>,
+    #[serde(default)]
+    pub bg_epoch: Option<u64>,
 }
 
-/// Batch BG entry (Raft log) — atomically applies table + multiple BG creates/updates
+/// Batch BG entry (Raft log) — atomically applies table + multiple BG creates/updates.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct BatchBGEntry {
     pub op_ms: u64,
     pub table: Option<super::super::bg::BGTable>,
     pub creates: Vec<BlockGroupInfo>,
     pub updates: Vec<BGUpdateEntry>,
+    /// If present, updates the next BG ID counter atomically with other changes.
+    #[serde(default)]
+    pub next_bg_id: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

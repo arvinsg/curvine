@@ -92,30 +92,15 @@ impl PoolIndex {
             .insert(pool_id);
     }
 
-    /// Remove worker from all pools (members + allocatable).
+    /// Remove worker from all pools.
     pub fn remove_worker(&mut self, worker_id: u32) -> Option<HashSet<u16>> {
         let pool_ids = self.worker_to_pools.remove(&worker_id)?;
         for pool_id in &pool_ids {
             if let Some(pool) = self.pools.get_mut(pool_id) {
                 pool.workers.remove(&worker_id);
-                pool.allocatable_workers.remove(&worker_id);
             }
         }
         Some(pool_ids)
-    }
-
-    /// Mark worker as allocatable in the given pool.
-    pub fn add_allocatable(&mut self, pool_id: u16, worker_id: u32) {
-        if let Some(pool) = self.pools.get_mut(&pool_id) {
-            pool.allocatable_workers.insert(worker_id);
-        }
-    }
-
-    /// Mark worker as unallocatable in the given pool.
-    pub fn remove_allocatable(&mut self, pool_id: u16, worker_id: u32) {
-        if let Some(pool) = self.pools.get_mut(&pool_id) {
-            pool.allocatable_workers.remove(&worker_id);
-        }
     }
 
     pub fn worker_has_storage(&self, worker_id: u32, storage_type: StorageType) -> bool {

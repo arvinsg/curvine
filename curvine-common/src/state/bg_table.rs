@@ -68,7 +68,6 @@ mod tests {
             bg_epoch: 1,
             replica_set: vec![],
             state: BGState::Assigned,
-            flags: 0,
             op_state: Default::default(),
             lease_owner: Some(BGLease {
                 node_id: 0,

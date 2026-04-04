@@ -12,15 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::checker::bg_assignment::BGAssignmentChecker;
 use super::checker::{BGPushCommand, Checker, CheckerContext, default_checkers};
 use super::operator::BGOperator;
 use super::operator_controller::OperatorController;
 use super::CoordinatorContext;
+use curvine_common::state::BGOpState;
 use std::sync::Arc;
 
+/// Runs all checkers in priority order during patrol.
+///
+/// For each BG, checkers execute in priority order (lower = first).
+/// The first checker producing an operator wins (short-circuit).
+/// BGAssignmentChecker runs separately (worker-dimension).
 pub struct CheckerController {
     checkers: Vec<Box<dyn Checker>>,
-    last_run_ms: Vec<u64>,
+    assignment_checker: BGAssignmentChecker,
     operator_controller: Arc<OperatorController>,
     ctx: Arc<CoordinatorContext>,
 }
@@ -31,18 +38,19 @@ impl CheckerController {
         ctx: Arc<CoordinatorContext>,
     ) -> Self {
         let checkers = default_checkers(ctx.clone());
-        let last_run_ms = vec![0u64; checkers.len()];
+        let assignment_checker = BGAssignmentChecker::new(ctx.clone());
         Self {
             checkers,
-            last_run_ms,
+            assignment_checker,
             operator_controller,
             ctx,
         }
     }
 
-    pub fn patrol(&mut self) -> (Vec<BGOperator>, Vec<BGPushCommand>) {
-        let now = orpc::common::LocalTime::mills();
-
+    /// Run one patrol cycle:
+    /// 1. Per-BG patrol with priority short-circuit (suspect BGs first, then full scan)
+    /// 2. Worker-dimension BGAssignment check
+    pub fn patrol(&self) -> (Vec<BGOperator>, Vec<BGPushCommand>) {
         let max_checks = self.ctx.config_manager.get_u32(
             crate::pd::config::keys::PD_SCHEDULE_SUSPECT_MAX_CHECKS,
             crate::pd::config::keys::PD_SCHEDULE_SUSPECT_MAX_CHECKS_DEFAULT,
@@ -58,26 +66,62 @@ impl CheckerController {
             bg_manager: self.ctx.bg_manager.as_ref(),
             node_manager: self.ctx.node_manager.as_ref(),
             config_manager: self.ctx.config_manager.as_ref(),
-            suspect_bgs,
         };
 
         let mut added_ops = Vec::new();
-        let mut push_commands = Vec::new();
-        for (i, checker) in self.checkers.iter().enumerate() {
-            if now.saturating_sub(self.last_run_ms[i]) < checker.interval_ms() {
+
+        // Phase 1: Priority-check suspect BGs
+        let mut processed_bg_ids = std::collections::HashSet::new();
+        for bg in &suspect_bgs {
+            processed_bg_ids.insert(bg.bg_id);
+            if bg.op_state != BGOpState::Idle {
                 continue;
             }
-            self.last_run_ms[i] = now;
-            let result = checker.check(&checker_ctx);
-            for mut op in result.bg_operators {
+            if let Some(mut op) = self.check_single_bg(bg, &checker_ctx) {
+                op.id = self.operator_controller.next_operator_id();
+                if self.operator_controller.add_operator(op.clone()) {
+                    added_ops.push(op);
+                }
+            } else {
+                self.ctx.bg_manager.clear_suspect(bg.bg_id);
+            }
+        }
+
+        // Phase 2: Full scan of Idle BGs
+        let all_bgs = self.ctx.bg_manager.list_bgs();
+        for bg in &all_bgs {
+            if processed_bg_ids.contains(&bg.bg_id) {
+                continue;
+            }
+            if bg.op_state != BGOpState::Idle {
+                continue;
+            }
+            if let Some(mut op) = self.check_single_bg(bg, &checker_ctx) {
                 op.id = self.operator_controller.next_operator_id();
                 if self.operator_controller.add_operator(op.clone()) {
                     added_ops.push(op);
                 }
             }
-            push_commands.extend(result.bg_push_commands);
         }
+
+        // Phase 3: Worker-dimension BGAssignment check
+        let push_commands = self.assignment_checker.patrol_workers(&checker_ctx);
+
         (added_ops, push_commands)
+    }
+
+    /// Check a single BG with all checkers in priority order (short-circuit).
+    fn check_single_bg(
+        &self,
+        bg: &curvine_common::state::BlockGroupInfo,
+        ctx: &CheckerContext<'_>,
+    ) -> Option<BGOperator> {
+        for checker in &self.checkers {
+            if let Some(op) = checker.check_bg(bg, ctx) {
+                return Some(op);
+            }
+        }
+        None
     }
 }
 
@@ -85,107 +129,41 @@ impl CheckerController {
 mod tests {
     use super::*;
 
-    fn test_ctx(
-        overrides: std::collections::HashMap<String, String>,
-    ) -> (Arc<CoordinatorContext>, Arc<OperatorController>) {
-        let store: Arc<dyn crate::pd::store::KvStore> =
-            Arc::new(crate::pd::store::memory_kv_engine::MemoryKvEngine::new());
-        let raft = curvine_common::raft::RaftClient::from_conf(
-            curvine_common::conf::JournalConf::default().create_runtime(),
-            &curvine_common::conf::JournalConf::default(),
+    fn test_ctx() -> (Arc<CoordinatorContext>, Arc<OperatorController>) {
+        let ctx = crate::pd::schedule::checker::tests_common::test_coordinator_context(
+            std::collections::HashMap::new(),
         );
-        let jc = Arc::new(crate::pd::journal::Client::new(raft));
-        let config = Arc::new(crate::pd::config::ConfigManager::new(
-            store.clone(),
-            jc.clone(),
-            overrides,
+        let op_ctrl = Arc::new(OperatorController::new(
+            ctx.config_manager.clone(),
+            ctx.bg_manager.clone(),
         ));
-        let node_store = Arc::new(crate::pd::node::NodeStore::new(store.clone()));
-        let node_mgr = Arc::new(crate::pd::node::NodeManager::new(
-            node_store,
-            config.clone(),
-            jc.clone(),
-        ));
-        let pool_store = Arc::new(crate::pd::pool::PoolStore::new(store.clone()));
-        let pool_mgr = Arc::new(crate::pd::pool::PoolManager::new(
-            pool_store,
-            node_mgr.clone(),
-            jc.clone(),
-        ));
-        let bg_store = Arc::new(crate::pd::bg::BGStore::new(store));
-        let bg_mgr = Arc::new(crate::pd::bg::BGManager::new(
-            bg_store,
-            pool_mgr.clone(),
-            jc.clone(),
-            1024,
-            vec![3],
-            vec![],
-        ));
-        let ctx = Arc::new(super::super::CoordinatorContext {
-            node_manager: node_mgr,
-            pool_manager: pool_mgr,
-            bg_manager: bg_mgr,
-            config_manager: config.clone(),
-            journal_client: jc,
-            leader_checker: Arc::new(crate::pd::schedule::coordinator::AlwaysLeader),
-        });
-        let op_ctrl = Arc::new(OperatorController::new(config, ctx.bg_manager.clone()));
         (ctx, op_ctrl)
     }
 
     #[test]
     fn new_creates_controller_with_checkers() {
-        let (ctx, op_ctrl) = test_ctx(std::collections::HashMap::new());
-        let mut controller = CheckerController::new(op_ctrl, ctx);
-        // Should not panic; checkers are initialized and patrol can be called
+        let (ctx, op_ctrl) = test_ctx();
+        let controller = CheckerController::new(op_ctrl, ctx);
         let (ops, cmds) = controller.patrol();
-        // Just verify it returns without error
-        drop(ops);
-        drop(cmds);
-    }
-
-    #[test]
-    fn first_patrol_runs_all_checkers() {
-        let (ctx, op_ctrl) = test_ctx(std::collections::HashMap::new());
-        let mut controller = CheckerController::new(op_ctrl, ctx);
-        // On the first call, last_run_ms is all 0, so all checkers should run.
-        // With no BGs in the system, the result should be empty but all checkers
-        // should have executed (last_run_ms updated to non-zero).
-        let (ops, cmds) = controller.patrol();
-        assert!(ops.is_empty(), "no operators expected with empty cluster");
-        assert!(cmds.is_empty(), "no push commands expected with empty cluster");
-        // Verify last_run_ms was updated (all should be > 0 now)
-        for ts in &controller.last_run_ms {
-            assert!(*ts > 0, "last_run_ms should be updated after first patrol");
-        }
-    }
-
-    #[test]
-    fn second_patrol_within_interval_skips() {
-        let (ctx, op_ctrl) = test_ctx(std::collections::HashMap::new());
-        let mut controller = CheckerController::new(op_ctrl, ctx);
-        // First patrol: runs all checkers, updates last_run_ms
-        let _ = controller.patrol();
-        // Second patrol immediately: all checker intervals are >= 10_000ms,
-        // so within the same millisecond (or a few ms later) they should all be skipped.
-        let (ops, cmds) = controller.patrol();
-        assert!(
-            ops.is_empty(),
-            "second patrol within interval should produce no operators"
-        );
-        assert!(
-            cmds.is_empty(),
-            "second patrol within interval should produce no push commands"
-        );
+        assert!(ops.is_empty());
+        assert!(cmds.is_empty());
     }
 
     #[test]
     fn patrol_returns_empty_with_no_bgs() {
-        let (ctx, op_ctrl) = test_ctx(std::collections::HashMap::new());
-        let mut controller = CheckerController::new(op_ctrl, ctx);
-        // With no BGs registered in the system, patrol should return empty results
+        let (ctx, op_ctrl) = test_ctx();
+        let controller = CheckerController::new(op_ctrl, ctx);
         let (ops, cmds) = controller.patrol();
-        assert!(ops.is_empty(), "no operators expected when no BGs exist");
-        assert!(cmds.is_empty(), "no push commands expected when no BGs exist");
+        assert!(ops.is_empty());
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn patrol_is_idempotent() {
+        let (ctx, op_ctrl) = test_ctx();
+        let controller = CheckerController::new(op_ctrl, ctx);
+        let (ops1, _) = controller.patrol();
+        let (ops2, _) = controller.patrol();
+        assert_eq!(ops1.len(), ops2.len());
     }
 }

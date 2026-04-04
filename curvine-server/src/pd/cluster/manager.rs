@@ -102,7 +102,7 @@ impl ClusterManager {
             error: None,
             epoch: new_epoch,
             mount_version: self.mount_manager.version(),
-            bg_version: self.bg_manager.max_table_epoch(),
+            table_epochs: self.bg_manager.get_table_epochs(),
             payload: HeartbeatResponsePayload::Worker(WorkerHeartbeatResponse {
                 add_bgs: worker_bgs,
                 remove_bgs: vec![],
@@ -114,6 +114,7 @@ impl ClusterManager {
     pub fn handle_worker_heartbeat(&self, req: HeartbeatRequest) -> FsResult<HeartbeatResponse> {
         let mut resp = self.node_manager.handle_heartbeat(req.clone())?;
         resp.mount_version = self.mount_manager.version();
+        resp.table_epochs = self.bg_manager.get_table_epochs();
 
         let commands = self.coordinator.dispatch_operators(req.node_id);
         if let HeartbeatResponsePayload::Worker(ref mut w) = resp.payload {
@@ -144,7 +145,7 @@ impl ClusterManager {
             error: None,
             epoch: new_epoch,
             mount_version: self.mount_manager.version(),
-            bg_version: self.bg_manager.max_table_epoch(),
+            table_epochs: self.bg_manager.get_table_epochs(),
             payload: HeartbeatResponsePayload::Meta(meta_resp),
         })
     }
@@ -152,6 +153,7 @@ impl ClusterManager {
     pub fn handle_meta_heartbeat(&self, req: HeartbeatRequest) -> FsResult<HeartbeatResponse> {
         let mut resp = self.node_manager.handle_heartbeat(req)?;
         resp.mount_version = self.mount_manager.version();
+        resp.table_epochs = self.bg_manager.get_table_epochs();
         if let HeartbeatResponsePayload::Meta(ref mut meta) = resp.payload {
             meta.path_route_update = self.meta_manager.get_path_route_update();
             meta.node_group_update = self.meta_manager.get_node_group_update();

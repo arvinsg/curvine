@@ -18,8 +18,8 @@ use curvine_common::utils::SerdeUtils as Serde;
 use orpc::CommonResult;
 use std::sync::Arc;
 
-const NS: &str = "pool";
-const POOL_INFO_PREFIX: u8 = 0x01;
+const NS: &str = "meta";
+const POOL_INFO_PREFIX: u8 = 0x30;
 
 pub struct PoolStore {
     store: Arc<dyn KvStore>,

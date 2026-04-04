@@ -216,7 +216,7 @@ impl NodeManager {
             error: None,
             epoch: node_snapshot.epoch,
             mount_version: 0,
-            bg_version: 0,
+            table_epochs: Default::default(),
             payload: response_payload,
         })
     }
@@ -612,9 +612,9 @@ mod tests {
     ) {
         let bytes = curvine_common::utils::SerdeUtils::serialize(node).expect("serialize NodeInfo");
         let mut key = [0u8; 5];
-        key[0] = 0x01; // NODE_INFO_PREFIX (same as in NodeStore)
+        key[0] = 0x20;
         key[1..5].copy_from_slice(&node.base.node_id.to_be_bytes());
-        kv.put("node", &key, &bytes).expect("KvStore put");
+        kv.put("meta", &key, &bytes).expect("KvStore put");
         let mut index = mgr.index.write().unwrap();
         index.insert(node.clone());
     }
@@ -708,7 +708,6 @@ mod tests {
         let mut rx = mgr.subscribe();
 
         // detect_heartbeat_timeout transitions Live -> Lost and emits an event
-        // without requiring a Raft connection (unlike update_state_and_persist).
         let timed_out = mgr.detect_heartbeat_timeout(20_000, 5_000);
         assert_eq!(timed_out, vec![1]);
 
