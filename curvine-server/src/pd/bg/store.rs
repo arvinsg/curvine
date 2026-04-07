@@ -13,16 +13,16 @@
 // limitations under the License.
 
 use super::table::BGTable;
-use crate::pd::store::KvStore;
+use crate::pd::store::{self, KvStore};
 use curvine_common::state::BlockGroupInfo;
 use curvine_common::utils::SerdeUtils as Serde;
 use orpc::CommonResult;
 use std::sync::Arc;
 
-const NS: &str = "data";
-const BG_INFO_PREFIX: u8 = 0x01;
-const BG_NEXT_ID_KEY: &[u8] = &[0x02];
-const BG_TABLE_PREFIX: u8 = 0x03;
+const NS: &str = store::CF_DATA;
+const BG_INFO_PREFIX: u8 = store::PREFIX_BG_INFO;
+const BG_NEXT_ID_KEY: &[u8] = &[store::PREFIX_BG_NEXT_ID];
+const BG_TABLE_PREFIX: u8 = store::PREFIX_BG_TABLE;
 
 pub struct BGStore {
     store: Arc<dyn KvStore>,

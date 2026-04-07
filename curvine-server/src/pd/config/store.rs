@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::pd::store::KvStore;
+use crate::pd::store::{self, KvStore};
 use curvine_common::state::ConfigInfo;
 use curvine_common::utils::SerdeUtils as Serde;
 use log::info;
 use orpc::{err_box, CommonResult};
 use std::sync::Arc;
 
-const NS: &str = "meta";
-const CONFIG_PREFIX: u8 = 0x10;
+const NS: &str = store::CF_META;
+const CONFIG_PREFIX: u8 = store::PREFIX_CONFIG;
 
 pub struct ConfigStore {
     store: Arc<dyn KvStore>,

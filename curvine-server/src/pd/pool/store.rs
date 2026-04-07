@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::pd::store::KvStore;
+use crate::pd::store::{self, KvStore};
 use curvine_common::state::PoolInfo;
 use curvine_common::utils::SerdeUtils as Serde;
 use orpc::CommonResult;
 use std::sync::Arc;
 
-const NS: &str = "meta";
-const POOL_INFO_PREFIX: u8 = 0x30;
+const NS: &str = store::CF_META;
+const POOL_INFO_PREFIX: u8 = store::PREFIX_POOL;
 
 pub struct PoolStore {
     store: Arc<dyn KvStore>,

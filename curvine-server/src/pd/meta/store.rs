@@ -12,16 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::pd::store::KvStore;
+use crate::pd::store::{self, KvStore};
 use curvine_common::state::PathRouteEntry;
 use curvine_common::utils::SerdeUtils as Serde;
 use orpc::CommonResult;
 use std::sync::Arc;
 
 /// Namespace for path route table (Federation Static).
-const NS: &str = "meta";
-const ROUTE_PREFIX: u8 = 0x51;
-const VERSION_KEY: &[u8] = &[0x50];
+const NS: &str = store::CF_META;
+const ROUTE_PREFIX: u8 = store::PREFIX_ROUTE;
+const VERSION_KEY: &[u8] = &[store::PREFIX_ROUTE_VERSION];
 
 /// Store for meta route data
 pub struct RouteStore {

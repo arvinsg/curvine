@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::pd::store::KvStore;
+use crate::pd::store::{self, KvStore};
 use curvine_common::state::NodeInfo;
 use curvine_common::utils::SerdeUtils as Serde;
 use orpc::CommonResult;
 use std::sync::Arc;
 
-const NS: &str = "meta";
-const NODE_INFO_PREFIX: u8 = 0x20;
+const NS: &str = store::CF_META;
+const NODE_INFO_PREFIX: u8 = store::PREFIX_NODE;
 
 pub struct NodeStore {
     store: Arc<dyn KvStore>,

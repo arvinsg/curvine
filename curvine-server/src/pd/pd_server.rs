@@ -22,7 +22,7 @@ use crate::pd::mount::MountManager;
 use crate::pd::node::NodeManager;
 use crate::pd::node::NodeStore;
 use crate::pd::pool::{PoolManager, PoolStore};
-use crate::pd::store::{KvStore, RocksKvEngine};
+use crate::pd::store::{KvStore, RocksKvEngine, CF_DATA, CF_META};
 use curvine_common::conf::PdConf;
 use curvine_common::raft::storage::{LogStorage, RocksLogStorage};
 use curvine_common::raft::{RaftClient, RaftJournal, RoleMonitor};
@@ -114,7 +114,7 @@ impl Pd {
             FileUtils::delete_path(&db_conf.data_dir, true)?;
         }
 
-        db_conf = db_conf.add_cf("meta").add_cf("data");
+        db_conf = db_conf.add_cf(CF_META).add_cf(CF_DATA);
         let db = DBEngine::new(db_conf, false)?;
         let engine = Arc::new(RocksKvEngine::new(db));
         let store: Arc<dyn KvStore> = engine.clone();
