@@ -49,6 +49,30 @@ pub enum BGState {
     Deleting,
 }
 
+impl BGState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BGState::Init => "init",
+            BGState::Assigned => "assigned",
+            BGState::Active => "active",
+            BGState::Degraded => "degraded",
+            BGState::Recovering => "recovering",
+            BGState::Rebalancing => "rebalancing",
+            BGState::Deleting => "deleting",
+        }
+    }
+
+    pub const ALL: [BGState; 7] = [
+        BGState::Init,
+        BGState::Assigned,
+        BGState::Active,
+        BGState::Degraded,
+        BGState::Recovering,
+        BGState::Rebalancing,
+        BGState::Deleting,
+    ];
+}
+
 /// Lease info
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BGLease {

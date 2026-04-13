@@ -17,6 +17,7 @@ use super::{HandlerRegistry, HeartbeatHandler, MetaHeartbeatHandler, WorkerHeart
 use crate::pd::config::ConfigManager;
 use crate::pd::journal::entry::NodeEntry;
 use crate::pd::journal::{self, PdEntry};
+use crate::pd::pd_server::Pd;
 use curvine_common::state::{
     HeartbeatRequest, HeartbeatResponse, NodeInfo, NodeState, NodeType, RegisterRequest,
 };
@@ -70,6 +71,10 @@ impl NodeManager {
     }
 
     fn emit_event(&self, event: NodeEvent) {
+        Pd::get_metrics()
+            .node_event_total
+            .with_label_values(&[event.event_type.as_str()])
+            .inc();
         let _ = self.event_tx.send(event);
     }
 
@@ -133,6 +138,11 @@ impl NodeManager {
     }
 
     pub fn handle_heartbeat(&self, req: HeartbeatRequest) -> FsResult<HeartbeatResponse> {
+        Pd::get_metrics()
+            .heartbeat_total
+            .with_label_values(&[req.node_type.as_str()])
+            .inc();
+
         let handler = self.get_handler(req.node_type)?;
         let now = LocalTime::mills();
         let persist_interval = self.persist_interval_ms();

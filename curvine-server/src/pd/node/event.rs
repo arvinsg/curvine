@@ -24,6 +24,19 @@ pub enum NodeEventType {
     DecommissionFinished,
 }
 
+impl NodeEventType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NodeEventType::Registered => "registered",
+            NodeEventType::HeartbeatResumed => "heartbeat_resumed",
+            NodeEventType::Lost => "lost",
+            NodeEventType::Offline => "offline",
+            NodeEventType::DecommissionStarted => "decommission_started",
+            NodeEventType::DecommissionFinished => "decommission_finished",
+        }
+    }
+}
+
 /// Events emitted by NodeManager for downstream subscribers.
 #[derive(Debug, Clone)]
 pub struct NodeEvent {

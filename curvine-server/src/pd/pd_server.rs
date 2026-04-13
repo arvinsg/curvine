@@ -21,6 +21,7 @@ use crate::pd::meta::{MetaManager, RouteStore};
 use crate::pd::mount::MountManager;
 use crate::pd::node::NodeManager;
 use crate::pd::node::NodeStore;
+use crate::pd::pd_metrics::PdMetrics;
 use crate::pd::pool::{PoolManager, PoolStore};
 use crate::pd::store::{KvStore, RocksKvEngine, CF_DATA, CF_META};
 use curvine_common::conf::PdConf;
@@ -30,6 +31,7 @@ use curvine_common::rocksdb::DBEngine;
 use curvine_common::state::{FederationRouteMode, MetaNodeMode};
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::info;
+use once_cell::sync::OnceCell;
 use orpc::common::FileUtils;
 use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
@@ -42,6 +44,8 @@ use std::sync::Arc;
 use crate::pd::schedule::coordinator::{LeaderChecker, RaftLeaderChecker};
 
 use crate::pd::rpc_handler::PdRpcHandler;
+
+static PD_METRICS: OnceCell<PdMetrics> = OnceCell::new();
 
 fn parse_metanode_mode(s: &str) -> MetaNodeMode {
     match s.to_lowercase().as_str() {
@@ -163,6 +167,15 @@ impl Pd {
         ));
         bg_manager.restore()?;
 
+        PD_METRICS.get_or_init(|| {
+            PdMetrics::new(
+                node_manager.clone(),
+                pool_manager.clone(),
+                bg_manager.clone(),
+            )
+            .expect("Failed to initialize PD metrics")
+        });
+
         let metanode_mode = parse_metanode_mode(&conf.metanode.mode);
         let federation_route_mode = Some(parse_federation_route_mode(&conf.metanode.route_mode));
         let route_store = Arc::new(RouteStore::new(store.clone()));
@@ -247,6 +260,10 @@ impl Pd {
 
     pub fn config_manager(&self) -> Arc<ConfigManager> {
         self.service.config_manager.clone()
+    }
+
+    pub fn get_metrics() -> &'static PdMetrics {
+        PD_METRICS.get().expect("PD metrics not initialized")
     }
 
     pub fn block_on_start(self) {

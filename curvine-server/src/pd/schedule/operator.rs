@@ -39,6 +39,20 @@ pub enum OpStatus {
     Replaced,
 }
 
+impl OpStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OpStatus::Pending => "pending",
+            OpStatus::Running => "running",
+            OpStatus::Success => "success",
+            OpStatus::Failed => "failed",
+            OpStatus::Timeout => "timeout",
+            OpStatus::Cancelled => "cancelled",
+            OpStatus::Replaced => "replaced",
+        }
+    }
+}
+
 /// A single step of an operator
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum OpStep {

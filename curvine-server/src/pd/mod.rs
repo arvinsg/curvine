@@ -3,6 +3,7 @@ pub mod http;
 pub mod http_handler;
 pub mod journal;
 pub mod mount;
+pub mod pd_metrics;
 pub mod pd_server;
 mod rpc_context;
 pub mod rpc_handler;

@@ -15,6 +15,7 @@
 use crate::pd::cluster::ClusterManager;
 use crate::pd::config::ConfigManager;
 use crate::pd::mount::MountManager;
+use crate::pd::pd_server::Pd;
 use crate::pd::rpc_context::RpcContext;
 use curvine_common::error::FsError;
 use curvine_common::fs::Path;
@@ -22,6 +23,7 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
 use curvine_common::utils::{ProtoUtils, SerdeUtils as Serde};
 use curvine_common::FsResult;
+use orpc::common::LocalTime;
 use orpc::handler::MessageHandler;
 use orpc::message::Message;
 use std::sync::Arc;
@@ -51,6 +53,13 @@ impl MessageHandler for PdRpcHandler {
 
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let ctx = RpcContext::new(msg);
+        let operation = ctx.code.as_str();
+        let metrics = Pd::get_metrics();
+        metrics
+            .rpc_request_total
+            .with_label_values(&[operation])
+            .inc();
+        let start = LocalTime::mills();
 
         let response = match ctx.code {
             RpcCode::GetConfig => {
@@ -114,6 +123,12 @@ impl MessageHandler for PdRpcHandler {
                 )));
             }
         };
+
+        let elapsed = LocalTime::mills().saturating_sub(start) as f64;
+        metrics
+            .rpc_request_duration
+            .with_label_values(&[operation])
+            .observe(elapsed);
 
         Ok(response)
     }

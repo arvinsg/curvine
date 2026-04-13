@@ -23,6 +23,15 @@ pub enum NodeType {
     Meta,
 }
 
+impl NodeType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NodeType::Worker => "worker",
+            NodeType::Meta => "meta",
+        }
+    }
+}
+
 /// Node state in PD
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum NodeState {
@@ -39,6 +48,28 @@ pub enum NodeState {
     Decommission,
     /// Blacklisted by admin
     Blacklist,
+}
+
+impl NodeState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NodeState::Starting => "starting",
+            NodeState::Live => "live",
+            NodeState::Lost => "lost",
+            NodeState::Offline => "offline",
+            NodeState::Decommission => "decommission",
+            NodeState::Blacklist => "blacklist",
+        }
+    }
+
+    pub const ALL: [NodeState; 6] = [
+        NodeState::Starting,
+        NodeState::Live,
+        NodeState::Lost,
+        NodeState::Offline,
+        NodeState::Decommission,
+        NodeState::Blacklist,
+    ];
 }
 
 /// Node address (hostname, ip, ports)

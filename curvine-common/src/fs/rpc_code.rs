@@ -83,6 +83,62 @@ pub enum RpcCode {
     GetMetaRouteSummary = 104,
 }
 
+impl RpcCode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RpcCode::Undefined => "Undefined",
+            RpcCode::Heartbeat => "Heartbeat",
+            RpcCode::Mkdir => "Mkdir",
+            RpcCode::Delete => "Delete",
+            RpcCode::CreateFile => "CreateFile",
+            RpcCode::OpenFile => "OpenFile",
+            RpcCode::AppendFile => "AppendFile",
+            RpcCode::FileStatus => "FileStatus",
+            RpcCode::ListStatus => "ListStatus",
+            RpcCode::Exists => "Exists",
+            RpcCode::Rename => "Rename",
+            RpcCode::AddBlock => "AddBlock",
+            RpcCode::CompleteFile => "CompleteFile",
+            RpcCode::GetBlockLocations => "GetBlockLocations",
+            RpcCode::GetMasterInfo => "GetMasterInfo",
+            RpcCode::SetAttr => "SetAttr",
+            RpcCode::Symlink => "Symlink",
+            RpcCode::Link => "Link",
+            RpcCode::ResizeFile => "ResizeFile",
+            RpcCode::AssignWorker => "AssignWorker",
+            RpcCode::GetLock => "GetLock",
+            RpcCode::SetLock => "SetLock",
+            RpcCode::ListLock => "ListLock",
+            RpcCode::CreateFilesBatch => "CreateFilesBatch",
+            RpcCode::AddBlocksBatch => "AddBlocksBatch",
+            RpcCode::CompleteFilesBatch => "CompleteFilesBatch",
+            RpcCode::Mount => "Mount",
+            RpcCode::UnMount => "UnMount",
+            RpcCode::UpdateMount => "UpdateMount",
+            RpcCode::GetMountTable => "GetMountTable",
+            RpcCode::GetMountInfo => "GetMountInfo",
+            RpcCode::SubmitJob => "SubmitJob",
+            RpcCode::GetJobStatus => "GetJobStatus",
+            RpcCode::CancelJob => "CancelJob",
+            RpcCode::ReportTask => "ReportTask",
+            RpcCode::SubmitTask => "SubmitTask",
+            RpcCode::WorkerHeartbeat => "WorkerHeartbeat",
+            RpcCode::WorkerBlockReport => "WorkerBlockReport",
+            RpcCode::SubmitBlockReplicationJob => "SubmitBlockReplicationJob",
+            RpcCode::ReportBlockReplicationResult => "ReportBlockReplicationResult",
+            RpcCode::MetricsReport => "MetricsReport",
+            RpcCode::WriteBlock => "WriteBlock",
+            RpcCode::ReadBlock => "ReadBlock",
+            RpcCode::WriteBlocksBatch => "WriteBlocksBatch",
+            RpcCode::WriteCommitsBatch => "WriteCommitsBatch",
+            RpcCode::GetConfig => "GetConfig",
+            RpcCode::ListConfig => "ListConfig",
+            RpcCode::SetConfig => "SetConfig",
+            RpcCode::GetMetaRouteSummary => "GetMetaRouteSummary",
+        }
+    }
+}
+
 impl fmt::Display for RpcCode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:?}", self)

@@ -15,6 +15,7 @@
 use super::operator::{BGCommands, BGOperator, OpStatus, OpStep};
 use crate::pd::bg::BGManager;
 use crate::pd::config::ConfigManager;
+use crate::pd::pd_server::Pd;
 use curvine_common::state::BGOpState;
 use dashmap::DashMap;
 use std::cmp::Ordering;
@@ -407,6 +408,10 @@ impl OperatorController {
         // Terminal state cleanup
         for bg_id in to_remove {
             if let Some((_, op)) = self.running_operators.remove(&bg_id) {
+                Pd::get_metrics()
+                    .operator_finish_total
+                    .with_label_values(&[op.status.as_str()])
+                    .inc();
                 self.decrement_worker_counts(&op);
                 // Reset op_state to Idle so checkers can re-evaluate this BG
                 self.bg_manager.set_op_state(bg_id, BGOpState::Idle);

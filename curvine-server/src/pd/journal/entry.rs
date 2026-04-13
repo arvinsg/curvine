@@ -109,3 +109,24 @@ pub enum PdEntry {
     AddPathRoute(PathRouteEntry),
     RemovePathRoute(String),
 }
+
+impl PdEntry {
+    pub fn entry_type_str(&self) -> &'static str {
+        match self {
+            PdEntry::Noop => "noop",
+            PdEntry::SetConfig(_) => "set_config",
+            PdEntry::Mount(_) => "mount",
+            PdEntry::Unmount(_) => "unmount",
+            PdEntry::RegisterNode(_) => "register_node",
+            PdEntry::SaveNode(_) => "save_node",
+            PdEntry::DeleteNode(_) => "delete_node",
+            PdEntry::SavePool(_) => "save_pool",
+            PdEntry::CreateBG(_) => "create_bg",
+            PdEntry::UpdateBG(_) => "update_bg",
+            PdEntry::DeleteBG(_) => "delete_bg",
+            PdEntry::BatchBG(_) => "batch_bg",
+            PdEntry::AddPathRoute(_) => "add_path_route",
+            PdEntry::RemovePathRoute(_) => "remove_path_route",
+        }
+    }
+}

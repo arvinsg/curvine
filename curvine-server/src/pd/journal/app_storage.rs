@@ -18,6 +18,7 @@ use crate::pd::journal::entry::PdEntry;
 use crate::pd::meta::MetaManager;
 use crate::pd::mount::MountManager;
 use crate::pd::node::NodeManager;
+use crate::pd::pd_server::Pd;
 use crate::pd::pool::PoolManager;
 use crate::pd::store::RocksKvEngine;
 use curvine_common::proto::raft::SnapshotData;
@@ -69,6 +70,11 @@ impl PdAppStorage {
         }
 
         let pd_entry: PdEntry = Serde::deserialize(message)?;
+        Pd::get_metrics()
+            .raft_apply_total
+            .with_label_values(&[pd_entry.entry_type_str()])
+            .inc();
+
         match pd_entry {
             PdEntry::Noop => {
                 info!("Apply noop entry");

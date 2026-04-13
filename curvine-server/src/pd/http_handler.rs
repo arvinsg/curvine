@@ -19,6 +19,7 @@ use crate::pd::config::ConfigManager;
 use crate::pd::meta::http_handler::*;
 use crate::pd::mount::http_handler::*;
 use crate::pd::mount::MountManager;
+use crate::pd::pd_server::Pd;
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Router};
 use curvine_web::router::RouterHandler;
@@ -45,10 +46,16 @@ impl PdHttpHandler {
     }
 }
 
+async fn pd_metrics_handler() -> String {
+    Pd::get_metrics().text_output().unwrap_or_default()
+}
+
 impl RouterHandler for PdHttpHandler {
     fn router(&self) -> Router {
         let instance = Arc::new(self.clone());
         Router::new()
+            // Metrics
+            .route("/metrics", get(pd_metrics_handler))
             // Config
             .route("/api/v1/config/set", put(set_config_by_query_handler))
             .route("/api/v1/config/:key", get(get_config_handler))

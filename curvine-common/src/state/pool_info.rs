@@ -22,6 +22,7 @@ pub struct PoolStats {
     pub capacity_bytes: u64,
     pub available_bytes: u64,
     pub used_bytes: u64,
+    pub block_count: u64,
 }
 
 /// Pool info

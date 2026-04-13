@@ -246,6 +246,7 @@ impl PoolManager {
                         stats.capacity_bytes += ss.capacity as u64;
                         stats.available_bytes += ss.available as u64;
                         stats.used_bytes += ss.fs_used as u64;
+                        stats.block_count += ss.block_num as u64;
                     }
                 }
             }
