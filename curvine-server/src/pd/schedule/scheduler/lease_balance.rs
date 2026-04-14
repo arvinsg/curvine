@@ -1,13 +1,31 @@
-use super::{BaseScheduler, Scheduler, SchedulerContext, compute_pool_scores, should_balance};
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::{BaseScheduler, Scheduler, SchedulerContext};
+use crate::pd::bg::placement::{create_policy, create_selector, PlacementContext};
 use crate::pd::config::keys;
 use crate::pd::schedule::operator::{BGOperator, OperatorBuilder, OperatorKind};
+use crate::pd::schedule::snapshot::build_table_snapshot;
 use crate::pd::schedule::CoordinatorContext;
 use curvine_common::state::BGOpState;
 use curvine_common::FsResult;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Lease balance scheduler: transfers lease ownership from overloaded to underloaded workers.
+/// Lease balance scheduler: transfers lease ownership from overloaded workers.
+///
+/// Operates per-table. Does NOT change replica_set, only lease_owner.
 pub struct LeaseBalanceScheduler {
     ctx: Arc<CoordinatorContext>,
 }
@@ -30,84 +48,129 @@ impl Scheduler for LeaseBalanceScheduler {
     fn schedule(&self, ctx: &SchedulerContext<'_>) -> Vec<BGOperator> {
         let mut result = Vec::new();
 
-        let max_ops = ctx.config_manager.get_u32(
+        let max_ops_per_table = ctx.config_manager.get_u32(
             keys::PD_SCHEDULE_BALANCE_MAX_OPS_PER_CYCLE,
             keys::PD_SCHEDULE_BALANCE_MAX_OPS_PER_CYCLE_DEFAULT,
         ) as usize;
 
-        let tolerant_ratio_bps = ctx.config_manager.get_u32(
+        let tolerant_ratio = ctx.config_manager.get_u32(
             keys::PD_SCHEDULE_BALANCE_TOLERANT_RATIO_BPS,
             keys::PD_SCHEDULE_BALANCE_TOLERANT_RATIO_BPS_DEFAULT,
-        );
+        ) as f64
+            / 10000.0;
 
-        for pool in ctx.pool_manager.list_active_pools() {
-            if result.len() >= max_ops {
-                break;
-            }
+        let tables = ctx.bg_manager.list_tables();
 
-            let live_workers = ctx.pool_manager.get_live_workers(pool.pool_id);
-            let mut scores =
-                compute_pool_scores(&live_workers, &pool, ctx.bg_manager, Some(ctx.operator_controller));
-            if scores.len() < 2 {
+        for table in &tables {
+            let pool_id = table.pool_id();
+            let pool = match ctx.pool_manager.get_pool(pool_id) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            let worker_snapshots = build_table_snapshot(
+                table.table_id,
+                ctx.bg_manager,
+                ctx.pool_manager,
+                Some(ctx.operator_controller),
+                pool.media,
+            );
+
+            if worker_snapshots.len() < 2 {
                 continue;
             }
 
-            scores.sort_by(|a, b| {
-                b.leader_score
-                    .partial_cmp(&a.leader_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            let placement_ctx = PlacementContext {
+                workers: &worker_snapshots,
+                bucket_count: table.bucket_count,
+                replica_count: table.replica_count(),
+                tolerant_ratio,
+                lease_tolerant_ratio: tolerant_ratio,
+            };
 
-            let total_leaders: f64 = scores.iter().map(|s| s.leader_count as f64).sum();
-            let mean_score = total_leaders / scores.len() as f64;
+            let balance_policy = create_policy("quota");
+            let mut st = match balance_policy.prepare(&placement_ctx) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
 
-            let source = &scores[0];
-            let target = scores.last().unwrap();
+            let mut selector = create_selector("quota");
+            selector.init_from_policy(&placement_ctx, &st);
 
-            if !should_balance(
-                source.leader_score,
-                target.leader_score,
-                mean_score,
-                tolerant_ratio_bps,
-            ) {
-                continue;
-            }
+            // Find source workers (lease overloaded).
+            let source_workers: Vec<u32> = placement_ctx
+                .worker_ids()
+                .into_iter()
+                .filter(|&wid| {
+                    balance_policy.should_rebalance_lease_from(&placement_ctx, &st, wid)
+                })
+                .collect();
 
-            let source_bgs = ctx.bg_manager.get_bgs_on_worker(source.worker_id);
-            let pool_id = pool.pool_id;
+            let mut table_ops = 0;
 
-            for bg in &source_bgs {
-                if result.len() >= max_ops {
+            for &source_id in &source_workers {
+                if table_ops >= max_ops_per_table {
                     break;
                 }
-                if bg.op_state != BGOpState::Idle {
-                    continue;
-                }
-                if (bg.table_id >> 16) as u16 != pool_id {
-                    continue;
-                }
-                if bg.lease_owner.as_ref().map(|l| l.node_id) != Some(source.worker_id) {
-                    continue;
-                }
-                if !bg.replica_set.contains(&target.worker_id) {
-                    continue;
-                }
 
-                let op = OperatorBuilder::new(
-                    OperatorKind::LeaseTransfer,
-                    bg.bg_id,
-                    format!(
-                        "Balance lease: transfer from {} (score={:.1}) to {} (score={:.1})",
-                        source.worker_id, source.leader_score, target.worker_id, target.leader_score
-                    ),
-                )
-                .bg_epoch(bg.bg_epoch)
-                .priority(40)
-                .transfer_lease(source.worker_id, target.worker_id)
-                .build();
+                let source_bgs = ctx.bg_manager.get_bgs_on_worker(source_id);
 
-                result.push(op);
-                break; // One lease transfer per source-target pair per cycle
+                for bg in &source_bgs {
+                    if table_ops >= max_ops_per_table {
+                        break;
+                    }
+                    if bg.op_state != BGOpState::Idle {
+                        continue;
+                    }
+                    if bg.table_id != table.table_id {
+                        continue;
+                    }
+                    // Source must be the lease owner.
+                    if bg.lease_owner.as_ref().map(|l| l.node_id) != Some(source_id) {
+                        continue;
+                    }
+
+                    // Target must be in replica_set and pass policy filter.
+                    let replica_targets: Vec<u32> = bg
+                        .replica_set
+                        .iter()
+                        .copied()
+                        .filter(|&w| w != source_id)
+                        .collect();
+
+                    let legal_targets = balance_policy.filter_lease_targets(
+                        &placement_ctx,
+                        &st,
+                        &replica_targets,
+                    );
+
+                    if legal_targets.is_empty() {
+                        continue;
+                    }
+
+                    let target = match selector.select_lease_owner(&mut st, &legal_targets) {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+
+                    let builder = OperatorBuilder::new(
+                        OperatorKind::LeaseTransfer,
+                        bg.bg_id,
+                        format!(
+                            "Lease balance: transfer from worker {} to {}",
+                            source_id, target
+                        ),
+                    )
+                    .bg_epoch(bg.bg_epoch)
+                    .priority(40)
+                    .transfer_lease(source_id, target);
+
+                    result.push(builder.build());
+
+                    st.record_lease_change(Some(source_id), target);
+                    table_ops += 1;
+                    break; // One lease per source per cycle.
+                }
             }
         }
 

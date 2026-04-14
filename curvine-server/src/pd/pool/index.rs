@@ -217,6 +217,7 @@ mod tests {
                 capacity_bytes: 1000,
                 available_bytes: 500,
                 used_bytes: 500,
+                block_count: 0,
             },
         );
         let p = idx.get_pool(2).unwrap();

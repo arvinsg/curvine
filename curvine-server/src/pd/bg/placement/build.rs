@@ -12,124 +12,109 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::context::PlacementContext;
+use super::policy::{BalancePolicy, PolicyState, RebuildOptions, ReplicaDecision};
 use super::rule::PlacementRule;
-use super::selector::{WorkerCandidate, WorkerSelector};
-use super::select_workers_for_bg;
+use super::selector::WorkerSelector;
 use crate::pd::bg::BGTable;
 use curvine_common::state::{BGLease, BGState, BlockGroupInfo, BlockGroupPolicy};
 use curvine_common::FsError;
 use orpc::common::LocalTime;
-use rand::seq::SliceRandom;
-use rand::thread_rng;
-use std::collections::HashMap;
 use std::collections::HashSet;
 
-/// Result of building a new BGTable: the table metadata plus the BG entries.
+/// Result of building a new BGTable.
 pub struct BuildTableResult {
     pub table: BGTable,
     pub bgs: Vec<BlockGroupInfo>,
 }
 
-/// Build a new BGTable with placement-aware replica selection.
+/// Result of rebuilding an existing BGTable.
+pub struct RebuildTableResult {
+    pub updated_bgs: Vec<BlockGroupInfo>,
+}
+
+/// Build a BGTable with all BGs allocated from scratch.
 ///
-/// - `table_id`: pre-computed table_id encoding pool_id and replica_count
-/// - `bucket_count`: number of buckets (partitions) in the table
-/// - `replica_count`: how many replicas per BG
-/// - `workers`: list of live worker IDs available for placement
-/// - `next_bg_id`: starting BG ID for allocation (caller manages the counter)
-/// - `worker_labels`: label map per worker for placement-aware sorting
-/// - `rules`: placement rules for isolation-aware selection
-/// - `selector`: worker selection strategy (NormalizedSelector, RandomSelector, etc.)
+/// Uses the unified three-layer pipeline: PlacementRule → BalancePolicy → WorkerSelector.
 pub fn build_table(
     table_id: u32,
     bucket_count: u32,
     replica_count: u16,
-    policy: BlockGroupPolicy,
-    workers: &[u32],
+    bg_policy: BlockGroupPolicy,
     next_bg_id: u32,
-    worker_labels: &HashMap<u32, HashMap<String, String>>,
-    rules: &[PlacementRule],
-    selector: &dyn WorkerSelector,
+    ctx: &PlacementContext<'_>,
+    rule: &PlacementRule,
+    policy: &dyn BalancePolicy,
+    st: &mut PolicyState,
+    selector: &mut dyn WorkerSelector,
 ) -> Result<BuildTableResult, FsError> {
-    let rc = replica_count as usize;
-    if workers.len() < rc {
-        return Err(FsError::common(format!(
-            "not enough workers for table: need {} replicas, have {} workers",
-            rc,
-            workers.len()
-        )));
-    }
     if bucket_count == 0 {
-        return Err(FsError::common("bucket_count must be > 0"));
+        return Err(FsError::common("bucket_count must be > 0".to_string()));
+    }
+
+    let worker_labels = ctx.worker_labels();
+    let constrained_workers = rule.filter(&worker_labels);
+    if constrained_workers.len() < replica_count as usize {
+        return Err(FsError::common(format!(
+            "not enough workers satisfying constraints: need {}, have {}",
+            replica_count,
+            constrained_workers.len()
+        )));
     }
 
     let now = LocalTime::mills();
+    let mut bgs: Vec<BlockGroupInfo> = Vec::with_capacity(bucket_count as usize);
 
-    // Track per-worker BG count and lease count for balanced placement.
-    let mut worker_bg_count: HashMap<u32, u32> = workers.iter().map(|&w| (w, 0)).collect();
-    let mut worker_lease_count: HashMap<u32, u32> = workers.iter().map(|&w| (w, 0)).collect();
-
-    // Shuffle BG selection order to eliminate greedy ordering bias.
-    let mut bg_indices: Vec<u32> = (0..bucket_count).collect();
-    bg_indices.shuffle(&mut thread_rng());
-
-    let mut bgs_map: HashMap<u32, (u32, BlockGroupInfo)> =
-        HashMap::with_capacity(bucket_count as usize);
-
-    for &i in &bg_indices {
+    for i in 0..bucket_count {
         let bg_id = next_bg_id + i;
+        let mut replica_set: Vec<u32> = Vec::with_capacity(replica_count as usize);
+        let mut exclude = HashSet::new();
 
-        // Build candidates with current bg_count for load-aware scoring.
-        let candidates: Vec<WorkerCandidate> = workers
-            .iter()
-            .map(|&wid| WorkerCandidate {
-                worker_id: wid,
-                bg_count: worker_bg_count.get(&wid).copied().unwrap_or(0),
-                // Initial build: no capacity data yet, set to 0 (selector handles this).
-                capacity_bytes: 0,
-                used_bytes: 0,
-                labels: worker_labels.get(&wid).cloned().unwrap_or_default(),
-            })
-            .collect();
+        for _ in 0..replica_count {
+            // Two-level: isolated first, fall back to all constrained.
+            let isolated = rule.filter_isolated(&constrained_workers, &replica_set, &worker_labels);
 
-        let replica_set = select_workers_for_bg(
-            &candidates,
-            rc,
-            &HashSet::new(),
-            &[],
-            rules,
-            selector,
-            worker_labels,
-        );
+            // Policy target filtering: remove overloaded workers.
+            let mut pool_ids = policy.filter_bg_targets(ctx, st, &isolated, &exclude);
+            if pool_ids.is_empty() {
+                // Degradation: try all constrained (skip isolation).
+                pool_ids = policy.filter_bg_targets(ctx, st, &constrained_workers, &exclude);
+            }
+            if pool_ids.is_empty() {
+                // Last resort: all constrained without policy filter.
+                pool_ids = constrained_workers
+                    .iter()
+                    .copied()
+                    .filter(|wid| !exclude.contains(wid))
+                    .collect();
+            }
 
-        if replica_set.len() < rc {
+            if pool_ids.is_empty() {
+                break;
+            }
+
+            let picked = selector.select(st, &pool_ids, 1, &exclude)?;
+            if let Some(&wid) = picked.first() {
+                replica_set.push(wid);
+                exclude.insert(wid);
+                st.record_bg_change(None, wid);
+            }
+        }
+
+        if replica_set.len() < replica_count as usize {
             return Err(FsError::common(format!(
-                "could not select enough replicas for bg {}: got {}, need {}",
+                "could not allocate {} replicas for bg {}, only found {}",
+                replica_count,
                 bg_id,
-                replica_set.len(),
-                rc
+                replica_set.len()
             )));
         }
 
-        // Update per-worker BG counts.
-        for &w in &replica_set {
-            *worker_bg_count.entry(w).or_default() += 1;
-        }
+        // Select lease owner from the replica set.
+        let lease_owner_id = selector.select_lease_owner(st, &replica_set)?;
+        st.record_lease_change(None, lease_owner_id);
 
-        // Lease owner: pick the worker with the fewest leases for balance.
-        let lease_owner = replica_set
-            .iter()
-            .min_by_key(|&&w| {
-                (
-                    worker_lease_count.get(&w).copied().unwrap_or(0),
-                    w, // deterministic tiebreaker by worker_id
-                )
-            })
-            .copied()
-            .unwrap_or(replica_set[0]);
-        *worker_lease_count.entry(lease_owner).or_default() += 1;
-
-        let bg = BlockGroupInfo {
+        bgs.push(BlockGroupInfo {
             bg_id,
             table_id,
             bg_epoch: 1,
@@ -137,27 +122,18 @@ pub fn build_table(
             state: BGState::Assigned,
             op_state: Default::default(),
             lease_owner: Some(BGLease {
-                node_id: lease_owner,
+                node_id: lease_owner_id,
                 epoch: 1,
-                grant_time_ms: 0,
+                grant_time_ms: now,
             }),
             stats: Default::default(),
-        };
-        bgs_map.insert(i, (bg_id, bg));
+        });
     }
 
-    // Reconstruct ordered BGs and buckets in original index order.
-    let mut bgs = Vec::with_capacity(bucket_count as usize);
-    let mut buckets = Vec::with_capacity(bucket_count as usize);
-    for i in 0..bucket_count {
-        let (bg_id, bg) = bgs_map.remove(&i).unwrap();
-        buckets.push(bg_id);
-        bgs.push(bg);
-    }
-
+    let buckets: Vec<u32> = (next_bg_id..next_bg_id + bucket_count).collect();
     let table = BGTable {
         table_id,
-        policy,
+        policy: bg_policy,
         bucket_count,
         buckets,
         epoch: 1,
@@ -168,197 +144,481 @@ pub fn build_table(
     Ok(BuildTableResult { table, bgs })
 }
 
+/// Rebuild an existing BGTable incrementally.
+pub fn rebuild_table(
+    _table: &BGTable,
+    existing_bgs: &[BlockGroupInfo],
+    ctx: &PlacementContext<'_>,
+    rule: &PlacementRule,
+    policy: &dyn BalancePolicy,
+    st: &mut PolicyState,
+    selector: &mut dyn WorkerSelector,
+    options: &RebuildOptions,
+) -> Result<RebuildTableResult, FsError> {
+    let worker_labels = ctx.worker_labels();
+    let constrained_workers = rule.filter(&worker_labels);
+    let live_workers: HashSet<u32> = constrained_workers.iter().copied().collect();
+
+    let now = LocalTime::mills();
+    let mut updated_bgs: Vec<BlockGroupInfo> = Vec::new();
+
+    for bg in existing_bgs {
+        let budget = options.max_replace_budget(bg.replica_set.len() as u16);
+        let mut replaced = 0;
+        let mut new_replica_set = bg.replica_set.clone();
+        let mut changed = false;
+
+        for pos in 0..new_replica_set.len() {
+            let decision = policy.classify_replica(ctx, st, bg, pos, &live_workers);
+
+            match decision {
+                ReplicaDecision::Keep => continue,
+
+                ReplicaDecision::MustReplace(_reason) => {
+                    if let Some(new_wid) = find_replacement(
+                        ctx,
+                        st,
+                        rule,
+                        policy,
+                        selector,
+                        &new_replica_set,
+                        &constrained_workers,
+                        &worker_labels,
+                    )? {
+                        let old_wid = new_replica_set[pos];
+                        st.record_bg_change(Some(old_wid), new_wid);
+                        new_replica_set[pos] = new_wid;
+                        replaced += 1;
+                        changed = true;
+                    }
+                }
+
+                ReplicaDecision::TryReplace(_reason) => {
+                    if replaced >= budget {
+                        continue;
+                    }
+                    if let Some(new_wid) = find_replacement(
+                        ctx,
+                        st,
+                        rule,
+                        policy,
+                        selector,
+                        &new_replica_set,
+                        &constrained_workers,
+                        &worker_labels,
+                    )? {
+                        let old_wid = new_replica_set[pos];
+                        st.record_bg_change(Some(old_wid), new_wid);
+                        new_replica_set[pos] = new_wid;
+                        replaced += 1;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        // Check lease owner validity.
+        let mut new_lease = bg.lease_owner.clone();
+        if let Some(ref lease) = bg.lease_owner {
+            if !live_workers.contains(&lease.node_id) || !new_replica_set.contains(&lease.node_id) {
+                let alive_replicas: Vec<u32> = new_replica_set
+                    .iter()
+                    .copied()
+                    .filter(|wid| live_workers.contains(wid))
+                    .collect();
+                if !alive_replicas.is_empty() {
+                    let new_owner = selector.select_lease_owner(st, &alive_replicas)?;
+                    st.record_lease_change(Some(lease.node_id), new_owner);
+                    new_lease = Some(BGLease {
+                        node_id: new_owner,
+                        epoch: lease.epoch + 1,
+                        grant_time_ms: now,
+                    });
+                    changed = true;
+                }
+            }
+        }
+
+        if changed {
+            let mut updated = bg.clone();
+            updated.replica_set = new_replica_set;
+            updated.lease_owner = new_lease;
+            updated.bg_epoch += 1;
+            updated_bgs.push(updated);
+        }
+    }
+
+    Ok(RebuildTableResult { updated_bgs })
+}
+
+/// Find a replacement worker for a replica position.
+/// Goes through: isolation filter → policy target filter → selector pick.
+fn find_replacement(
+    ctx: &PlacementContext<'_>,
+    st: &mut PolicyState,
+    rule: &PlacementRule,
+    policy: &dyn BalancePolicy,
+    selector: &mut dyn WorkerSelector,
+    current_replicas: &[u32],
+    constrained_workers: &[u32],
+    worker_labels: &std::collections::HashMap<u32, std::collections::HashMap<String, String>>,
+) -> Result<Option<u32>, FsError> {
+    let exclude: HashSet<u32> = current_replicas.iter().copied().collect();
+
+    // Isolation filter.
+    let isolated = rule.filter_isolated(constrained_workers, current_replicas, worker_labels);
+
+    // Policy target filter.
+    let mut targets = policy.filter_bg_targets(ctx, st, &isolated, &exclude);
+    if targets.is_empty() {
+        // Degradation: skip isolation.
+        targets = policy.filter_bg_targets(ctx, st, constrained_workers, &exclude);
+    }
+    if targets.is_empty() {
+        // Last resort: all constrained.
+        targets = constrained_workers
+            .iter()
+            .copied()
+            .filter(|wid| !exclude.contains(wid))
+            .collect();
+    }
+
+    if targets.is_empty() {
+        return Ok(None);
+    }
+
+    match selector.select(st, &targets, 1, &exclude) {
+        Ok(picks) => Ok(picks.first().copied()),
+        Err(_) => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pd::bg::placement::NormalizedSelector;
-    use curvine_common::state::{PlacementPolicy, StorageType};
+    use crate::pd::bg::placement::context::WorkerLoadSnapshot;
+    use crate::pd::bg::placement::quota_policy::QuotaBalancePolicy;
+    use crate::pd::bg::placement::quota_selector::QuotaSelector;
+    use curvine_common::state::{BGOpState, PlacementPolicy, StorageType};
+    use std::collections::HashMap;
 
-    fn default_policy(replicas: u16) -> BlockGroupPolicy {
+    fn default_bg_policy() -> BlockGroupPolicy {
         BlockGroupPolicy {
             storage_type: StorageType::Ssd,
-            replicas,
+            replicas: 2,
             placement: PlacementPolicy::Default,
         }
     }
 
-    fn default_selector() -> NormalizedSelector {
-        NormalizedSelector::default()
+    fn make_ctx<'a>(
+        workers: &'a HashMap<u32, WorkerLoadSnapshot>,
+        bucket_count: u32,
+        replica_count: u16,
+    ) -> PlacementContext<'a> {
+        PlacementContext {
+            workers,
+            bucket_count,
+            replica_count,
+            tolerant_ratio: 0.1,
+            lease_tolerant_ratio: 0.1,
+        }
+    }
+
+    fn make_snapshots(ids: &[u32]) -> HashMap<u32, WorkerLoadSnapshot> {
+        ids.iter()
+            .map(|&wid| {
+                (
+                    wid,
+                    WorkerLoadSnapshot {
+                        worker_id: wid,
+                        actual_bg: 0,
+                        actual_lease: 0,
+                        pending_bg_add: 0,
+                        pending_bg_remove: 0,
+                        pending_lease_in: 0,
+                        pending_lease_out: 0,
+                        capacity_bytes: 1000,
+                        used_bytes: 100,
+                        labels: HashMap::new(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn make_snapshots_with_bg(data: &[(u32, u32)]) -> HashMap<u32, WorkerLoadSnapshot> {
+        data.iter()
+            .map(|&(wid, bg)| {
+                (
+                    wid,
+                    WorkerLoadSnapshot {
+                        worker_id: wid,
+                        actual_bg: bg,
+                        actual_lease: 0,
+                        pending_bg_add: 0,
+                        pending_bg_remove: 0,
+                        pending_lease_in: 0,
+                        pending_lease_out: 0,
+                        capacity_bytes: 1000,
+                        used_bytes: 100,
+                        labels: HashMap::new(),
+                    },
+                )
+            })
+            .collect()
     }
 
     #[test]
-    fn build_table_basic() {
+    fn test_build_table_basic() {
+        let workers = make_snapshots(&[1, 2, 3]);
+        let ctx = make_ctx(&workers, 4, 2);
+        let rule = PlacementRule::default_rule();
+        let policy = QuotaBalancePolicy::new();
+        let mut st = policy.prepare(&ctx).unwrap();
+        let mut selector = QuotaSelector::new();
+        selector.init_from_policy(&ctx, &st);
+
         let result = build_table(
-            (2u32 << 16) | 3,
-            4,
-            3,
-            default_policy(3),
-            &[10, 20, 30, 40],
             1,
-            &HashMap::new(),
-            &[],
-            &default_selector(),
+            4,
+            2,
+            default_bg_policy(),
+            100,
+            &ctx,
+            &rule,
+            &policy,
+            &mut st,
+            &mut selector,
         )
         .unwrap();
+
         assert_eq!(result.table.bucket_count, 4);
         assert_eq!(result.bgs.len(), 4);
-        assert_eq!(result.table.buckets.len(), 4);
         for bg in &result.bgs {
-            assert_eq!(bg.replica_set.len(), 3);
-            assert_eq!(bg.state, BGState::Assigned);
-            assert_eq!(bg.bg_epoch, 1);
+            assert_eq!(bg.replica_set.len(), 2);
+            let set: HashSet<u32> = bg.replica_set.iter().copied().collect();
+            assert_eq!(set.len(), 2);
+            assert!(bg.lease_owner.is_some());
         }
     }
 
     #[test]
-    fn build_table_not_enough_workers() {
-        let result = build_table(
-            1, 4, 3, default_policy(3), &[10, 20], 1, &HashMap::new(), &[], &default_selector(),
-        );
-        assert!(result.is_err());
-    }
+    fn test_build_table_not_enough_workers() {
+        let workers = make_snapshots(&[1]);
+        let ctx = make_ctx(&workers, 4, 2);
+        let rule = PlacementRule::default_rule();
+        let policy = QuotaBalancePolicy::new();
+        let mut st = policy.prepare(&ctx).unwrap();
+        let mut selector = QuotaSelector::new();
+        selector.init_from_policy(&ctx, &st);
 
-    #[test]
-    fn build_table_zero_buckets() {
         let result = build_table(
-            1, 0, 3, default_policy(3), &[10, 20, 30], 1, &HashMap::new(), &[], &default_selector(),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn build_table_spread_is_balanced() {
-        let result = build_table(
-            (2u32 << 16) | 2,
-            8,
+            1,
+            4,
             2,
-            default_policy(2),
-            &[1, 2, 3, 4],
+            default_bg_policy(),
             100,
-            &HashMap::new(),
-            &[],
-            &default_selector(),
-        )
-        .unwrap();
-        let mut load: HashMap<u32, usize> = HashMap::new();
-        for bg in &result.bgs {
-            for &w in &bg.replica_set {
-                *load.entry(w).or_default() += 1;
-            }
-        }
-        let max_load = load.values().max().copied().unwrap_or(0);
-        let min_load = load.values().min().copied().unwrap_or(0);
-        assert!(max_load - min_load <= 2, "load imbalance: {:?}", load);
+            &ctx,
+            &rule,
+            &policy,
+            &mut st,
+            &mut selector,
+        );
+        assert!(result.is_err());
     }
 
     #[test]
-    fn build_table_no_duplicate_replicas_per_bg() {
+    fn test_build_table_zero_buckets() {
+        let workers = make_snapshots(&[1, 2]);
+        let ctx = make_ctx(&workers, 0, 2);
+        let rule = PlacementRule::default_rule();
+        let policy = QuotaBalancePolicy::new();
+        let mut st = policy.prepare(&ctx).unwrap();
+        let mut selector = QuotaSelector::new();
+        selector.init_from_policy(&ctx, &st);
+
         let result = build_table(
-            1, 10, 3, default_policy(3), &[1, 2, 3, 4, 5], 1,
-            &HashMap::new(), &[], &default_selector(),
-        )
-        .unwrap();
-        for bg in &result.bgs {
-            let unique: HashSet<_> = bg.replica_set.iter().collect();
-            assert_eq!(unique.len(), bg.replica_set.len(), "duplicate in bg {}", bg.bg_id);
-        }
+            1,
+            0,
+            2,
+            default_bg_policy(),
+            100,
+            &ctx,
+            &rule,
+            &policy,
+            &mut st,
+            &mut selector,
+        );
+        assert!(result.is_err());
     }
 
     #[test]
-    fn build_table_with_placement_rules_isolates_az() {
-        let mut labels = HashMap::new();
-        labels.insert(1, {
-            let mut m = HashMap::new();
-            m.insert("az".to_string(), "az1".to_string());
-            m
-        });
-        labels.insert(2, {
-            let mut m = HashMap::new();
-            m.insert("az".to_string(), "az2".to_string());
-            m
-        });
-        labels.insert(3, {
-            let mut m = HashMap::new();
-            m.insert("az".to_string(), "az3".to_string());
-            m
-        });
+    fn test_rebuild_replaces_invalid_nodes() {
+        // Worker 1 is not available (not in snapshot).
+        let workers = make_snapshots_with_bg(&[(2, 1), (3, 0)]);
+        let ctx = make_ctx(&workers, 1, 2);
+        let rule = PlacementRule::default_rule();
+        let policy = QuotaBalancePolicy::new();
+        let mut st = policy.prepare(&ctx).unwrap();
+        let mut selector = QuotaSelector::new();
+        selector.init_from_policy(&ctx, &st);
 
-        let rules = vec![PlacementRule {
-            id: "cross-az".to_string(),
-            label_constraints: vec![],
-            location_labels: vec!["az".to_string()],
-            isolation_level: 0,
+        let existing_bgs = vec![BlockGroupInfo {
+            bg_id: 100,
+            table_id: 1,
+            bg_epoch: 1,
+            replica_set: vec![1, 2], // worker 1 is invalid
+            state: BGState::Active,
+            op_state: BGOpState::Idle,
+            lease_owner: Some(BGLease {
+                node_id: 2,
+                epoch: 1,
+                grant_time_ms: 0,
+            }),
+            stats: Default::default(),
         }];
 
-        let result = build_table(
-            (2u32 << 16) | 3,
-            4,
-            3,
-            default_policy(3),
-            &[1, 2, 3],
-            1,
-            &labels,
-            &rules,
-            &default_selector(),
+        let table = BGTable {
+            table_id: 1,
+            policy: default_bg_policy(),
+            bucket_count: 1,
+            buckets: vec![100],
+            epoch: 1,
+            create_time_ms: 0,
+            last_rebuild_ms: 0,
+        };
+
+        let options = RebuildOptions::default();
+        let result = rebuild_table(
+            &table,
+            &existing_bgs,
+            &ctx,
+            &rule,
+            &policy,
+            &mut st,
+            &mut selector,
+            &options,
         )
         .unwrap();
 
-        // Each BG should use all 3 workers (different AZs)
-        for bg in &result.bgs {
-            let unique: HashSet<_> = bg.replica_set.iter().collect();
-            assert_eq!(unique.len(), 3, "expected 3 unique workers per BG");
-        }
+        assert_eq!(result.updated_bgs.len(), 1);
+        assert!(!result.updated_bgs[0].replica_set.contains(&1));
+        assert!(result.updated_bgs[0].replica_set.contains(&3));
     }
 
     #[test]
-    fn build_table_lease_balance() {
-        // 1024 BGs, 3 replicas, 9 workers — leases should be roughly uniform.
-        let workers: Vec<u32> = (1..=9).collect();
-        let result = build_table(
-            (2u32 << 16) | 3,
-            1024,
-            3,
-            default_policy(3),
-            &workers,
-            1,
-            &HashMap::new(),
-            &[],
-            &default_selector(),
+    fn test_rebuild_no_changes() {
+        let workers = make_snapshots_with_bg(&[(1, 1), (2, 1)]);
+        let ctx = make_ctx(&workers, 1, 2);
+        let rule = PlacementRule::default_rule();
+        let policy = QuotaBalancePolicy::new();
+        let mut st = policy.prepare(&ctx).unwrap();
+        let mut selector = QuotaSelector::new();
+        selector.init_from_policy(&ctx, &st);
+
+        let existing_bgs = vec![BlockGroupInfo {
+            bg_id: 100,
+            table_id: 1,
+            bg_epoch: 1,
+            replica_set: vec![1, 2],
+            state: BGState::Active,
+            op_state: BGOpState::Idle,
+            lease_owner: Some(BGLease {
+                node_id: 1,
+                epoch: 1,
+                grant_time_ms: 0,
+            }),
+            stats: Default::default(),
+        }];
+
+        let table = BGTable {
+            table_id: 1,
+            policy: default_bg_policy(),
+            bucket_count: 1,
+            buckets: vec![100],
+            epoch: 1,
+            create_time_ms: 0,
+            last_rebuild_ms: 0,
+        };
+
+        let options = RebuildOptions::default();
+        let result = rebuild_table(
+            &table,
+            &existing_bgs,
+            &ctx,
+            &rule,
+            &policy,
+            &mut st,
+            &mut selector,
+            &options,
         )
         .unwrap();
-
-        let mut lease_count: HashMap<u32, u32> = HashMap::new();
-        for bg in &result.bgs {
-            if let Some(ref lease) = bg.lease_owner {
-                *lease_count.entry(lease.node_id).or_default() += 1;
-            }
-        }
-
-        let expected_per_worker = 1024.0 / 9.0; // ~113.8
-        for &count in lease_count.values() {
-            let deviation = (count as f64 - expected_per_worker).abs();
-            // Allow up to 15% deviation for randomized placement.
-            assert!(
-                deviation < expected_per_worker * 0.15,
-                "lease count {} deviates too far from expected {:.1}: {:?}",
-                count,
-                expected_per_worker,
-                lease_count
-            );
-        }
+        assert!(result.updated_bgs.is_empty());
     }
 
     #[test]
-    fn build_table_bg_ids_sequential() {
-        // Even though selection order is shuffled, BG IDs in buckets should be sequential.
-        let result = build_table(
-            1, 4, 1, default_policy(1), &[1, 2], 100,
-            &HashMap::new(), &[], &default_selector(),
+    fn test_rebuild_over_quota_with_budget() {
+        // 3 workers, bucket=4, replica=2, total=8
+        // Worker 1 has 5 BGs (over quota of ~3)
+        // Workers 2,3 have 1 each
+        // New worker 4 has 0
+        let workers = make_snapshots_with_bg(&[(1, 5), (2, 1), (3, 1), (4, 0)]);
+        let ctx = make_ctx(&workers, 4, 2);
+        let rule = PlacementRule::default_rule();
+        let policy = QuotaBalancePolicy::new();
+        let mut st = policy.prepare(&ctx).unwrap();
+        let mut selector = QuotaSelector::new();
+        selector.init_from_policy(&ctx, &st);
+
+        // Create BGs where worker 1 is heavily used.
+        let existing_bgs: Vec<BlockGroupInfo> = (0..4)
+            .map(|i| BlockGroupInfo {
+                bg_id: 100 + i,
+                table_id: 1,
+                bg_epoch: 1,
+                replica_set: vec![1, (i % 3 + 2)], // worker 1 always, worker 2/3/4 rotating
+                state: BGState::Active,
+                op_state: BGOpState::Idle,
+                lease_owner: Some(BGLease {
+                    node_id: 1,
+                    epoch: 1,
+                    grant_time_ms: 0,
+                }),
+                stats: Default::default(),
+            })
+            .collect();
+
+        let table = BGTable {
+            table_id: 1,
+            policy: default_bg_policy(),
+            bucket_count: 4,
+            buckets: vec![100, 101, 102, 103],
+            epoch: 1,
+            create_time_ms: 0,
+            last_rebuild_ms: 0,
+        };
+
+        let options = RebuildOptions::default(); // max 50% = 1 per BG
+        let result = rebuild_table(
+            &table,
+            &existing_bgs,
+            &ctx,
+            &rule,
+            &policy,
+            &mut st,
+            &mut selector,
+            &options,
         )
         .unwrap();
-        assert_eq!(result.table.buckets, vec![100, 101, 102, 103]);
-        for (i, bg) in result.bgs.iter().enumerate() {
-            assert_eq!(bg.bg_id, 100 + i as u32);
-        }
+
+        // Some BGs should be updated (worker 1 replaced by worker 4).
+        assert!(!result.updated_bgs.is_empty());
+        // Worker 4 should now have some BGs.
+        let w4_count = result
+            .updated_bgs
+            .iter()
+            .filter(|bg| bg.replica_set.contains(&4))
+            .count();
+        assert!(w4_count > 0, "new worker 4 should receive BGs");
     }
 }

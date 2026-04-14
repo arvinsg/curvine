@@ -1,291 +1,115 @@
-use rand::seq::SliceRandom;
-use rand::thread_rng;
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::context::PlacementContext;
+use super::policy::PolicyState;
+use curvine_common::FsResult;
 use std::collections::{HashMap, HashSet};
 
 /// Worker candidate with pre-computed scoring inputs.
 #[derive(Debug, Clone)]
 pub struct WorkerCandidate {
     pub worker_id: u32,
-    /// Number of BGs currently hosted on this worker.
     pub bg_count: u32,
-    /// Total capacity (bytes) for the relevant storage type.
+    pub lease_count: u32,
     pub capacity_bytes: u64,
-    /// Used bytes for the relevant storage type.
     pub used_bytes: u64,
-    /// Worker labels (az, rack, etc.).
     pub labels: HashMap<String, String>,
 }
 
-/// Extensible worker selection strategy.
+/// Worker selection strategy — picks from a pre-filtered legal candidate set.
 pub trait WorkerSelector: Send + Sync {
-    /// Strategy name for logging and dynamic switching.
     fn name(&self) -> &str;
 
-    /// Select `count` workers from `candidates`, excluding `exclude`.
-    fn select(
-        &self,
-        candidates: &[WorkerCandidate],
-        count: usize,
-        exclude: &HashSet<u32>,
-    ) -> Vec<u32>;
-}
+    fn init_from_policy(&mut self, ctx: &PlacementContext<'_>, st: &PolicyState);
 
-/// Default selector using normalized scoring: BG count + storage usage rate.
-pub struct NormalizedSelector {
-    pub bg_weight: f64,
-    pub capacity_weight: f64,
-}
-
-impl Default for NormalizedSelector {
-    fn default() -> Self {
-        Self {
-            bg_weight: 0.6,
-            capacity_weight: 0.4,
-        }
-    }
-}
-
-impl WorkerSelector for NormalizedSelector {
-    fn name(&self) -> &str {
-        "normalized"
-    }
-
-    fn select(
-        &self,
-        candidates: &[WorkerCandidate],
-        count: usize,
-        exclude: &HashSet<u32>,
-    ) -> Vec<u32> {
-        let mut selected: Vec<u32> = Vec::with_capacity(count);
-
-        for _ in 0..count {
-            let eligible: Vec<&WorkerCandidate> = candidates
-                .iter()
-                .filter(|c| !exclude.contains(&c.worker_id) && !selected.contains(&c.worker_id))
-                .collect();
-
-            if eligible.is_empty() {
-                break;
-            }
-
-            // max(max_bg, 1) to avoid division by zero on empty clusters.
-            let max_bg = eligible
-                .iter()
-                .map(|c| c.bg_count)
-                .max()
-                .unwrap_or(1)
-                .max(1) as f64;
-
-            let mut best_worker = None;
-            let mut best_score = f64::MAX;
-
-            for &c in &eligible {
-                let bg_norm = c.bg_count as f64 / max_bg;
-                // capacity_bytes=0 (worker not yet reported) treated as full.
-                let usage_norm = if c.capacity_bytes == 0 {
-                    1.0
-                } else {
-                    c.used_bytes as f64 / c.capacity_bytes as f64
-                };
-                let score = self.bg_weight * bg_norm + self.capacity_weight * usage_norm;
-
-                if score < best_score {
-                    best_score = score;
-                    best_worker = Some(c.worker_id);
-                }
-            }
-
-            if let Some(wid) = best_worker {
-                selected.push(wid);
-            } else {
-                break;
-            }
-        }
-
-        selected
-    }
-}
-
-/// Random selector for testing and baseline comparison.
-pub struct RandomSelector;
-
-impl WorkerSelector for RandomSelector {
-    fn name(&self) -> &str {
-        "random"
-    }
-
-    fn select(
-        &self,
-        candidates: &[WorkerCandidate],
-        count: usize,
-        exclude: &HashSet<u32>,
-    ) -> Vec<u32> {
-        let mut eligible: Vec<u32> = candidates
+    fn init(&mut self, candidates: &[WorkerCandidate], bucket_count: u32, replica_count: u16) {
+        let workers: HashMap<u32, super::context::WorkerLoadSnapshot> = candidates
             .iter()
-            .filter(|c| !exclude.contains(&c.worker_id))
-            .map(|c| c.worker_id)
+            .map(|c| {
+                (
+                    c.worker_id,
+                    super::context::WorkerLoadSnapshot {
+                        worker_id: c.worker_id,
+                        actual_bg: c.bg_count,
+                        actual_lease: c.lease_count,
+                        pending_bg_add: 0,
+                        pending_bg_remove: 0,
+                        pending_lease_in: 0,
+                        pending_lease_out: 0,
+                        capacity_bytes: c.capacity_bytes,
+                        used_bytes: c.used_bytes,
+                        labels: c.labels.clone(),
+                    },
+                )
+            })
             .collect();
-        eligible.shuffle(&mut thread_rng());
-        eligible.truncate(count);
-        eligible
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_candidate(
-        worker_id: u32,
-        bg_count: u32,
-        capacity_bytes: u64,
-        used_bytes: u64,
-        labels: HashMap<String, String>,
-    ) -> WorkerCandidate {
-        WorkerCandidate {
-            worker_id,
-            bg_count,
-            capacity_bytes,
-            used_bytes,
-            labels,
-        }
-    }
-
-    fn az_labels(az: &str) -> HashMap<String, String> {
-        let mut m = HashMap::new();
-        m.insert("az".to_string(), az.to_string());
-        m
-    }
-
-    #[test]
-    fn normalized_name() {
-        assert_eq!(NormalizedSelector::default().name(), "normalized");
-    }
-
-    #[test]
-    fn basic_selection_picks_lowest_score() {
-        let selector = NormalizedSelector::default();
-        let candidates = vec![
-            make_candidate(1, 10, 1000, 500, HashMap::new()),
-            make_candidate(2, 5, 1000, 300, HashMap::new()),
-            make_candidate(3, 8, 1000, 800, HashMap::new()),
-        ];
-        let result = selector.select(&candidates, 2, &HashSet::new());
-        assert_eq!(result.len(), 2);
-        // Worker 2 should be picked first (lowest bg_count and usage)
-        assert_eq!(result[0], 2);
-    }
-
-    #[test]
-    fn exclude_set_respected() {
-        let selector = NormalizedSelector::default();
-        let candidates = vec![
-            make_candidate(1, 0, 1000, 0, HashMap::new()),
-            make_candidate(2, 0, 1000, 0, HashMap::new()),
-        ];
-        let mut exclude = HashSet::new();
-        exclude.insert(1);
-        let result = selector.select(&candidates, 1, &exclude);
-        assert_eq!(result, vec![2]);
-    }
-
-    #[test]
-    fn max_bg_count_zero_no_panic() {
-        // All workers have bg_count=0 — should not panic on division.
-        let selector = NormalizedSelector::default();
-        let candidates = vec![
-            make_candidate(1, 0, 1000, 100, HashMap::new()),
-            make_candidate(2, 0, 1000, 200, HashMap::new()),
-            make_candidate(3, 0, 1000, 300, HashMap::new()),
-        ];
-        let result = selector.select(&candidates, 2, &HashSet::new());
-        assert_eq!(result.len(), 2);
-        // bg_norm=0 for all, so pure capacity sort: worker 1 (lowest usage) first
-        assert_eq!(result[0], 1);
-        assert_eq!(result[1], 2);
-    }
-
-    #[test]
-    fn capacity_bytes_zero_treated_as_full() {
-        let selector = NormalizedSelector::default();
-        let candidates = vec![
-            make_candidate(1, 0, 0, 0, HashMap::new()), // no capacity info -> full
-            make_candidate(2, 0, 1000, 100, HashMap::new()), // 10% used
-        ];
-        let result = selector.select(&candidates, 1, &HashSet::new());
-        // Worker 2 should be preferred (lower usage_norm)
-        assert_eq!(result, vec![2]);
-    }
-
-    #[test]
-    fn empty_candidates_returns_empty() {
-        let selector = NormalizedSelector::default();
-        let result = selector.select(&[], 3, &HashSet::new());
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn count_exceeds_candidates() {
-        let selector = NormalizedSelector::default();
-        let candidates = vec![
-            make_candidate(1, 0, 1000, 0, HashMap::new()),
-            make_candidate(2, 0, 1000, 0, HashMap::new()),
-        ];
-        let result = selector.select(&candidates, 5, &HashSet::new());
-        assert_eq!(result.len(), 2);
-    }
-
-    #[test]
-    fn custom_weights() {
-        // Pure bg_count weight
-        let selector = NormalizedSelector {
-            bg_weight: 1.0,
-            capacity_weight: 0.0,
+        let ctx = PlacementContext {
+            workers: &workers,
+            bucket_count,
+            replica_count,
+            tolerant_ratio: 1.0,
+            lease_tolerant_ratio: 1.0,
         };
-        let candidates = vec![
-            make_candidate(1, 10, 1000, 100, HashMap::new()), // high bg, low usage
-            make_candidate(2, 1, 1000, 900, HashMap::new()),  // low bg, high usage
-        ];
-        let result = selector.select(&candidates, 1, &HashSet::new());
-        assert_eq!(result, vec![2]); // lower bg_count wins
+        // Use a simple PolicyState with equal quotas
+        let worker_ids: Vec<u32> = candidates.iter().map(|c| c.worker_id).collect();
+        let total_slots = bucket_count * replica_count as u32;
+        let n = worker_ids.len() as u32;
+        let (bg_base, bg_rem) = if n > 0 {
+            (total_slots / n, total_slots % n)
+        } else {
+            (0, 0)
+        };
+        let (lease_base, lease_rem) = if n > 0 {
+            (bucket_count / n, bucket_count % n)
+        } else {
+            (0, 0)
+        };
+        let st = PolicyState {
+            worker_bg_quota: worker_ids
+                .iter()
+                .enumerate()
+                .map(|(i, &w)| (w, bg_base + if (i as u32) < bg_rem { 1 } else { 0 }))
+                .collect(),
+            worker_lease_quota: worker_ids
+                .iter()
+                .enumerate()
+                .map(|(i, &w)| (w, lease_base + if (i as u32) < lease_rem { 1 } else { 0 }))
+                .collect(),
+            worker_bg_effective: candidates
+                .iter()
+                .map(|c| (c.worker_id, c.bg_count as i64))
+                .collect(),
+            worker_lease_effective: candidates
+                .iter()
+                .map(|c| (c.worker_id, c.lease_count as i64))
+                .collect(),
+            bg_load_score: HashMap::new(),
+            lease_load_score: HashMap::new(),
+        };
+        self.init_from_policy(&ctx, &st);
     }
 
-    #[test]
-    fn random_name() {
-        assert_eq!(RandomSelector.name(), "random");
-    }
+    /// Select `count` workers.
+    fn select(
+        &mut self,
+        st: &PolicyState,
+        candidate_ids: &[u32],
+        count: usize,
+        exclude: &HashSet<u32>,
+    ) -> FsResult<Vec<u32>>;
 
-    #[test]
-    fn random_excludes_correctly() {
-        let selector = RandomSelector;
-        let candidates = vec![
-            make_candidate(1, 0, 0, 0, HashMap::new()),
-            make_candidate(2, 0, 0, 0, HashMap::new()),
-            make_candidate(3, 0, 0, 0, HashMap::new()),
-        ];
-        let mut exclude = HashSet::new();
-        exclude.insert(2);
-        let result = selector.select(&candidates, 3, &exclude);
-        assert!(!result.contains(&2));
-        assert!(result.len() <= 2);
-    }
-
-    #[test]
-    fn random_respects_count() {
-        let selector = RandomSelector;
-        let candidates = vec![
-            make_candidate(1, 0, 0, 0, HashMap::new()),
-            make_candidate(2, 0, 0, 0, HashMap::new()),
-            make_candidate(3, 0, 0, 0, HashMap::new()),
-        ];
-        let result = selector.select(&candidates, 1, &HashSet::new());
-        assert_eq!(result.len(), 1);
-    }
-
-    #[test]
-    fn random_empty_candidates() {
-        let selector = RandomSelector;
-        let result = selector.select(&[], 3, &HashSet::new());
-        assert!(result.is_empty());
-    }
+    /// Select a lease owner.
+    fn select_lease_owner(&mut self, st: &PolicyState, candidate_ids: &[u32]) -> FsResult<u32>;
 }

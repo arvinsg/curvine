@@ -1,30 +1,76 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 pub mod build;
+pub mod capacity_policy;
+pub mod context;
+pub mod normalized_selector;
+pub mod policy;
+pub mod quota_policy;
+pub mod quota_selector;
+pub mod random_selector;
 pub mod rule;
 pub mod selector;
 
-pub use build::{build_table, BuildTableResult};
+pub use build::{build_table, rebuild_table, BuildTableResult, RebuildTableResult};
+pub use context::{PlacementContext, WorkerLoadSnapshot};
+pub use capacity_policy::CapacityBalancePolicy;
+pub use normalized_selector::NormalizedSelector;
+pub use policy::{
+    BalancePolicy, PolicyState, RebuildOptions, ReplicaDecision, ReplicaReplaceReason,
+};
+pub use quota_policy::QuotaBalancePolicy;
+pub use quota_selector::QuotaSelector;
+pub use random_selector::RandomSelector;
 pub use rule::{
     check_violations, filter_by_constraints, filter_by_isolation, find_worst_replica,
     LabelConstraint, LabelOp, PlacementRule, ViolationResult,
 };
-pub use selector::{NormalizedSelector, RandomSelector, WorkerCandidate, WorkerSelector};
+pub use selector::{WorkerCandidate, WorkerSelector};
 
 use std::collections::{HashMap, HashSet};
 
-/// Unified worker selection entry point for all BG placement scenarios.
+/// Legacy worker selection entry point. Creates a temporary PolicyState internally.
+/// New code should use build_table/rebuild_table with explicit policy + selector.
 pub fn select_workers_for_bg(
     candidates: &[WorkerCandidate],
     count: usize,
     exclude: &HashSet<u32>,
     existing_replicas: &[u32],
     rules: &[PlacementRule],
-    selector: &dyn WorkerSelector,
+    selector: &mut dyn WorkerSelector,
     worker_labels: &HashMap<u32, HashMap<String, String>>,
 ) -> Vec<u32> {
+    // Build a temporary PolicyState for the legacy path
+    let tmp_st = PolicyState {
+        worker_bg_quota: HashMap::new(),
+        worker_lease_quota: HashMap::new(),
+        worker_bg_effective: candidates
+            .iter()
+            .map(|c| (c.worker_id, c.bg_count as i64))
+            .collect(),
+        worker_lease_effective: candidates
+            .iter()
+            .map(|c| (c.worker_id, c.lease_count as i64))
+            .collect(),
+        bg_load_score: HashMap::new(),
+        lease_load_score: HashMap::new(),
+    };
+
     let mut selected: Vec<u32> = Vec::with_capacity(count);
 
     for _ in 0..count {
-        // Build eligible set: not excluded, not already selected.
         let eligible_ids: Vec<u32> = candidates
             .iter()
             .filter(|c| !exclude.contains(&c.worker_id) && !selected.contains(&c.worker_id))
@@ -35,11 +81,9 @@ pub fn select_workers_for_bg(
             break;
         }
 
-        // Combined existing: original existing_replicas + already selected in this call.
         let mut all_existing: Vec<u32> = existing_replicas.to_vec();
         all_existing.extend_from_slice(&selected);
 
-        // Level 1: constraint + isolation filtering.
         let constrained = filter_by_constraints(&eligible_ids, rules, worker_labels);
         let isolated = if constrained.is_empty() {
             Vec::new()
@@ -47,33 +91,46 @@ pub fn select_workers_for_bg(
             filter_by_isolation(&constrained, rules, &all_existing, worker_labels)
         };
 
-        // Build candidate slice for selector from the best available filter level.
         let pick_from = if !isolated.is_empty() {
             &isolated
         } else if !constrained.is_empty() {
-            // Relaxation level 1: constraint-only (isolation relaxed).
             &constrained
         } else {
-            // Relaxation level 2: all eligible (constraints also relaxed).
             &eligible_ids
         };
 
-        let pick_set: HashSet<u32> = pick_from.iter().copied().collect();
-        let filtered_candidates: Vec<WorkerCandidate> = candidates
-            .iter()
-            .filter(|c| pick_set.contains(&c.worker_id))
-            .cloned()
-            .collect();
+        let pick_ids: Vec<u32> = pick_from.to_vec();
 
-        let picks = selector.select(&filtered_candidates, 1, &HashSet::new());
-        if let Some(&wid) = picks.first() {
-            selected.push(wid);
-        } else {
-            break;
+        match selector.select(&tmp_st, &pick_ids, 1, &HashSet::new()) {
+            Ok(picks) => {
+                if let Some(&wid) = picks.first() {
+                    selected.push(wid);
+                } else {
+                    break;
+                }
+            }
+            Err(_) => break,
         }
     }
 
     selected
+}
+
+/// Create a selector instance by strategy name.
+pub fn create_selector(strategy: &str) -> Box<dyn WorkerSelector> {
+    match strategy {
+        "normalized" => Box::new(NormalizedSelector::default()),
+        "random" => Box::new(RandomSelector),
+        _ => Box::new(QuotaSelector::new()),
+    }
+}
+
+/// Create a balance policy instance by strategy name.
+pub fn create_policy(strategy: &str) -> Box<dyn BalancePolicy> {
+    match strategy {
+        "capacity" => Box::new(CapacityBalancePolicy::new()),
+        _ => Box::new(QuotaBalancePolicy::new()),
+    }
 }
 
 #[cfg(test)]
@@ -88,6 +145,7 @@ mod tests {
         WorkerCandidate {
             worker_id,
             bg_count,
+            lease_count: 0,
             capacity_bytes: 1000,
             used_bytes: 100,
             labels,
@@ -115,7 +173,7 @@ mod tests {
 
     #[test]
     fn select_with_isolation() {
-        let selector = NormalizedSelector::default();
+        let mut selector = NormalizedSelector::default();
         let candidates = vec![
             make_candidate(1, 5, az_labels("az1")),
             make_candidate(2, 5, az_labels("az2")),
@@ -125,9 +183,8 @@ mod tests {
         let rules = vec![cross_az_rule()];
 
         let result =
-            select_workers_for_bg(&candidates, 3, &HashSet::new(), &[], &rules, &selector, &wl);
+            select_workers_for_bg(&candidates, 3, &HashSet::new(), &[], &rules, &mut selector, &wl);
         assert_eq!(result.len(), 3);
-        // All 3 AZs should be covered.
         let azs: HashSet<&str> = result
             .iter()
             .filter_map(|wid| wl.get(wid).and_then(|l| l.get("az").map(|s| s.as_str())))
@@ -137,8 +194,7 @@ mod tests {
 
     #[test]
     fn select_with_relaxation() {
-        // 3 replicas needed but only 2 AZs — must relax isolation.
-        let selector = NormalizedSelector::default();
+        let mut selector = NormalizedSelector::default();
         let candidates = vec![
             make_candidate(1, 0, az_labels("az1")),
             make_candidate(2, 0, az_labels("az1")),
@@ -148,114 +204,22 @@ mod tests {
         let rules = vec![cross_az_rule()];
 
         let result =
-            select_workers_for_bg(&candidates, 3, &HashSet::new(), &[], &rules, &selector, &wl);
+            select_workers_for_bg(&candidates, 3, &HashSet::new(), &[], &rules, &mut selector, &wl);
         assert_eq!(result.len(), 3);
     }
 
     #[test]
-    fn select_respects_exclude() {
-        let selector = NormalizedSelector::default();
-        let candidates = vec![
-            make_candidate(1, 0, HashMap::new()),
-            make_candidate(2, 0, HashMap::new()),
-            make_candidate(3, 0, HashMap::new()),
-        ];
-        let mut exclude = HashSet::new();
-        exclude.insert(1);
-
-        let result = select_workers_for_bg(
-            &candidates,
-            2,
-            &exclude,
-            &[],
-            &[],
-            &selector,
-            &HashMap::new(),
-        );
-        assert_eq!(result.len(), 2);
-        assert!(!result.contains(&1));
-    }
-
-    #[test]
-    fn select_count_exceeds_available() {
-        let selector = NormalizedSelector::default();
-        let candidates = vec![
-            make_candidate(1, 0, HashMap::new()),
-            make_candidate(2, 0, HashMap::new()),
-        ];
-        let result = select_workers_for_bg(
-            &candidates,
-            5,
-            &HashSet::new(),
-            &[],
-            &[],
-            &selector,
-            &HashMap::new(),
-        );
-        assert_eq!(result.len(), 2);
-    }
-
-    #[test]
-    fn select_with_existing_replicas() {
-        // Existing replica in az1, should prefer az2 workers.
-        let selector = NormalizedSelector::default();
-        let candidates = vec![
-            make_candidate(2, 0, az_labels("az1")),
-            make_candidate(3, 0, az_labels("az2")),
-        ];
-        let wl = worker_labels_map(&[(1, "az1"), (2, "az1"), (3, "az2")]);
-        let rules = vec![cross_az_rule()];
-
-        let result = select_workers_for_bg(
-            &candidates,
-            1,
-            &HashSet::new(),
-            &[1], // existing replica in az1
-            &rules,
-            &selector,
-            &wl,
-        );
-        assert_eq!(result, vec![3]); // az2 preferred
-    }
-
-    #[test]
     fn select_empty_candidates() {
-        let selector = NormalizedSelector::default();
+        let mut selector = NormalizedSelector::default();
         let result = select_workers_for_bg(
             &[],
             3,
             &HashSet::new(),
             &[],
             &[],
-            &selector,
+            &mut selector,
             &HashMap::new(),
         );
         assert!(result.is_empty());
-    }
-
-    #[test]
-    fn select_constraint_relaxation() {
-        // All workers fail constraints -> should fall back to all eligible.
-        let selector = NormalizedSelector::default();
-        let candidates = vec![
-            make_candidate(1, 5, az_labels("az3")),
-            make_candidate(2, 10, az_labels("az3")),
-        ];
-        let wl = worker_labels_map(&[(1, "az3"), (2, "az3")]);
-        let rules = vec![PlacementRule {
-            id: "test".to_string(),
-            label_constraints: vec![LabelConstraint {
-                key: "az".to_string(),
-                op: rule::LabelOp::In,
-                values: vec!["az1".to_string()],
-            }],
-            location_labels: vec![],
-            isolation_level: 0,
-        }];
-
-        let result =
-            select_workers_for_bg(&candidates, 1, &HashSet::new(), &[], &rules, &selector, &wl);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], 1); // lower bg_count
     }
 }

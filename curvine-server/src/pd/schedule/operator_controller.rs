@@ -469,6 +469,41 @@ impl OperatorController {
         delta
     }
 
+    /// Get pending BG add/remove counts for a worker from all running operators.
+    pub fn get_worker_pending_bg_delta(&self, worker_id: u32) -> (u32, u32) {
+        let mut add = 0u32;
+        let mut remove = 0u32;
+        for entry in self.running_operators.iter() {
+            for step in &entry.value().steps {
+                match step {
+                    OpStep::AddReplica { worker_id: w } if *w == worker_id => add += 1,
+                    OpStep::RemoveReplica { worker_id: w } if *w == worker_id => remove += 1,
+                    _ => {}
+                }
+            }
+        }
+        (add, remove)
+    }
+
+    /// Get pending lease transfer in/out counts for a worker from all running operators.
+    pub fn get_worker_pending_lease_delta(&self, worker_id: u32) -> (u32, u32) {
+        let mut lease_in = 0u32;
+        let mut lease_out = 0u32;
+        for entry in self.running_operators.iter() {
+            for step in &entry.value().steps {
+                if let OpStep::TransferLease { from_worker, to_worker } = step {
+                    if *to_worker == worker_id {
+                        lease_in += 1;
+                    }
+                    if *from_worker == worker_id {
+                        lease_out += 1;
+                    }
+                }
+            }
+        }
+        (lease_in, lease_out)
+    }
+
     // ========== Per-worker concurrency helpers ==========
 
     fn workers_in_op(op: &BGOperator) -> Vec<u32> {

@@ -82,6 +82,62 @@ impl PlacementRule {
             },
         }
     }
+
+    /// Filter workers by label constraints.
+    pub fn filter(&self, worker_labels: &HashMap<u32, HashMap<String, String>>) -> Vec<u32> {
+        if self.label_constraints.is_empty() {
+            return worker_labels.keys().copied().collect();
+        }
+        worker_labels
+            .iter()
+            .filter(|(_, labels)| self.label_constraints.iter().all(|lc| lc.matches(labels)))
+            .map(|(wid, _)| *wid)
+            .collect()
+    }
+
+    /// Filter workers by isolation: returns workers NOT in the same isolation group.
+    pub fn filter_isolated(
+        &self,
+        candidates: &[u32],
+        existing_replicas: &[u32],
+        worker_labels: &HashMap<u32, HashMap<String, String>>,
+    ) -> Vec<u32> {
+        let label_key = match self.location_labels.first() {
+            Some(k) => k,
+            None => return candidates.to_vec(),
+        };
+
+        let occupied: HashSet<&str> = existing_replicas
+            .iter()
+            .filter_map(|wid| {
+                worker_labels
+                    .get(wid)
+                    .and_then(|l| l.get(label_key))
+                    .map(|v| v.as_str())
+            })
+            .collect();
+
+        let filtered: Vec<u32> = candidates
+            .iter()
+            .copied()
+            .filter(|wid| {
+                let group = worker_labels
+                    .get(wid)
+                    .and_then(|l| l.get(label_key))
+                    .map(|v| v.as_str());
+                match group {
+                    Some(g) => !occupied.contains(g),
+                    None => true,
+                }
+            })
+            .collect();
+
+        if filtered.is_empty() {
+            candidates.to_vec()
+        } else {
+            filtered
+        }
+    }
 }
 
 /// Result of checking placement violations for a BG's replica set.

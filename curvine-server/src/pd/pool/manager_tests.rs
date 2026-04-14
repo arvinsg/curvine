@@ -209,6 +209,7 @@ fn update_pool_stats() {
             capacity_bytes: 2000,
             available_bytes: 1000,
             used_bytes: 1000,
+            block_count: 0,
         },
     )
     .unwrap();

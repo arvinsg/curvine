@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::placement::{
-    select_workers_for_bg, NormalizedSelector, PlacementRule, RandomSelector, WorkerCandidate,
-    WorkerSelector,
+    create_policy, create_selector, select_workers_for_bg, PlacementContext, PlacementRule,
+    RebuildOptions, WorkerCandidate, WorkerLoadSnapshot,
 };
 use super::state_machine;
 use super::{BGStore, BGTable};
@@ -153,7 +153,7 @@ pub struct BGManager {
     bucket_count: u32,
     replica_counts: Vec<u16>,
     location_labels: Vec<String>,
-    worker_selector: Arc<RwLock<Box<dyn WorkerSelector>>>,
+    selector_strategy: RwLock<String>,
 }
 
 /// Tracks a suspect BG for priority checking.
@@ -184,7 +184,7 @@ impl BGManager {
             bucket_count,
             replica_counts,
             location_labels,
-            worker_selector: Arc::new(RwLock::new(Box::new(NormalizedSelector::default()))),
+            selector_strategy: RwLock::new("quota".to_string()),
         }
     }
 
@@ -430,27 +430,69 @@ impl BGManager {
         // Pre-allocate IDs via Raft (no direct RocksDB write).
         let next_bg_id = self.id_allocator.alloc(bucket_count)?;
 
-        // TODO: policy 需要可配置
-        let policy = BlockGroupPolicy {
+        let bg_policy = BlockGroupPolicy {
             storage_type: pool.media,
             replicas: replica_count,
             placement: PlacementPolicy::Default,
         };
 
-        let worker_labels = self.pool_manager.get_workers_labels(workers);
+        // Build snapshot for the new table (all workers start at 0 BGs for this table).
+        let worker_snapshots: std::collections::HashMap<u32, WorkerLoadSnapshot> = workers
+            .iter()
+            .map(|&wid| {
+                let labels = self.pool_manager.get_worker_labels(wid).unwrap_or_default();
+                let (capacity, used) = self
+                    .pool_manager
+                    .get_worker_storage_stats(wid, pool.media)
+                    .unwrap_or((0, 0));
+                (
+                    wid,
+                    WorkerLoadSnapshot {
+                        worker_id: wid,
+                        actual_bg: 0,
+                        actual_lease: 0,
+                        pending_bg_add: 0,
+                        pending_bg_remove: 0,
+                        pending_lease_in: 0,
+                        pending_lease_out: 0,
+                        capacity_bytes: capacity as u64,
+                        used_bytes: used as u64,
+                        labels,
+                    },
+                )
+            })
+            .collect();
+
+        let ctx = PlacementContext {
+            workers: &worker_snapshots,
+            bucket_count,
+            replica_count,
+            tolerant_ratio: 0.1,
+            lease_tolerant_ratio: 0.1,
+        };
+
         let rules = self.get_pool_placement_rules(pool_id);
-        let selector = self.worker_selector.read().unwrap();
+        let rule = rules
+            .first()
+            .cloned()
+            .unwrap_or_else(PlacementRule::default_rule);
+        let strategy = self.selector_strategy.read().unwrap().clone();
+        let balance_policy = create_policy("quota");
+        let mut st = balance_policy.prepare(&ctx)?;
+        let mut selector = create_selector(&strategy);
+        selector.init_from_policy(&ctx, &st);
 
         let result = super::placement::build_table(
             table_id,
             bucket_count,
             replica_count,
-            policy,
-            workers,
+            bg_policy,
             next_bg_id,
-            &worker_labels,
-            &rules,
-            selector.as_ref(),
+            &ctx,
+            &rule,
+            balance_policy.as_ref(),
+            &mut st,
+            selector.as_mut(),
         )?;
 
         let entry = BatchBGEntry {
@@ -709,6 +751,7 @@ impl BGManager {
                 WorkerCandidate {
                     worker_id: wid,
                     bg_count,
+                    lease_count: 0,
                     capacity_bytes,
                     used_bytes,
                     labels,
@@ -721,14 +764,15 @@ impl BGManager {
         let worker_labels = self
             .pool_manager
             .get_workers_labels(&allocatable.iter().copied().collect::<Vec<_>>());
-        let selector = self.worker_selector.read().unwrap();
+        let strategy = self.selector_strategy.read().unwrap().clone();
+        let mut selector = create_selector(&strategy);
         let result = select_workers_for_bg(
             &candidates,
             n,
             &exclude_set,
             exclude,
             &rules,
-            selector.as_ref(),
+            selector.as_mut(),
             &worker_labels,
         );
 
@@ -745,7 +789,7 @@ impl BGManager {
 
     // TODO:
     /// Rebuild table buckets: for each bucket, verify the BG's replica_set workers are still alive.
-    /// If any BG has insufficient replicas, attempt to select new workers via PoolManager.
+    /// Rebuild a BGTable incrementally using the unified policy framework.
     /// All changes are batched into a single Raft entry for consistency.
     pub fn rebuild_table(&self, table_id: u32) -> FsResult<()> {
         let table = {
@@ -756,7 +800,7 @@ impl BGManager {
                 .ok_or_else(|| FsError::common(format!("table {} not found", table_id)))?
         };
 
-        let repair_list: Vec<(u32, Vec<u32>, Vec<u32>, u64)> = {
+        let existing_bgs: Vec<BlockGroupInfo> = {
             let bgs = self.bgs.read().unwrap();
             table
                 .buckets
@@ -765,61 +809,112 @@ impl BGManager {
                     if bg_id == 0 {
                         return None;
                     }
-                    let bg = bgs.get(&bg_id)?;
-                    let alive: Vec<u32> = bg
-                        .replica_set
-                        .iter()
-                        .filter(|w| self.pool_manager.is_worker_available(**w))
-                        .copied()
-                        .collect();
-                    let desired = table.replica_count() as usize;
-                    if alive.len() < desired && !alive.is_empty() {
-                        Some((bg_id, alive, bg.replica_set.clone(), bg.bg_epoch))
-                    } else {
-                        None
-                    }
+                    bgs.get(&bg_id).cloned()
                 })
                 .collect()
         };
 
-        if repair_list.is_empty() {
+        if existing_bgs.is_empty() {
             return Ok(());
         }
 
-        let mut updates = Vec::new();
-        for (bg_id, alive, old_replica_set, bg_epoch) in &repair_list {
-            let needed = table.replica_count() as u16 - alive.len() as u16;
-            let new_workers = match self.select_workers(table.pool_id(), needed, old_replica_set) {
-                Ok(w) => w,
-                Err(_) => continue,
-            };
-            if new_workers.is_empty() {
-                continue;
-            }
-            let mut new_replicas = alive.clone();
-            new_replicas.extend(new_workers);
+        // Build per-table snapshot.
+        let live_workers = self.pool_manager.get_live_workers(table.pool_id());
+        let pool = self.pool_manager.get_pool(table.pool_id())?;
+        let w2b = self.worker_to_bgs.read().unwrap();
 
-            updates.push(BGUpdateEntry {
+        let worker_snapshots: std::collections::HashMap<u32, WorkerLoadSnapshot> = live_workers
+            .iter()
+            .map(|&wid| {
+                // Count per-table BG and lease for this worker.
+                let table_bg_count = existing_bgs
+                    .iter()
+                    .filter(|bg| bg.replica_set.contains(&wid))
+                    .count() as u32;
+                let table_lease_count = existing_bgs
+                    .iter()
+                    .filter(|bg| bg.lease_owner.as_ref().map(|l| l.node_id) == Some(wid))
+                    .count() as u32;
+                let labels = self.pool_manager.get_worker_labels(wid).unwrap_or_default();
+                let (capacity, used) = self
+                    .pool_manager
+                    .get_worker_storage_stats(wid, pool.media)
+                    .unwrap_or((0, 0));
+                (
+                    wid,
+                    WorkerLoadSnapshot {
+                        worker_id: wid,
+                        actual_bg: table_bg_count,
+                        actual_lease: table_lease_count,
+                        pending_bg_add: 0,
+                        pending_bg_remove: 0,
+                        pending_lease_in: 0,
+                        pending_lease_out: 0,
+                        capacity_bytes: capacity as u64,
+                        used_bytes: used as u64,
+                        labels,
+                    },
+                )
+            })
+            .collect();
+        drop(w2b);
+
+        let ctx = PlacementContext {
+            workers: &worker_snapshots,
+            bucket_count: table.bucket_count,
+            replica_count: table.replica_count(),
+            tolerant_ratio: 0.1,
+            lease_tolerant_ratio: 0.1,
+        };
+
+        let rules = self.get_pool_placement_rules(table.pool_id());
+        let rule = rules
+            .first()
+            .cloned()
+            .unwrap_or_else(PlacementRule::default_rule);
+        let strategy = self.selector_strategy.read().unwrap().clone();
+        let balance_policy = create_policy("quota");
+        let mut st = balance_policy.prepare(&ctx)?;
+        let mut selector = create_selector(&strategy);
+        selector.init_from_policy(&ctx, &st);
+
+        let options = RebuildOptions::default();
+        let result = super::placement::rebuild_table(
+            &table,
+            &existing_bgs,
+            &ctx,
+            &rule,
+            balance_policy.as_ref(),
+            &mut st,
+            selector.as_mut(),
+            &options,
+        )?;
+
+        if result.updated_bgs.is_empty() {
+            return Ok(());
+        }
+
+        let updates: Vec<BGUpdateEntry> = result
+            .updated_bgs
+            .iter()
+            .map(|bg| BGUpdateEntry {
                 op_ms: orpc::common::LocalTime::mills(),
-                bg_id: *bg_id,
+                bg_id: bg.bg_id,
                 state: None,
-                replica_set: Some(new_replicas),
-                lease_owner: None,
-                bg_epoch: Some(*bg_epoch),
-            });
-        }
+                replica_set: Some(bg.replica_set.clone()),
+                lease_owner: bg.lease_owner.clone(),
+                bg_epoch: Some(bg.bg_epoch - 1),
+            })
+            .collect();
 
-        if !updates.is_empty() {
-            let entry = BatchBGEntry {
-                op_ms: orpc::common::LocalTime::mills(),
-                table: None,
-                creates: vec![],
-                updates,
-                next_bg_id: None,
-            };
-            self.propose_batch_bg(entry)?;
-        }
-        Ok(())
+        let entry = BatchBGEntry {
+            op_ms: orpc::common::LocalTime::mills(),
+            table: None,
+            creates: vec![],
+            updates,
+            next_bg_id: None,
+        };
+        self.propose_batch_bg(entry)
     }
 
     /// Rebuild all tables for a pool (e.g. after node join/remove). Calls rebuild_table for each table in the pool.
@@ -859,18 +954,16 @@ impl BGManager {
     // TODO: 应该通过动态参数设置
     /// Switch the worker selection strategy at runtime.
     pub fn set_selector_strategy(&self, name: &str) -> FsResult<()> {
-        let selector: Box<dyn WorkerSelector> = match name {
-            "normalized" => Box::new(NormalizedSelector::default()),
-            "random" => Box::new(RandomSelector),
-            _ => {
-                return Err(FsError::common(format!(
-                    "unknown selector strategy: {}",
-                    name
-                )))
+        match name {
+            "quota" | "normalized" | "random" => {
+                *self.selector_strategy.write().unwrap() = name.to_string();
+                Ok(())
             }
-        };
-        *self.worker_selector.write().unwrap() = selector;
-        Ok(())
+            _ => Err(FsError::common(format!(
+                "unknown selector strategy: {}",
+                name
+            ))),
+        }
     }
 
     /// Count leases per worker across all BGs (used by LeaseValidityChecker).

@@ -19,6 +19,7 @@ pub mod operator;
 pub mod operator_controller;
 pub mod scheduler;
 pub mod scheduler_controller;
+pub mod snapshot;
 
 pub use checker::BGPushCommand;
 pub use coordinator::{Coordinator, CoordinatorContext, LeaderChecker};

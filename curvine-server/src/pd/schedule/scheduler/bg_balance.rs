@@ -1,14 +1,35 @@
-use super::{BaseScheduler, Scheduler, SchedulerContext, compute_pool_scores, should_balance};
-use crate::pd::bg::placement::check_violations;
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::{BaseScheduler, Scheduler, SchedulerContext};
+use crate::pd::bg::placement::{
+    create_policy, create_selector, PlacementContext, PlacementRule,
+};
 use crate::pd::config::keys;
 use crate::pd::schedule::operator::{BGOperator, OperatorBuilder, OperatorKind};
+use crate::pd::schedule::snapshot::build_table_snapshot;
 use crate::pd::schedule::CoordinatorContext;
 use curvine_common::state::BGOpState;
 use curvine_common::FsResult;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// BG count balance scheduler: moves BGs from overloaded workers to underloaded ones.
+/// BG balance scheduler: moves BGs from overloaded workers to underloaded ones.
+///
+/// Operates per-table using the unified policy framework:
+/// BalancePolicy identifies sources, filters targets; WorkerSelector picks from legal set.
 pub struct BGBalanceScheduler {
     ctx: Arc<CoordinatorContext>,
 }
@@ -31,120 +52,146 @@ impl Scheduler for BGBalanceScheduler {
     fn schedule(&self, ctx: &SchedulerContext<'_>) -> Vec<BGOperator> {
         let mut result = Vec::new();
 
-        let max_ops = ctx.config_manager.get_u32(
+        let max_ops_per_table = ctx.config_manager.get_u32(
             keys::PD_SCHEDULE_BALANCE_MAX_OPS_PER_CYCLE,
             keys::PD_SCHEDULE_BALANCE_MAX_OPS_PER_CYCLE_DEFAULT,
         ) as usize;
 
-        let tolerant_ratio_bps = ctx.config_manager.get_u32(
+        let tolerant_ratio = ctx.config_manager.get_u32(
             keys::PD_SCHEDULE_BALANCE_TOLERANT_RATIO_BPS,
             keys::PD_SCHEDULE_BALANCE_TOLERANT_RATIO_BPS_DEFAULT,
-        );
+        ) as f64
+            / 10000.0;
 
-        for pool in ctx.pool_manager.list_active_pools() {
-            if result.len() >= max_ops {
-                break;
-            }
+        let tables = ctx.bg_manager.list_tables();
 
-            let live_workers = ctx.pool_manager.get_live_workers(pool.pool_id);
-            let mut scores =
-                compute_pool_scores(&live_workers, &pool, ctx.bg_manager, Some(ctx.operator_controller));
-            if scores.len() < 2 {
+        for table in &tables {
+            let pool_id = table.pool_id();
+            let pool = match ctx.pool_manager.get_pool(pool_id) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            // Build per-table snapshot with operator influence.
+            let worker_snapshots = build_table_snapshot(
+                table.table_id,
+                ctx.bg_manager,
+                ctx.pool_manager,
+                Some(ctx.operator_controller),
+                pool.media,
+            );
+
+            if worker_snapshots.len() < 2 {
                 continue;
             }
 
-            scores.sort_by(|a, b| {
-                b.bg_score
-                    .partial_cmp(&a.bg_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            let placement_ctx = PlacementContext {
+                workers: &worker_snapshots,
+                bucket_count: table.bucket_count,
+                replica_count: table.replica_count(),
+                tolerant_ratio,
+                lease_tolerant_ratio: tolerant_ratio,
+            };
 
-            let total_bg: f64 = scores.iter().map(|s| s.bg_count as f64).sum();
-            let mean_score = total_bg / scores.len() as f64;
+            let balance_policy = create_policy("quota");
+            let mut st = match balance_policy.prepare(&placement_ctx) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
 
-            let source = &scores[0];
-            let target = scores.last().unwrap();
+            let rules = ctx.bg_manager.get_pool_placement_rules(pool_id);
+            let rule = rules
+                .first()
+                .cloned()
+                .unwrap_or_else(PlacementRule::default_rule);
+            let worker_labels = placement_ctx.worker_labels();
 
-            if !should_balance(source.bg_score, target.bg_score, mean_score, tolerant_ratio_bps) {
-                continue;
-            }
+            let mut selector = create_selector("quota");
+            selector.init_from_policy(&placement_ctx, &st);
 
-            let source_bgs = ctx.bg_manager.get_bgs_on_worker(source.worker_id);
-            let pool_id = pool.pool_id;
+            // Find source workers (overloaded).
+            let source_workers: Vec<u32> = placement_ctx
+                .worker_ids()
+                .into_iter()
+                .filter(|&wid| balance_policy.should_rebalance_bg_from(&placement_ctx, &st, wid))
+                .collect();
 
-            for bg in &source_bgs {
-                if result.len() >= max_ops {
+            let mut table_ops = 0;
+
+            for &source_id in &source_workers {
+                if table_ops >= max_ops_per_table {
                     break;
                 }
-                if bg.op_state != BGOpState::Idle {
-                    continue;
-                }
-                if (bg.table_id >> 16) as u16 != pool_id {
-                    continue;
-                }
-                if bg.replica_set.contains(&target.worker_id) {
-                    continue;
-                }
 
-                // Placement safeguard
-                let rules = ctx.bg_manager.get_pool_placement_rules(pool_id);
-                if rules
-                    .iter()
-                    .any(|r| !r.label_constraints.is_empty() || !r.location_labels.is_empty())
-                {
-                    let worker_ids: Vec<u32> = {
-                        let mut ids = bg.replica_set.clone();
-                        ids.push(target.worker_id);
-                        ids
+                let source_bgs = ctx.bg_manager.get_bgs_on_worker(source_id);
+
+                for bg in &source_bgs {
+                    if table_ops >= max_ops_per_table {
+                        break;
+                    }
+                    if bg.op_state != BGOpState::Idle {
+                        continue;
+                    }
+                    if bg.table_id != table.table_id {
+                        continue;
+                    }
+
+                    // Get legal targets: isolation → policy filter → selector pick.
+                    let constrained = rule.filter(&worker_labels);
+                    let isolated = rule.filter_isolated(
+                        &constrained,
+                        &bg.replica_set,
+                        &worker_labels,
+                    );
+                    let exclude: HashSet<u32> = bg.replica_set.iter().copied().collect();
+                    let targets =
+                        balance_policy.filter_bg_targets(&placement_ctx, &st, &isolated, &exclude);
+
+                    if targets.is_empty() {
+                        continue;
+                    }
+
+                    let picked = match selector.select(&mut st, &targets, 1, &exclude) {
+                        Ok(p) if !p.is_empty() => p[0],
+                        _ => continue,
                     };
-                    let worker_labels = ctx.pool_manager.get_workers_labels(&worker_ids);
 
-                    let old_violations = check_violations(&bg.replica_set, &rules, &worker_labels);
-                    let mut new_set = bg.replica_set.clone();
-                    if let Some(pos) = new_set.iter().position(|&w| w == source.worker_id) {
-                        new_set[pos] = target.worker_id;
-                    }
-                    let new_violations = check_violations(&new_set, &rules, &worker_labels);
+                    // Build operator: AddReplica → (optional TransferLease) → RemoveReplica.
+                    let mut builder = OperatorBuilder::new(
+                        OperatorKind::Balance,
+                        bg.bg_id,
+                        format!(
+                            "Balance BG: move from worker {} to {}",
+                            source_id, picked
+                        ),
+                    )
+                    .bg_epoch(bg.bg_epoch)
+                    .priority(50)
+                    .add_replica(picked);
 
-                    if new_violations.has_violation() && !old_violations.has_violation() {
-                        continue;
+                    if bg
+                        .lease_owner
+                        .as_ref()
+                        .map(|l| l.node_id == source_id)
+                        .unwrap_or(false)
+                    {
+                        let to_worker = bg
+                            .replica_set
+                            .iter()
+                            .filter(|&&w| w != source_id)
+                            .find(|&&w| ctx.pool_manager.is_worker_available(w))
+                            .copied()
+                            .unwrap_or(picked);
+                        builder = builder.transfer_lease(source_id, to_worker);
                     }
-                    if new_violations.total() > old_violations.total() {
-                        continue;
-                    }
+
+                    builder = builder.remove_replica(source_id);
+                    result.push(builder.build());
+
+                    st.record_bg_change(Some(source_id), picked);
+                    table_ops += 1;
+                    break; // One BG per source per cycle.
                 }
-
-                let mut builder = OperatorBuilder::new(
-                    OperatorKind::Balance,
-                    bg.bg_id,
-                    format!(
-                        "Balance BG: move from worker {} (score={:.1}) to {} (score={:.1})",
-                        source.worker_id, source.bg_score, target.worker_id, target.bg_score
-                    ),
-                )
-                .bg_epoch(bg.bg_epoch)
-                .priority(50)
-                .add_replica(target.worker_id);
-
-                if bg
-                    .lease_owner
-                    .as_ref()
-                    .map(|l| l.node_id == source.worker_id)
-                    .unwrap_or(false)
-                {
-                    let to_worker = bg
-                        .replica_set
-                        .iter()
-                        .filter(|&&w| w != source.worker_id)
-                        .find(|&&w| ctx.pool_manager.is_worker_available(w))
-                        .copied()
-                        .unwrap_or(target.worker_id);
-                    builder = builder.transfer_lease(source.worker_id, to_worker);
-                }
-
-                builder = builder.remove_replica(source.worker_id);
-                result.push(builder.build());
-                break; // One BG per source-target pair per cycle
             }
         }
 
