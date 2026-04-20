@@ -12,44 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{BaseScheduler, Scheduler, SchedulerContext};
+use super::{build_pending_influence, BaseScheduler, Scheduler};
 use crate::pd::bg::placement::{
-    create_policy, create_selector, PlacementContext, PlacementRule,
+    best_isolation_candidates, create_policy, filter_min_isolation,
+    isolation_score, is_bg_gap_sufficient, PlacementContext,
 };
 use crate::pd::config::keys;
-use crate::pd::schedule::operator::{BGOperator, OperatorBuilder, OperatorKind};
-use crate::pd::schedule::snapshot::build_table_snapshot;
-use crate::pd::schedule::CoordinatorContext;
-use curvine_common::state::BGOpState;
-use curvine_common::FsResult;
+use crate::pd::schedule::operator::{BGOperator, OpPriority, OperatorBuilder, OperatorKind};
+use crate::pd::bg::placement::context::build_table_snapshot;
+use crate::pd::schedule::ManagerContext;
+use curvine_common::state::{BGOpState, ReplicaState};
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::Duration;
 
-/// BG balance scheduler: moves BGs from overloaded workers to underloaded ones.
-///
-/// Operates per-table using the unified policy framework:
-/// BalancePolicy identifies sources, filters targets; WorkerSelector picks from legal set.
-pub struct BGBalanceScheduler {
-    ctx: Arc<CoordinatorContext>,
-}
-
-impl BGBalanceScheduler {
-    pub fn new(ctx: Arc<CoordinatorContext>) -> Self {
-        Self { ctx }
-    }
-}
+pub struct BGBalanceScheduler;
 
 impl Scheduler for BGBalanceScheduler {
     fn name(&self) -> &str {
         "bg-balance-scheduler"
     }
 
-    fn scheduler_type(&self) -> &str {
-        "bg-balance"
-    }
-
-    fn schedule(&self, ctx: &SchedulerContext<'_>) -> Vec<BGOperator> {
+    fn schedule(&self, ctx: &ManagerContext) -> Vec<BGOperator> {
         let mut result = Vec::new();
 
         let max_ops_per_table = ctx.config_manager.get_u32(
@@ -63,6 +46,11 @@ impl Scheduler for BGBalanceScheduler {
         ) as f64
             / 10000.0;
 
+        let policy_strategy = ctx.config_manager.get_string(
+            keys::PD_BG_BALANCE_POLICY,
+            keys::PD_BG_BALANCE_POLICY_DEFAULT,
+        );
+
         let tables = ctx.bg_manager.list_tables();
 
         for table in &tables {
@@ -73,11 +61,12 @@ impl Scheduler for BGBalanceScheduler {
             };
 
             // Build per-table snapshot with operator influence.
+            let influence = build_pending_influence(&ctx.operator_controller);
             let worker_snapshots = build_table_snapshot(
                 table.table_id,
-                ctx.bg_manager,
-                ctx.pool_manager,
-                Some(ctx.operator_controller),
+                &ctx.bg_manager,
+                &ctx.pool_manager,
+                &influence,
                 pool.media,
             );
 
@@ -93,27 +82,20 @@ impl Scheduler for BGBalanceScheduler {
                 lease_tolerant_ratio: tolerant_ratio,
             };
 
-            let balance_policy = create_policy("quota");
+            let balance_policy = create_policy(&policy_strategy);
             let mut st = match balance_policy.prepare(&placement_ctx) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
 
-            let rules = ctx.bg_manager.get_pool_placement_rules(pool_id);
-            let rule = rules
-                .first()
-                .cloned()
-                .unwrap_or_else(PlacementRule::default_rule);
+            let rule = ctx.bg_manager.placement_rule();
             let worker_labels = placement_ctx.worker_labels();
-
-            let mut selector = create_selector("quota");
-            selector.init_from_policy(&placement_ctx, &st);
 
             // Find source workers (overloaded).
             let source_workers: Vec<u32> = placement_ctx
                 .worker_ids()
                 .into_iter()
-                .filter(|&wid| balance_policy.should_rebalance_bg_from(&placement_ctx, &st, wid))
+                .filter(|&wid| balance_policy.is_bg_overloaded(&placement_ctx, &st, wid))
                 .collect();
 
             let mut table_ops = 0;
@@ -135,26 +117,70 @@ impl Scheduler for BGBalanceScheduler {
                     if bg.table_id != table.table_id {
                         continue;
                     }
-
-                    // Get legal targets: isolation → policy filter → selector pick.
-                    let constrained = rule.filter(&worker_labels);
-                    let isolated = rule.filter_isolated(
-                        &constrained,
-                        &bg.replica_set,
-                        &worker_labels,
-                    );
-                    let exclude: HashSet<u32> = bg.replica_set.iter().copied().collect();
-                    let targets =
-                        balance_policy.filter_bg_targets(&placement_ctx, &st, &isolated, &exclude);
-
-                    if targets.is_empty() {
+                    // Skip BGs with non-Active replicas (already in flux)
+                    let serving = ctx.bg_manager.get_serving_replicas(bg.bg_id);
+                    if serving.len() != bg.replica_set.len() {
                         continue;
                     }
 
-                    let picked = match selector.select(&mut st, &targets, 1, &exclude) {
-                        Ok(p) if !p.is_empty() => p[0],
+                    // Use Resident view for topology evaluation
+                    let resident = ctx.bg_manager.get_resident_replicas(bg.bg_id);
+
+                    // Get legal targets: isolation → policy filter → selector pick.
+                    let all_ids = placement_ctx.worker_ids();
+                    let constrained = rule.filter(&all_ids, &worker_labels);
+                    let hard_filtered = if let Some(ref min_level) = rule.min_isolation_level {
+                        let f = filter_min_isolation(
+                            &constrained,
+                            &resident,
+                            min_level,
+                            &rule.location_labels,
+                            &worker_labels,
+                        );
+                        if f.is_empty() { constrained.clone() } else { f }
+                    } else {
+                        constrained.clone()
+                    };
+                    let best = best_isolation_candidates(
+                        &hard_filtered,
+                        &resident,
+                        &rule.location_labels,
+                        &worker_labels,
+                    );
+                    let exclude: HashSet<u32> = resident.iter().copied().collect();
+                    let picked = match balance_policy.select_bg_targets(
+                        &placement_ctx,
+                        &st,
+                        &best,
+                        1,
+                        &exclude,
+                    ) {
+                        Ok(v) if !v.is_empty() => v[0],
                         _ => continue,
                     };
+
+                    // Safety check 1: source-target gap must be large enough.
+                    if !is_bg_gap_sufficient(&st, source_id, picked, tolerant_ratio) {
+                        continue;
+                    }
+
+                    // Safety check 2: isolation must not worsen.
+                    if !rule.location_labels.is_empty() {
+                        let old_iso = isolation_score(
+                            &resident,
+                            &rule.location_labels,
+                            &worker_labels,
+                        );
+                        let mut new_set = resident.clone();
+                        if let Some(pos) = new_set.iter().position(|&w| w == source_id) {
+                            new_set[pos] = picked;
+                        }
+                        let new_iso =
+                            isolation_score(&new_set, &rule.location_labels, &worker_labels);
+                        if new_iso < old_iso {
+                            continue;
+                        }
+                    }
 
                     // Build operator: AddReplica → (optional TransferLease) → RemoveReplica.
                     let mut builder = OperatorBuilder::new(
@@ -166,8 +192,9 @@ impl Scheduler for BGBalanceScheduler {
                         ),
                     )
                     .bg_epoch(bg.bg_epoch)
-                    .priority(50)
-                    .add_replica(picked);
+                    .priority(OpPriority::BG_BALANCE)
+                    .add_replica(picked)
+                    .wait_replica_ready(picked, ReplicaState::Active);
 
                     if bg
                         .lease_owner
@@ -198,7 +225,7 @@ impl Scheduler for BGBalanceScheduler {
         result
     }
 
-    fn is_schedule_allowed(&self, ctx: &SchedulerContext<'_>) -> bool {
+    fn is_schedule_allowed(&self, ctx: &ManagerContext) -> bool {
         ctx.config_manager.get_bool(
             keys::PD_SCHEDULE_BALANCE_BG_ENABLED,
             keys::PD_SCHEDULE_BALANCE_BG_ENABLED_DEFAULT,
@@ -213,11 +240,6 @@ impl Scheduler for BGBalanceScheduler {
         BaseScheduler::default_next_interval(current)
     }
 
-    fn encode_config(&self) -> FsResult<serde_json::Value> {
-        Ok(serde_json::json!({
-            "type": self.scheduler_type(),
-        }))
-    }
 }
 
 #[cfg(test)]
@@ -226,11 +248,7 @@ mod tests {
 
     #[test]
     fn name_and_type() {
-        let ctx = crate::pd::schedule::checker::tests_common::test_coordinator_context(
-            std::collections::HashMap::new(),
-        );
-        let s = BGBalanceScheduler::new(ctx);
+        let s = BGBalanceScheduler;
         assert_eq!(s.name(), "bg-balance-scheduler");
-        assert_eq!(s.scheduler_type(), "bg-balance");
     }
 }

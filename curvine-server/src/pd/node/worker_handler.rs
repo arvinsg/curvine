@@ -64,8 +64,8 @@ impl HeartbeatHandler for WorkerHeartbeatHandler {
 
         if let NodePayload::Worker(ref mut p) = node.payload {
             p.storage_stats = w.storage_stats.clone();
-            p.bg_ids = w.bg_ids.clone();
-            p.bg_stats = w.bg_stats.clone();
+            p.bg_epochs = w.bg_epochs.clone();
+            p.bg_reports = w.bg_reports.clone();
 
             for (sid, _stat) in &w.storage_stats {
                 if !p.storage_specs.contains_key(sid) {

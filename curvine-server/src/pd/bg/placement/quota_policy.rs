@@ -14,33 +14,34 @@
 
 use super::context::PlacementContext;
 use super::policy::{
-    build_effective_counts, classify_replica, compute_equal_quota, filter_bg_targets,
-    filter_lease_targets, should_rebalance_bg, should_rebalance_lease, BalancePolicy, PolicyState,
-    ReplicaDecision,
+    build_effective_counts, classify_replica, compute_equal_quota, select_by_hunger,
+    select_lease_by_hunger, is_bg_overloaded, is_lease_overloaded, PlacementPolicy,
+    PolicyState, ReplicaDecision,
 };
 use curvine_common::state::BlockGroupInfo;
-use curvine_common::FsResult;
-use std::collections::{HashMap, HashSet};
+use curvine_common::{FsError, FsResult};
+use std::collections::HashSet;
 
-/// Default quota-based balance policy.
+/// Default quota-based placement policy.
 ///
 /// BG quota: equal-weight (`total_slots / num_workers`).
 /// Lease quota: equal-weight (`bucket_count / num_workers`).
-pub struct QuotaBalancePolicy;
+/// Selection: deterministic hunger-based (highest `quota - effective` wins).
+pub struct QuotaPolicy;
 
-impl QuotaBalancePolicy {
+impl QuotaPolicy {
     pub fn new() -> Self {
         Self
     }
 }
 
-impl Default for QuotaBalancePolicy {
+impl Default for QuotaPolicy {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl BalancePolicy for QuotaBalancePolicy {
+impl PlacementPolicy for QuotaPolicy {
     fn name(&self) -> &str {
         "quota"
     }
@@ -58,8 +59,6 @@ impl BalancePolicy for QuotaBalancePolicy {
             worker_lease_quota,
             worker_bg_effective,
             worker_lease_effective,
-            bg_load_score: HashMap::new(),
-            lease_load_score: HashMap::new(),
         })
     }
 
@@ -74,41 +73,32 @@ impl BalancePolicy for QuotaBalancePolicy {
         classify_replica(ctx, st, bg, pos, live_workers)
     }
 
-    fn should_rebalance_bg_from(
-        &self,
-        ctx: &PlacementContext<'_>,
-        st: &PolicyState,
-        worker_id: u32,
-    ) -> bool {
-        should_rebalance_bg(ctx, st, worker_id)
+    fn is_bg_overloaded(&self, ctx: &PlacementContext<'_>, st: &PolicyState, wid: u32) -> bool {
+        is_bg_overloaded(ctx, st, wid)
     }
 
-    fn should_rebalance_lease_from(
-        &self,
-        ctx: &PlacementContext<'_>,
-        st: &PolicyState,
-        worker_id: u32,
-    ) -> bool {
-        should_rebalance_lease(ctx, st, worker_id)
+    fn is_lease_overloaded(&self, ctx: &PlacementContext<'_>, st: &PolicyState, wid: u32) -> bool {
+        is_lease_overloaded(ctx, st, wid)
     }
 
-    fn filter_bg_targets(
+    fn select_bg_targets(
         &self,
-        ctx: &PlacementContext<'_>,
+        _ctx: &PlacementContext<'_>,
         st: &PolicyState,
-        candidate_ids: &[u32],
+        candidates: &[u32],
+        count: usize,
         exclude: &HashSet<u32>,
-    ) -> Vec<u32> {
-        filter_bg_targets(ctx, st, candidate_ids, exclude)
+    ) -> FsResult<Vec<u32>> {
+        let result = select_by_hunger(st, candidates, count, exclude);
+        if result.is_empty() {
+            return Err(FsError::common("no eligible BG target".to_string()));
+        }
+        Ok(result)
     }
 
-    fn filter_lease_targets(
-        &self,
-        ctx: &PlacementContext<'_>,
-        st: &PolicyState,
-        candidate_ids: &[u32],
-    ) -> Vec<u32> {
-        filter_lease_targets(ctx, st, candidate_ids)
+    fn select_lease_owner(&self, st: &PolicyState, candidates: &[u32]) -> FsResult<u32> {
+        select_lease_by_hunger(st, candidates)
+            .ok_or_else(|| FsError::common("no eligible lease owner".to_string()))
     }
 }
 
@@ -118,6 +108,7 @@ mod tests {
     use crate::pd::bg::placement::context::WorkerLoadSnapshot;
     use crate::pd::bg::placement::policy::ReplicaReplaceReason;
     use curvine_common::state::{BGLease, BGOpState, BGState};
+    use std::collections::HashMap;
 
     fn make_snapshot(worker_id: u32, actual_bg: u32, actual_lease: u32) -> WorkerLoadSnapshot {
         WorkerLoadSnapshot {
@@ -167,7 +158,7 @@ mod tests {
         workers.insert(1, make_snapshot(1, 4, 2));
         workers.insert(2, make_snapshot(2, 4, 2));
         let ctx = make_ctx(&workers);
-        let policy = QuotaBalancePolicy::new();
+        let policy = QuotaPolicy::new();
         let st = policy.prepare(&ctx).unwrap();
 
         assert_eq!(st.worker_bg_quota[&1] + st.worker_bg_quota[&2], 16);
@@ -179,7 +170,7 @@ mod tests {
         let mut workers = HashMap::new();
         workers.insert(2, make_snapshot(2, 4, 2));
         let ctx = make_ctx(&workers);
-        let policy = QuotaBalancePolicy::new();
+        let policy = QuotaPolicy::new();
         let st = policy.prepare(&ctx).unwrap();
         let live: HashSet<u32> = vec![2].into_iter().collect();
 
@@ -196,7 +187,7 @@ mod tests {
         workers.insert(1, make_snapshot(1, 10, 2));
         workers.insert(2, make_snapshot(2, 2, 2));
         let ctx = make_ctx(&workers);
-        let policy = QuotaBalancePolicy::new();
+        let policy = QuotaPolicy::new();
         let st = policy.prepare(&ctx).unwrap();
         let live: HashSet<u32> = vec![1, 2].into_iter().collect();
 
@@ -213,7 +204,7 @@ mod tests {
         workers.insert(1, make_snapshot(1, 8, 2));
         workers.insert(2, make_snapshot(2, 8, 2));
         let ctx = make_ctx(&workers);
-        let policy = QuotaBalancePolicy::new();
+        let policy = QuotaPolicy::new();
         let st = policy.prepare(&ctx).unwrap();
         let live: HashSet<u32> = vec![1, 2].into_iter().collect();
 
@@ -225,31 +216,45 @@ mod tests {
     }
 
     #[test]
-    fn test_should_rebalance_bg_from() {
+    fn test_is_bg_overloaded() {
         let mut workers = HashMap::new();
         workers.insert(1, make_snapshot(1, 10, 2));
         workers.insert(2, make_snapshot(2, 6, 2));
         let ctx = make_ctx(&workers);
-        let policy = QuotaBalancePolicy::new();
+        let policy = QuotaPolicy::new();
         let st = policy.prepare(&ctx).unwrap();
 
-        assert!(policy.should_rebalance_bg_from(&ctx, &st, 1));
-        assert!(!policy.should_rebalance_bg_from(&ctx, &st, 2));
+        assert!(policy.is_bg_overloaded(&ctx, &st, 1));
+        assert!(!policy.is_bg_overloaded(&ctx, &st, 2));
     }
 
     #[test]
-    fn test_filter_bg_targets() {
+    fn test_select_bg_targets_hungriest() {
         let mut workers = HashMap::new();
         workers.insert(1, make_snapshot(1, 10, 0));
         workers.insert(2, make_snapshot(2, 6, 0));
-        workers.insert(3, make_snapshot(3, 2, 0));
+        workers.insert(3, make_snapshot(3, 0, 0));
         let ctx = make_ctx(&workers);
-        let policy = QuotaBalancePolicy::new();
+        let policy = QuotaPolicy::new();
         let st = policy.prepare(&ctx).unwrap();
 
-        let targets = policy.filter_bg_targets(&ctx, &st, &[1, 2, 3], &HashSet::new());
-        assert!(targets.contains(&3));
-        assert!(!targets.contains(&1));
+        let targets = policy
+            .select_bg_targets(&ctx, &st, &[1, 2, 3], 1, &HashSet::new())
+            .unwrap();
+        assert_eq!(targets, vec![3]);
+    }
+
+    #[test]
+    fn test_select_lease_owner() {
+        let mut workers = HashMap::new();
+        workers.insert(1, make_snapshot(1, 4, 4));
+        workers.insert(2, make_snapshot(2, 4, 0));
+        let ctx = make_ctx(&workers);
+        let policy = QuotaPolicy::new();
+        let st = policy.prepare(&ctx).unwrap();
+
+        let owner = policy.select_lease_owner(&st, &[1, 2]).unwrap();
+        assert_eq!(owner, 2);
     }
 
     #[test]
@@ -258,7 +263,7 @@ mod tests {
         workers.insert(1, make_snapshot(1, 10, 0));
         workers.insert(2, make_snapshot(2, 2, 0));
         let ctx = make_ctx(&workers);
-        let policy = QuotaBalancePolicy::new();
+        let policy = QuotaPolicy::new();
         let mut st = policy.prepare(&ctx).unwrap();
 
         st.record_bg_change(Some(1), 2);

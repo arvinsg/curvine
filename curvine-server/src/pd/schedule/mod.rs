@@ -14,15 +14,13 @@
 
 pub mod checker;
 pub mod checker_controller;
-pub mod coordinator;
+pub mod manager;
 pub mod operator;
 pub mod operator_controller;
 pub mod scheduler;
 pub mod scheduler_controller;
-pub mod snapshot;
 
-pub use checker::BGPushCommand;
-pub use coordinator::{Coordinator, CoordinatorContext, LeaderChecker};
+pub use manager::{Manager, ManagerContext};
 pub use operator::{BGCommands, BGOperator, OpInfluence, OpStatus, OpStep, OperatorBuilder, OperatorKind};
 pub use operator_controller::OperatorController;
 pub use scheduler::Scheduler;

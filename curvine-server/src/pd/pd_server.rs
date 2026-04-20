@@ -41,7 +41,7 @@ use orpc::server::{RpcServer, ServerStateListener};
 use orpc::CommonResult;
 use std::sync::Arc;
 
-use crate::pd::schedule::coordinator::{LeaderChecker, RaftLeaderChecker};
+use crate::pd::cluster::manager::{LeaderChecker, RaftLeaderChecker};
 
 use crate::pd::rpc_handler::PdRpcHandler;
 
@@ -161,11 +161,13 @@ impl Pd {
             bg_store,
             pool_manager.clone(),
             journal_client.clone(),
+            config_manager.clone(),
             conf.bucket_count,
             conf.replica_counts.clone(),
             conf.location_labels.clone(),
         ));
         bg_manager.restore()?;
+        bg_manager.restore_active_snapshot();
 
         PD_METRICS.get_or_init(|| {
             PdMetrics::new(
@@ -204,6 +206,14 @@ impl Pd {
         let role_ctl = role_monitor.read_ctl();
         let leader_checker: Arc<dyn LeaderChecker> = Arc::new(RaftLeaderChecker::new(role_ctl));
 
+        let rpc_conf = conf.pd_server_conf();
+        let rpc_rt: Arc<Runtime> = Arc::new(rpc_conf.create_runtime());
+        let scheduler_rt: Arc<Runtime> = Arc::new(Runtime::new(
+            "pd-scheduler",
+            conf.scheduler_io_threads,
+            conf.scheduler_worker_threads,
+        ));
+
         let cluster_manager = Arc::new(ClusterManager::new(
             node_manager,
             pool_manager,
@@ -211,8 +221,8 @@ impl Pd {
             config_manager.clone(),
             mount_manager.clone(),
             Some(meta_manager),
-            journal_client,
             leader_checker,
+            scheduler_rt,
         ));
 
         let raft_journal = PdRaftJournal::new(
@@ -223,16 +233,14 @@ impl Pd {
             role_monitor,
         );
 
-        let rpc_conf = conf.pd_server_conf();
-        let rt: Arc<Runtime> = Arc::new(rpc_conf.create_runtime());
         let service = PdService {
             conf: conf.clone(),
             config_manager,
             mount_manager,
             cluster_manager,
         };
-        let rpc_server = RpcServer::with_rt(rt.clone(), rpc_conf, service.clone());
-        let web_server = WebServer::with_rt(rt.clone(), conf.pd_web_conf(), service.clone());
+        let rpc_server = RpcServer::with_rt(rpc_rt.clone(), rpc_conf, service.clone());
+        let web_server = WebServer::with_rt(rpc_rt, conf.pd_web_conf(), service.clone());
 
         Ok(Self {
             raft_journal,
@@ -254,6 +262,9 @@ impl Pd {
 
         // Step 3: start web server
         self.web_server.start();
+
+        // Step 4: start leader lifecycle monitor
+        self.service.cluster_manager.start_leader_monitor();
 
         Ok(rpc_status)
     }

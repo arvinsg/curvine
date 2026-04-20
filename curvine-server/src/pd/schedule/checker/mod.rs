@@ -17,54 +17,51 @@ use self::lease_validity::LeaseValidityChecker;
 use self::placement_rule::PlacementRuleChecker;
 use self::replica::ReplicaChecker;
 use crate::pd::schedule::operator::BGOperator;
-use crate::pd::schedule::CoordinatorContext;
-use curvine_common::state::BlockGroupInfo;
-use std::sync::Arc;
+use crate::pd::schedule::ManagerContext;
+use curvine_common::state::{BlockGroupInfo, NodeInfo};
 
 pub mod bg_assignment;
 pub mod lease_validity;
 pub mod placement_rule;
 pub mod replica;
 
-/// Context passed to checkers (read-only refs to managers).
-pub struct CheckerContext<'a> {
-    pub pool_manager: &'a crate::pd::pool::PoolManager,
-    pub bg_manager: &'a crate::pd::bg::BGManager,
-    pub node_manager: &'a crate::pd::node::NodeManager,
-    pub config_manager: &'a crate::pd::config::ConfigManager,
+/// Priority levels for `Checker::priority()`.
+pub struct CheckerPriority;
+impl CheckerPriority {
+    /// Replica count wrong (under/over) — affects data availability.
+    pub const REPLICA: u32 = 10;
+    /// Lease invalid (orphaned or on dead worker) — affects data consistency.
+    pub const LEASE_VALIDITY: u32 = 20;
+    /// Placement rule violated — affects fault isolation but not data safety.
+    pub const PLACEMENT_RULE: u32 = 30;
+    /// Worker-vs-PD assignment drift — eventually-consistent reconciliation.
+    pub const BG_ASSIGNMENT: u32 = 40;
 }
 
-/// Direct BG push command for a worker (via heartbeat response).
-#[derive(Debug, Clone)]
-pub struct BGPushCommand {
-    pub worker_id: u32,
-    pub add_bgs: Vec<BlockGroupInfo>,
-    pub remove_bgs: Vec<u32>,
-}
-
-/// Checker trait: ensures correctness via per-BG patrol.
+/// Checker trait: ensures correctness via patrol.
 ///
-/// Checkers are always active and cannot be paused. During patrol,
-/// checkers execute in priority order (lower number = higher priority).
-/// For each BG, the first checker producing an operator wins (short-circuit).
+/// Checkers are stateless. During patrol, checkers execute in priority order.
+/// For each BG/Worker, the first checker producing an operator wins (short-circuit).
 pub trait Checker: Send + Sync {
-    /// Unique checker name.
     fn name(&self) -> &str;
+    fn priority(&self) -> u32;
 
     /// Check a single BG. Returns an operator if the BG needs correction.
-    fn check_bg(&self, bg: &BlockGroupInfo, ctx: &CheckerContext<'_>) -> Option<BGOperator>;
+    fn check_bg(&self, bg: &BlockGroupInfo, ctx: &ManagerContext) -> Option<BGOperator>;
 
-    /// Checker priority (lower = executed first).
-    fn priority(&self) -> u32;
+    /// Check a single worker. Returns an operator if the worker needs correction.
+    fn check_worker(&self, _worker: &NodeInfo, _ctx: &ManagerContext) -> Option<BGOperator> {
+        None
+    }
 }
 
 /// Build the default set of checkers (sorted by priority).
-pub fn default_checkers(ctx: Arc<CoordinatorContext>) -> Vec<Box<dyn Checker>> {
+pub fn default_checkers() -> Vec<Box<dyn Checker>> {
     let mut checkers: Vec<Box<dyn Checker>> = vec![
-        Box::new(LeaseValidityChecker::new(ctx.clone())),
-        Box::new(ReplicaChecker::new(ctx.clone())),
-        Box::new(PlacementRuleChecker::new(ctx.clone())),
-        Box::new(BGAssignmentChecker::new(ctx)),
+        Box::new(ReplicaChecker),
+        Box::new(LeaseValidityChecker),
+        Box::new(PlacementRuleChecker),
+        Box::new(BGAssignmentChecker),
     ];
     checkers.sort_by_key(|c| c.priority());
     checkers
@@ -73,13 +70,11 @@ pub fn default_checkers(ctx: Arc<CoordinatorContext>) -> Vec<Box<dyn Checker>> {
 /// Shared test helpers for checker and scheduler tests.
 #[cfg(test)]
 pub mod tests_common {
-    use crate::pd::schedule::CoordinatorContext;
+    use crate::pd::schedule::ManagerContext;
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    pub fn test_coordinator_context(
-        overrides: HashMap<String, String>,
-    ) -> Arc<CoordinatorContext> {
+    pub fn test_context(overrides: HashMap<String, String>) -> Arc<ManagerContext> {
         let store: Arc<dyn crate::pd::store::KvStore> =
             Arc::new(crate::pd::store::memory_kv_engine::MemoryKvEngine::new());
         let raft = curvine_common::raft::RaftClient::from_conf(
@@ -109,17 +104,24 @@ pub mod tests_common {
             bg_store,
             pool_mgr.clone(),
             jc.clone(),
+            config.clone(),
             1024,
             vec![3],
             vec![],
         ));
-        Arc::new(CoordinatorContext {
+        let operator_controller = Arc::new(
+            crate::pd::schedule::operator_controller::OperatorController::new(
+                config.clone(),
+                bg_mgr.clone(),
+            ),
+        );
+        Arc::new(ManagerContext {
             node_manager: node_mgr,
             pool_manager: pool_mgr,
             bg_manager: bg_mgr,
             config_manager: config,
-            journal_client: jc,
-            leader_checker: Arc::new(crate::pd::schedule::coordinator::AlwaysLeader),
+            operator_controller,
+            runtime: Arc::new(orpc::runtime::Runtime::new("test", 1, 1)),
         })
     }
 }

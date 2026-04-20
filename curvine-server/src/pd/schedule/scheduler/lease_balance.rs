@@ -12,40 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{BaseScheduler, Scheduler, SchedulerContext};
-use crate::pd::bg::placement::{create_policy, create_selector, PlacementContext};
+use super::{build_pending_influence, BaseScheduler, Scheduler};
+use crate::pd::bg::placement::context::build_table_snapshot;
+use crate::pd::bg::placement::{create_policy, is_lease_gap_sufficient, PlacementContext};
 use crate::pd::config::keys;
-use crate::pd::schedule::operator::{BGOperator, OperatorBuilder, OperatorKind};
-use crate::pd::schedule::snapshot::build_table_snapshot;
-use crate::pd::schedule::CoordinatorContext;
+use crate::pd::schedule::operator::{BGOperator, OpPriority, OperatorBuilder, OperatorKind};
+use crate::pd::schedule::ManagerContext;
 use curvine_common::state::BGOpState;
-use curvine_common::FsResult;
-use std::sync::Arc;
 use std::time::Duration;
 
-/// Lease balance scheduler: transfers lease ownership from overloaded workers.
-///
-/// Operates per-table. Does NOT change replica_set, only lease_owner.
-pub struct LeaseBalanceScheduler {
-    ctx: Arc<CoordinatorContext>,
-}
-
-impl LeaseBalanceScheduler {
-    pub fn new(ctx: Arc<CoordinatorContext>) -> Self {
-        Self { ctx }
-    }
-}
+pub struct LeaseBalanceScheduler;
 
 impl Scheduler for LeaseBalanceScheduler {
     fn name(&self) -> &str {
         "lease-balance-scheduler"
     }
 
-    fn scheduler_type(&self) -> &str {
-        "lease-balance"
-    }
-
-    fn schedule(&self, ctx: &SchedulerContext<'_>) -> Vec<BGOperator> {
+    fn schedule(&self, ctx: &ManagerContext) -> Vec<BGOperator> {
         let mut result = Vec::new();
 
         let max_ops_per_table = ctx.config_manager.get_u32(
@@ -59,6 +42,11 @@ impl Scheduler for LeaseBalanceScheduler {
         ) as f64
             / 10000.0;
 
+        let policy_strategy = ctx.config_manager.get_string(
+            keys::PD_BG_BALANCE_POLICY,
+            keys::PD_BG_BALANCE_POLICY_DEFAULT,
+        );
+
         let tables = ctx.bg_manager.list_tables();
 
         for table in &tables {
@@ -68,11 +56,12 @@ impl Scheduler for LeaseBalanceScheduler {
                 Err(_) => continue,
             };
 
+            let influence = build_pending_influence(&ctx.operator_controller);
             let worker_snapshots = build_table_snapshot(
                 table.table_id,
-                ctx.bg_manager,
-                ctx.pool_manager,
-                Some(ctx.operator_controller),
+                &ctx.bg_manager,
+                &ctx.pool_manager,
+                &influence,
                 pool.media,
             );
 
@@ -88,22 +77,17 @@ impl Scheduler for LeaseBalanceScheduler {
                 lease_tolerant_ratio: tolerant_ratio,
             };
 
-            let balance_policy = create_policy("quota");
+            let balance_policy = create_policy(&policy_strategy);
             let mut st = match balance_policy.prepare(&placement_ctx) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
 
-            let mut selector = create_selector("quota");
-            selector.init_from_policy(&placement_ctx, &st);
-
             // Find source workers (lease overloaded).
             let source_workers: Vec<u32> = placement_ctx
                 .worker_ids()
                 .into_iter()
-                .filter(|&wid| {
-                    balance_policy.should_rebalance_lease_from(&placement_ctx, &st, wid)
-                })
+                .filter(|&wid| balance_policy.is_lease_overloaded(&placement_ctx, &st, wid))
                 .collect();
 
             let mut table_ops = 0;
@@ -138,20 +122,14 @@ impl Scheduler for LeaseBalanceScheduler {
                         .filter(|&w| w != source_id)
                         .collect();
 
-                    let legal_targets = balance_policy.filter_lease_targets(
-                        &placement_ctx,
-                        &st,
-                        &replica_targets,
-                    );
-
-                    if legal_targets.is_empty() {
-                        continue;
-                    }
-
-                    let target = match selector.select_lease_owner(&mut st, &legal_targets) {
+                    let target = match balance_policy.select_lease_owner(&st, &replica_targets) {
                         Ok(t) => t,
                         Err(_) => continue,
                     };
+
+                    if !is_lease_gap_sufficient(&st, source_id, target, tolerant_ratio) {
+                        continue;
+                    }
 
                     let builder = OperatorBuilder::new(
                         OperatorKind::LeaseTransfer,
@@ -162,7 +140,7 @@ impl Scheduler for LeaseBalanceScheduler {
                         ),
                     )
                     .bg_epoch(bg.bg_epoch)
-                    .priority(40)
+                    .priority(OpPriority::LEASE_BALANCE)
                     .transfer_lease(source_id, target);
 
                     result.push(builder.build());
@@ -177,7 +155,7 @@ impl Scheduler for LeaseBalanceScheduler {
         result
     }
 
-    fn is_schedule_allowed(&self, ctx: &SchedulerContext<'_>) -> bool {
+    fn is_schedule_allowed(&self, ctx: &ManagerContext) -> bool {
         ctx.config_manager.get_bool(
             keys::PD_SCHEDULE_BALANCE_LEADER_ENABLED,
             keys::PD_SCHEDULE_BALANCE_LEADER_ENABLED_DEFAULT,
@@ -191,12 +169,6 @@ impl Scheduler for LeaseBalanceScheduler {
     fn next_interval(&self, current: Duration) -> Duration {
         BaseScheduler::default_next_interval(current)
     }
-
-    fn encode_config(&self) -> FsResult<serde_json::Value> {
-        Ok(serde_json::json!({
-            "type": self.scheduler_type(),
-        }))
-    }
 }
 
 #[cfg(test)]
@@ -205,11 +177,7 @@ mod tests {
 
     #[test]
     fn name_and_type() {
-        let ctx = crate::pd::schedule::checker::tests_common::test_coordinator_context(
-            std::collections::HashMap::new(),
-        );
-        let s = LeaseBalanceScheduler::new(ctx);
+        let s = LeaseBalanceScheduler;
         assert_eq!(s.name(), "lease-balance-scheduler");
-        assert_eq!(s.scheduler_type(), "lease-balance");
     }
 }

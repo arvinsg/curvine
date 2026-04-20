@@ -116,9 +116,9 @@ impl PdAppStorage {
                 info!("Apply UpdateBG bg_id={}", entry.bg_id);
                 self.bg_manager.apply_update_bg(&entry)?;
             }
-            PdEntry::DeleteBG(bg_id) => {
-                info!("Apply DeleteBG bg_id={}", bg_id);
-                self.bg_manager.apply_delete_bg(bg_id)?;
+            PdEntry::DeleteBG(ref entry) => {
+                info!("Apply DeleteBG bg_id={}", entry.bg_id);
+                self.bg_manager.apply_delete_bg(entry)?;
             }
             PdEntry::BatchBG(entry) => {
                 info!(
@@ -178,6 +178,7 @@ impl AppStorage for PdAppStorage {
         self.node_manager.restore()?;
         self.pool_manager.restore()?;
         self.bg_manager.restore()?;
+        self.bg_manager.restore_active_snapshot();
         self.meta_manager.restore()?;
         Ok(())
     }

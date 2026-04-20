@@ -1,26 +1,30 @@
-use super::CheckerContext;
-use crate::pd::bg::placement::{check_violations, find_worst_replica};
-use crate::pd::schedule::operator::{BGOperator, OperatorBuilder, OperatorKind};
-use crate::pd::schedule::CoordinatorContext;
-use curvine_common::state::BlockGroupInfo;
-use std::sync::Arc;
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-pub struct PlacementRuleChecker {
-    ctx: Arc<CoordinatorContext>,
-}
+use crate::pd::bg::placement::{isolation_score, worst_replica};
+use crate::pd::schedule::operator::{BGOperator, OpPriority, OperatorBuilder, OperatorKind};
+use crate::pd::schedule::ManagerContext;
+use curvine_common::state::{BlockGroupInfo, ReplicaState};
 
-impl PlacementRuleChecker {
-    pub fn new(ctx: Arc<CoordinatorContext>) -> Self {
-        Self { ctx }
-    }
-}
+pub struct PlacementRuleChecker;
 
 impl super::Checker for PlacementRuleChecker {
     fn name(&self) -> &str {
         "placement-rule-checker"
     }
 
-    fn check_bg(&self, bg: &BlockGroupInfo, ctx: &CheckerContext<'_>) -> Option<BGOperator> {
+    fn check_bg(&self, bg: &BlockGroupInfo, ctx: &ManagerContext) -> Option<BGOperator> {
         if !ctx.config_manager.get_bool(
             crate::pd::config::keys::PD_SCHEDULE_PLACEMENT_CHECK_ENABLED,
             crate::pd::config::keys::PD_SCHEDULE_PLACEMENT_CHECK_ENABLED_DEFAULT,
@@ -28,36 +32,29 @@ impl super::Checker for PlacementRuleChecker {
             return None;
         }
 
+        let rule = ctx.bg_manager.placement_rule();
+        if rule.is_empty() {
+            return None;
+        }
+
+        let resident = ctx.bg_manager.get_resident_replicas(bg.bg_id);
+        let worker_labels = ctx.pool_manager.get_workers_labels(&resident);
+
+        let worst_worker = worst_replica(&resident, &rule, &worker_labels)?;
+        let current_score = isolation_score(&resident, &rule.location_labels, &worker_labels);
+
         let pool_id = (bg.table_id >> 16) as u16;
-        let rules = ctx.bg_manager.get_pool_placement_rules(pool_id);
-
-        if rules
-            .iter()
-            .all(|r| r.label_constraints.is_empty() && r.location_labels.is_empty())
-        {
-            return None;
-        }
-
-        let worker_labels = ctx.pool_manager.get_workers_labels(&bg.replica_set);
-        let current_violations = check_violations(&bg.replica_set, &rules, &worker_labels);
-
-        if !current_violations.has_violation() {
-            return None;
-        }
-
-        let (worst_worker, _score) = find_worst_replica(&bg.replica_set, &rules, &worker_labels)?;
-
         let all_worker_ids: Vec<u32> = ctx.pool_manager.get_live_workers(pool_id);
         let all_worker_labels = ctx.pool_manager.get_workers_labels(&all_worker_ids);
 
         let mut best_replacement = None;
-        let mut best_violations_total = current_violations.total();
+        let mut best_score = current_score;
 
         for &candidate in &all_worker_ids {
-            if bg.replica_set.contains(&candidate) {
+            if resident.contains(&candidate) {
                 continue;
             }
-            let mut new_set = bg.replica_set.clone();
+            let mut new_set = resident.clone();
             if let Some(pos) = new_set.iter().position(|&w| w == worst_worker) {
                 new_set[pos] = candidate;
             }
@@ -67,10 +64,18 @@ impl super::Checker for PlacementRuleChecker {
                 combined_labels.insert(candidate, lbl.clone());
             }
 
-            let new_violations = check_violations(&new_set, &rules, &combined_labels);
-            if new_violations.total() < best_violations_total {
+            let passes = combined_labels
+                .get(&candidate)
+                .map(|l| rule.label_constraints.iter().all(|lc| lc.matches(l)))
+                .unwrap_or(rule.label_constraints.is_empty());
+            if !passes {
+                continue;
+            }
+
+            let new_score = isolation_score(&new_set, &rule.location_labels, &combined_labels);
+            if new_score > best_score {
                 best_replacement = Some(candidate);
-                best_violations_total = new_violations.total();
+                best_score = new_score;
             }
         }
 
@@ -80,16 +85,14 @@ impl super::Checker for PlacementRuleChecker {
             OperatorKind::Balance,
             bg.bg_id,
             format!(
-                "Placement fix: replace {} with {} (violations {} -> {})",
-                worst_worker,
-                new_worker,
-                current_violations.total(),
-                best_violations_total,
+                "Placement fix: replace {} with {} (score {:.0} -> {:.0})",
+                worst_worker, new_worker, current_score, best_score,
             ),
         )
         .bg_epoch(bg.bg_epoch)
-        .priority(90)
-        .add_replica(new_worker);
+        .priority(OpPriority::PLACEMENT_FIX)
+        .add_replica(new_worker)
+        .wait_replica_ready(new_worker, ReplicaState::Active);
 
         if bg
             .lease_owner
@@ -112,18 +115,18 @@ impl super::Checker for PlacementRuleChecker {
     }
 
     fn priority(&self) -> u32 {
-        30
+        super::CheckerPriority::PLACEMENT_RULE
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pd::schedule::checker::{Checker, CheckerContext};
+    use crate::pd::schedule::checker::Checker;
     use curvine_common::state::{BGLease, BGOpState, BGState, BlockGroupInfo};
 
-    fn test_ctx() -> Arc<CoordinatorContext> {
-        crate::pd::schedule::checker::tests_common::test_coordinator_context(
+    fn test_ctx() -> std::sync::Arc<ManagerContext> {
+        crate::pd::schedule::checker::tests_common::test_context(
             std::collections::HashMap::new(),
         )
     }
@@ -146,31 +149,23 @@ mod tests {
         }
     }
 
-    fn checker_ctx(ctx: &CoordinatorContext) -> CheckerContext<'_> {
-        CheckerContext {
-            pool_manager: &ctx.pool_manager,
-            bg_manager: &ctx.bg_manager,
-            node_manager: &ctx.node_manager,
-            config_manager: &ctx.config_manager,
-        }
-    }
-
     #[test]
     fn no_ops_when_no_rules() {
         let ctx = test_ctx();
-        let checker = PlacementRuleChecker::new(ctx.clone());
+        let checker = PlacementRuleChecker;
         let bg = make_bg(1, 0x0001_0001, vec![100, 101, 102]);
         ctx.bg_manager
-            .apply_create_bg(&crate::pd::journal::entry::BGEntry { op_ms: 0, info: bg.clone() })
+            .apply_create_bg(&crate::pd::journal::entry::BGEntry {
+                op_ms: 0,
+                info: bg.clone(),
+            })
             .unwrap();
-        let cctx = checker_ctx(&ctx);
-        assert!(checker.check_bg(&bg, &cctx).is_none());
+        assert!(checker.check_bg(&bg, &ctx).is_none());
     }
 
     #[test]
     fn name_and_priority() {
-        let ctx = test_ctx();
-        let checker = PlacementRuleChecker::new(ctx);
+        let checker = PlacementRuleChecker;
         assert_eq!(checker.name(), "placement-rule-checker");
         assert_eq!(checker.priority(), 30);
     }

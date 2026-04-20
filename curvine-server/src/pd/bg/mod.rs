@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod id_allocator;
 mod manager;
 pub mod placement;
 pub mod state_machine;
 mod store;
 mod table;
 
+pub use curvine_common::state::BGTableSummary;
+pub use id_allocator::IdAllocator;
 pub use manager::BGManager;
 pub use store::BGStore;
 pub use table::BGTable;
-pub use curvine_common::state::BGTableSummary;

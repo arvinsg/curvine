@@ -85,6 +85,14 @@ pub struct PdConf {
     /// Dynamic config defaults. key → default_value (String).
     #[serde(default)]
     pub dynamic_config: HashMap<String, String>,
+
+    /// Scheduler runtime IO threads (default 1).
+    #[serde(default)]
+    pub scheduler_io_threads: usize,
+
+    /// Scheduler runtime worker threads (default 4).
+    #[serde(default)]
+    pub scheduler_worker_threads: usize,
 }
 
 impl Default for PdConf {
@@ -107,6 +115,8 @@ impl Default for PdConf {
             location_labels: Vec::new(),
             // dynamic_config is populated from pd config file (if any).
             dynamic_config: HashMap::new(),
+            scheduler_io_threads: 2,
+            scheduler_worker_threads: 8,
         }
     }
 }
@@ -192,5 +202,5 @@ fn default_bucket_count() -> u32 {
 }
 
 fn default_replica_counts() -> Vec<u16> {
-    vec![3]
+    vec![1, 3]
 }

@@ -60,7 +60,7 @@ pub struct BGEntry {
     pub info: BlockGroupInfo,
 }
 
-/// BG update entry (Raft log)
+/// BG update entry (Raft log).
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct BGUpdateEntry {
     pub op_ms: u64,
@@ -68,8 +68,8 @@ pub struct BGUpdateEntry {
     pub state: Option<curvine_common::state::BGState>,
     pub replica_set: Option<Vec<u32>>,
     pub lease_owner: Option<BGLease>,
-    #[serde(default)]
-    pub bg_epoch: Option<u64>,
+    pub new_bg_epoch: u64,
+    pub new_table_epoch: Option<u64>,
 }
 
 /// Batch BG entry (Raft log) — atomically applies table + multiple BG creates/updates.
@@ -82,6 +82,17 @@ pub struct BatchBGEntry {
     /// If present, updates the next BG ID counter atomically with other changes.
     #[serde(default)]
     pub next_bg_id: Option<u32>,
+    #[serde(default)]
+    pub new_table_epoch: Option<(u32, u64)>,
+}
+
+/// BG delete entry (Raft log).
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct BGDeleteEntry {
+    pub op_ms: u64,
+    pub bg_id: u32,
+    pub table_id: u32,
+    pub new_table_epoch: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -102,7 +113,7 @@ pub enum PdEntry {
     // BG management
     CreateBG(BGEntry),
     UpdateBG(BGUpdateEntry),
-    DeleteBG(u32),
+    DeleteBG(BGDeleteEntry),
     BatchBG(BatchBGEntry),
 
     // Path route (MetaNode Federation static mode)

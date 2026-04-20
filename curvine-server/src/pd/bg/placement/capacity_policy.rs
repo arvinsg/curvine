@@ -14,27 +14,80 @@
 
 use super::context::PlacementContext;
 use super::policy::{
-    build_effective_counts, classify_replica, compute_equal_quota, filter_bg_targets,
-    filter_lease_targets, should_rebalance_bg, should_rebalance_lease, BalancePolicy, PolicyState,
-    ReplicaDecision,
+    build_effective_counts, classify_replica, compute_equal_quota, select_lease_by_hunger,
+    is_bg_overloaded, is_lease_overloaded, PlacementPolicy, PolicyState, ReplicaDecision,
 };
 use curvine_common::state::BlockGroupInfo;
-use curvine_common::FsResult;
+use curvine_common::{FsError, FsResult};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
-/// Capacity-weighted balance policy.
+/// Capacity-weighted placement policy.
 ///
-/// BG quota: proportional to worker disk capacity (`total_slots × capacity_i / total_capacity`).
-/// Lease quota: equal-weight (`bucket_count / num_workers`), same as QuotaBalancePolicy.
-pub struct CapacityBalancePolicy;
+/// BG quota: proportional to worker disk capacity.
+/// Lease quota: equal-weight.
+/// Selection: weighted-random blending BG hunger + capacity proportion.
+pub struct CapacityPolicy {
+    bg_weight: f64,
+    capacity_weight: f64,
+    rng: Mutex<StdRng>,
+}
 
-impl CapacityBalancePolicy {
+impl CapacityPolicy {
     pub fn new() -> Self {
-        Self
+        Self {
+            bg_weight: 0.6,
+            capacity_weight: 0.4,
+            rng: Mutex::new(StdRng::from_entropy()),
+        }
+    }
+
+    pub fn with_seed(seed: u64) -> Self {
+        Self {
+            bg_weight: 0.6,
+            capacity_weight: 0.4,
+            rng: Mutex::new(StdRng::seed_from_u64(seed)),
+        }
+    }
+
+    fn compute_weight(&self, wid: u32, st: &PolicyState, ctx: &PlacementContext<'_>) -> f64 {
+        let effective = st
+            .worker_bg_effective
+            .get(&wid)
+            .copied()
+            .unwrap_or(0)
+            .max(0) as u32;
+        let quota = st.worker_bg_quota.get(&wid).copied().unwrap_or(0);
+
+        let bg_score = if quota == 0 {
+            0.0
+        } else {
+            (quota as f64 - effective as f64) / quota as f64
+        };
+
+        let cap = ctx
+            .workers
+            .get(&wid)
+            .map(|s| s.available_bytes())
+            .unwrap_or(0) as f64;
+        let total_cap: f64 = ctx
+            .workers
+            .values()
+            .map(|s| s.available_bytes() as f64)
+            .sum();
+        let cap_score = if total_cap == 0.0 {
+            1.0
+        } else {
+            cap / total_cap
+        };
+
+        (self.bg_weight * bg_score + self.capacity_weight * cap_score).max(0.01)
     }
 }
 
-impl Default for CapacityBalancePolicy {
+impl Default for CapacityPolicy {
     fn default() -> Self {
         Self::new()
     }
@@ -48,11 +101,7 @@ fn compute_capacity_weighted_quota(
         return HashMap::new();
     }
 
-    let total_capacity: u64 = ctx
-        .workers
-        .values()
-        .map(|snap| snap.capacity_bytes)
-        .sum();
+    let total_capacity: u64 = ctx.workers.values().map(|s| s.capacity_bytes).sum();
 
     if total_capacity == 0 {
         let worker_ids: Vec<u32> = ctx.worker_ids();
@@ -66,7 +115,7 @@ fn compute_capacity_weighted_quota(
         .iter()
         .map(|(&wid, snap)| {
             let quota = if snap.capacity_bytes == 0 {
-                0 // Not yet reported, don't allocate.
+                0
             } else {
                 (t * (snap.capacity_bytes as f64 / c)).round() as u32
             };
@@ -75,21 +124,16 @@ fn compute_capacity_weighted_quota(
         .collect()
 }
 
-impl BalancePolicy for CapacityBalancePolicy {
+impl PlacementPolicy for CapacityPolicy {
     fn name(&self) -> &str {
         "capacity"
     }
 
     fn prepare(&self, ctx: &PlacementContext<'_>) -> FsResult<PolicyState> {
         let total_slots = ctx.total_bg_slots();
-
-        // BG quota: capacity-weighted.
         let worker_bg_quota = compute_capacity_weighted_quota(ctx, total_slots);
-
-        // Lease quota: equal-weight (same as QuotaBalancePolicy).
         let worker_ids: Vec<u32> = ctx.worker_ids();
         let worker_lease_quota = compute_equal_quota(&worker_ids, ctx.bucket_count);
-
         let (worker_bg_effective, worker_lease_effective) = build_effective_counts(ctx);
 
         Ok(PolicyState {
@@ -97,8 +141,6 @@ impl BalancePolicy for CapacityBalancePolicy {
             worker_lease_quota,
             worker_bg_effective,
             worker_lease_effective,
-            bg_load_score: HashMap::new(),
-            lease_load_score: HashMap::new(),
         })
     }
 
@@ -113,41 +155,76 @@ impl BalancePolicy for CapacityBalancePolicy {
         classify_replica(ctx, st, bg, pos, live_workers)
     }
 
-    fn should_rebalance_bg_from(
-        &self,
-        ctx: &PlacementContext<'_>,
-        st: &PolicyState,
-        worker_id: u32,
-    ) -> bool {
-        should_rebalance_bg(ctx, st, worker_id)
+    fn is_bg_overloaded(&self, ctx: &PlacementContext<'_>, st: &PolicyState, wid: u32) -> bool {
+        is_bg_overloaded(ctx, st, wid)
     }
 
-    fn should_rebalance_lease_from(
-        &self,
-        ctx: &PlacementContext<'_>,
-        st: &PolicyState,
-        worker_id: u32,
-    ) -> bool {
-        should_rebalance_lease(ctx, st, worker_id)
+    fn is_lease_overloaded(&self, ctx: &PlacementContext<'_>, st: &PolicyState, wid: u32) -> bool {
+        is_lease_overloaded(ctx, st, wid)
     }
 
-    fn filter_bg_targets(
+    fn select_bg_targets(
         &self,
         ctx: &PlacementContext<'_>,
         st: &PolicyState,
-        candidate_ids: &[u32],
+        candidates: &[u32],
+        count: usize,
         exclude: &HashSet<u32>,
-    ) -> Vec<u32> {
-        filter_bg_targets(ctx, st, candidate_ids, exclude)
+    ) -> FsResult<Vec<u32>> {
+        let weighted: Vec<(u32, f64)> = candidates
+            .iter()
+            .copied()
+            .filter(|wid| !exclude.contains(wid))
+            .map(|wid| (wid, self.compute_weight(wid, st, ctx)))
+            .collect();
+
+        if weighted.is_empty() {
+            return Err(FsError::common("no eligible BG target".to_string()));
+        }
+
+        let mut rng = self.rng.lock().unwrap();
+        let mut total_weight: f64 = weighted.iter().map(|(_, w)| w).sum();
+        let mut selected: Vec<u32> = Vec::with_capacity(count);
+        let mut selected_set: HashSet<u32> = HashSet::with_capacity(count);
+
+        for _ in 0..count {
+            if total_weight <= 0.0 {
+                break;
+            }
+            let r = rng.gen_range(0.0..total_weight);
+            let mut cumulative = 0.0;
+            let mut picked = None;
+
+            for &(wid, weight) in &weighted {
+                if selected_set.contains(&wid) {
+                    continue;
+                }
+                cumulative += weight;
+                if cumulative >= r {
+                    picked = Some((wid, weight));
+                    break;
+                }
+            }
+
+            match picked {
+                Some((wid, weight)) => {
+                    selected.push(wid);
+                    selected_set.insert(wid);
+                    total_weight -= weight;
+                }
+                None => break,
+            }
+        }
+
+        if selected.is_empty() {
+            return Err(FsError::common("no eligible BG target".to_string()));
+        }
+        Ok(selected)
     }
 
-    fn filter_lease_targets(
-        &self,
-        ctx: &PlacementContext<'_>,
-        st: &PolicyState,
-        candidate_ids: &[u32],
-    ) -> Vec<u32> {
-        filter_lease_targets(ctx, st, candidate_ids)
+    fn select_lease_owner(&self, st: &PolicyState, candidates: &[u32]) -> FsResult<u32> {
+        select_lease_by_hunger(st, candidates)
+            .ok_or_else(|| FsError::common("no eligible lease owner".to_string()))
     }
 }
 
@@ -173,7 +250,6 @@ mod tests {
 
     #[test]
     fn test_capacity_weighted_quota_heterogeneous() {
-        // A=4TB, B=4TB, C=2TB
         let mut workers = HashMap::new();
         workers.insert(1, make_snapshot(1, 0, 4_000_000));
         workers.insert(2, make_snapshot(2, 0, 4_000_000));
@@ -187,10 +263,9 @@ mod tests {
             lease_tolerant_ratio: 0.1,
         };
 
-        let policy = CapacityBalancePolicy::new();
+        let policy = CapacityPolicy::new();
         let st = policy.prepare(&ctx).unwrap();
 
-        // A and B (equal capacity) should get equal quota, both > C.
         assert_eq!(st.worker_bg_quota[&1], st.worker_bg_quota[&2]);
         assert!(st.worker_bg_quota[&1] > st.worker_bg_quota[&3]);
     }
@@ -210,10 +285,9 @@ mod tests {
             lease_tolerant_ratio: 0.1,
         };
 
-        let policy = CapacityBalancePolicy::new();
+        let policy = CapacityPolicy::new();
         let st = policy.prepare(&ctx).unwrap();
 
-        // Equal capacity → equal quota (± rounding).
         let max = *st.worker_bg_quota.values().max().unwrap();
         let min = *st.worker_bg_quota.values().min().unwrap();
         assert!(max - min <= 1);
@@ -223,7 +297,7 @@ mod tests {
     fn test_capacity_zero_worker_gets_zero_quota() {
         let mut workers = HashMap::new();
         workers.insert(1, make_snapshot(1, 0, 1000));
-        workers.insert(2, make_snapshot(2, 0, 0)); // not yet reported
+        workers.insert(2, make_snapshot(2, 0, 0));
 
         let ctx = PlacementContext {
             workers: &workers,
@@ -233,10 +307,9 @@ mod tests {
             lease_tolerant_ratio: 0.1,
         };
 
-        let policy = CapacityBalancePolicy::new();
+        let policy = CapacityPolicy::new();
         let st = policy.prepare(&ctx).unwrap();
 
-        // Worker 1 should get all 8 slots, worker 2 gets 0.
         assert_eq!(st.worker_bg_quota[&1], 8);
         assert_eq!(st.worker_bg_quota[&2], 0);
     }
@@ -255,18 +328,15 @@ mod tests {
             lease_tolerant_ratio: 0.1,
         };
 
-        let policy = CapacityBalancePolicy::new();
+        let policy = CapacityPolicy::new();
         let st = policy.prepare(&ctx).unwrap();
 
-        // Lease quota should be equal regardless of capacity.
         assert_eq!(st.worker_lease_quota[&1], 4);
         assert_eq!(st.worker_lease_quota[&2], 4);
     }
 
     #[test]
     fn test_should_rebalance_with_capacity_quota() {
-        // Worker 1: capacity 4TB, quota ~6.4→6, actual 8 → over quota
-        // Worker 2: capacity 1TB, quota ~1.6→2, actual 0 → not over quota
         let mut workers = HashMap::new();
         workers.insert(1, make_snapshot(1, 8, 4000));
         workers.insert(2, make_snapshot(2, 0, 1000));
@@ -274,16 +344,15 @@ mod tests {
         let ctx = PlacementContext {
             workers: &workers,
             bucket_count: 4,
-            replica_count: 2, // total=8
+            replica_count: 2,
             tolerant_ratio: 0.1,
             lease_tolerant_ratio: 0.1,
         };
 
-        let policy = CapacityBalancePolicy::new();
+        let policy = CapacityPolicy::new();
         let st = policy.prepare(&ctx).unwrap();
 
-        // Worker 1 quota ≈ 6, tolerant ≈ 1, threshold ≈ 7, actual 8 > 7 → rebalance
-        assert!(policy.should_rebalance_bg_from(&ctx, &st, 1));
-        assert!(!policy.should_rebalance_bg_from(&ctx, &st, 2));
+        assert!(policy.is_bg_overloaded(&ctx, &st, 1));
+        assert!(!policy.is_bg_overloaded(&ctx, &st, 2));
     }
 }

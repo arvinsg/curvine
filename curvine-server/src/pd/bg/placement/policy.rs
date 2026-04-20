@@ -24,7 +24,6 @@ pub enum ReplicaReplaceReason {
     OverQuota,
 }
 
-/// Decision for a single replica position during rebuild.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicaDecision {
     Keep,
@@ -32,7 +31,6 @@ pub enum ReplicaDecision {
     TryReplace(ReplicaReplaceReason),
 }
 
-/// Guardrail for single-BG replacement budget during rebuild.
 pub struct RebuildOptions {
     pub max_replace_ratio: f64,
     pub min_keep_replicas: u16,
@@ -55,26 +53,14 @@ impl RebuildOptions {
     }
 }
 
-/// Mutable state produced by `BalancePolicy::prepare()`, updated during build/rebuild.
 pub struct PolicyState {
-    /// BG quota per worker (equal-weight or capacity-weighted, by policy).
     pub worker_bg_quota: HashMap<u32, u32>,
-    /// Lease quota per worker (typically equal-weight).
     pub worker_lease_quota: HashMap<u32, u32>,
-
-    /// Dynamic effective BG count. Initialized from snapshot, updated per assignment.
     pub worker_bg_effective: HashMap<u32, i64>,
-    /// Dynamic effective lease count. Same lifecycle.
     pub worker_lease_effective: HashMap<u32, i64>,
-
-    /// Strategy-specific BG load scores.
-    pub bg_load_score: HashMap<u32, f64>,
-    /// Strategy-specific lease load scores.
-    pub lease_load_score: HashMap<u32, f64>,
 }
 
 impl PolicyState {
-    /// Update effective BG counts after a replica replacement or assignment.
     pub fn record_bg_change(&mut self, old_worker: Option<u32>, new_worker: u32) {
         if let Some(old) = old_worker {
             if let Some(v) = self.worker_bg_effective.get_mut(&old) {
@@ -84,7 +70,6 @@ impl PolicyState {
         *self.worker_bg_effective.entry(new_worker).or_insert(0) += 1;
     }
 
-    /// Update effective lease counts after a lease transfer or assignment.
     pub fn record_lease_change(&mut self, old_owner: Option<u32>, new_owner: u32) {
         if let Some(old) = old_owner {
             if let Some(v) = self.worker_lease_effective.get_mut(&old) {
@@ -95,19 +80,12 @@ impl PolicyState {
     }
 }
 
-/// Unified load judgment for rebuild, BG balance, and lease balance.
-///
-/// - `prepare`: pre-compute quotas, effective counts, scores from snapshot.
-/// - `classify_replica`: rebuild — decide if a replica position should be replaced.
-/// - `should_rebalance_*_from`: balance — identify overloaded source workers.
-/// - `filter_*_targets`: prune candidate list before selector picks.
-pub trait BalancePolicy: Send + Sync {
+/// Unified placement policy: quota computation + source identification + target selection.
+pub trait PlacementPolicy: Send + Sync {
     fn name(&self) -> &str;
 
-    /// Pre-compute quotas and effective counts from the immutable snapshot.
     fn prepare(&self, ctx: &PlacementContext<'_>) -> FsResult<PolicyState>;
 
-    /// Classify a replica position during rebuild.
     fn classify_replica(
         &self,
         ctx: &PlacementContext<'_>,
@@ -117,38 +95,33 @@ pub trait BalancePolicy: Send + Sync {
         live_workers: &HashSet<u32>,
     ) -> ReplicaDecision;
 
-    /// Should this worker be a BG rebalance source? (balance scenario)
-    fn should_rebalance_bg_from(
+    fn is_bg_overloaded(
         &self,
         ctx: &PlacementContext<'_>,
         st: &PolicyState,
         worker_id: u32,
     ) -> bool;
 
-    /// Should this worker be a lease rebalance source? (balance scenario)
-    fn should_rebalance_lease_from(
+    fn is_lease_overloaded(
         &self,
         ctx: &PlacementContext<'_>,
         st: &PolicyState,
         worker_id: u32,
     ) -> bool;
 
-    /// Filter BG target candidates: remove overloaded/invalid workers.
-    fn filter_bg_targets(
+    /// Select up to `count` BG targets from `candidates`, excluding `exclude`.
+    /// Combines filtering (remove overloaded) + ranking (pick best) in one step.
+    fn select_bg_targets(
         &self,
         ctx: &PlacementContext<'_>,
         st: &PolicyState,
-        candidate_ids: &[u32],
+        candidates: &[u32],
+        count: usize,
         exclude: &HashSet<u32>,
-    ) -> Vec<u32>;
+    ) -> FsResult<Vec<u32>>;
 
-    /// Filter lease target candidates.
-    fn filter_lease_targets(
-        &self,
-        ctx: &PlacementContext<'_>,
-        st: &PolicyState,
-        candidate_ids: &[u32],
-    ) -> Vec<u32>;
+    /// Select a lease owner from candidates.
+    fn select_lease_owner(&self, st: &PolicyState, candidates: &[u32]) -> FsResult<u32>;
 }
 
 pub fn compute_equal_quota(worker_ids: &[u32], total: u32) -> HashMap<u32, u32> {
@@ -214,14 +187,14 @@ pub fn classify_replica(
     ReplicaDecision::Keep
 }
 
-pub fn should_rebalance_bg(ctx: &PlacementContext<'_>, st: &PolicyState, worker_id: u32) -> bool {
+pub fn is_bg_overloaded(ctx: &PlacementContext<'_>, st: &PolicyState, worker_id: u32) -> bool {
     let effective = st.worker_bg_effective.get(&worker_id).copied().unwrap_or(0);
     let quota = st.worker_bg_quota.get(&worker_id).copied().unwrap_or(0);
     let threshold = quota + tolerant(quota, ctx.tolerant_ratio);
     effective > threshold as i64
 }
 
-pub fn should_rebalance_lease(
+pub fn is_lease_overloaded(
     ctx: &PlacementContext<'_>,
     st: &PolicyState,
     worker_id: u32,
@@ -236,38 +209,74 @@ pub fn should_rebalance_lease(
     effective > threshold as i64
 }
 
-pub fn filter_bg_targets(
-    ctx: &PlacementContext<'_>,
+/// Hunger-based BG target selection (shared by QuotaPolicy).
+pub fn select_by_hunger(
     st: &PolicyState,
-    candidate_ids: &[u32],
+    candidates: &[u32],
+    count: usize,
     exclude: &HashSet<u32>,
 ) -> Vec<u32> {
-    candidate_ids
+    let mut eligible: Vec<(u32, i64)> = candidates
         .iter()
         .copied()
         .filter(|wid| !exclude.contains(wid))
-        .filter(|wid| {
-            let effective = st.worker_bg_effective.get(wid).copied().unwrap_or(0);
-            let quota = st.worker_bg_quota.get(wid).copied().unwrap_or(0);
-            let threshold = quota + tolerant(quota, ctx.tolerant_ratio);
-            effective < threshold as i64
+        .map(|wid| {
+            let quota = st.worker_bg_quota.get(&wid).copied().unwrap_or(0) as i64;
+            let effective = st.worker_bg_effective.get(&wid).copied().unwrap_or(0);
+            (wid, quota - effective)
         })
+        .collect();
+    eligible.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    eligible
+        .into_iter()
+        .take(count)
+        .map(|(wid, _)| wid)
         .collect()
 }
 
-pub fn filter_lease_targets(
-    ctx: &PlacementContext<'_>,
+/// Hunger-based lease owner selection (lowest lease effective wins).
+pub fn select_lease_by_hunger(st: &PolicyState, candidates: &[u32]) -> Option<u32> {
+    candidates.iter().copied().min_by_key(|&wid| {
+        let quota = st.worker_lease_quota.get(&wid).copied().unwrap_or(0) as i64;
+        let effective = st.worker_lease_effective.get(&wid).copied().unwrap_or(0);
+        (-(quota - effective), wid)
+    })
+}
+
+pub fn is_bg_gap_sufficient(
     st: &PolicyState,
-    candidate_ids: &[u32],
-) -> Vec<u32> {
-    candidate_ids
-        .iter()
+    source_id: u32,
+    target_id: u32,
+    tolerant_ratio: f64,
+) -> bool {
+    let src = st.worker_bg_effective.get(&source_id).copied().unwrap_or(0);
+    let tgt = st.worker_bg_effective.get(&target_id).copied().unwrap_or(0);
+    let src_quota = st.worker_bg_quota.get(&source_id).copied().unwrap_or(0);
+    let tgt_quota = st.worker_bg_quota.get(&target_id).copied().unwrap_or(0);
+    let avg_quota = (src_quota + tgt_quota) / 2;
+    let tol = tolerant(avg_quota, tolerant_ratio) as i64;
+    src - tgt > 2 * tol
+}
+
+pub fn is_lease_gap_sufficient(
+    st: &PolicyState,
+    source_id: u32,
+    target_id: u32,
+    tolerant_ratio: f64,
+) -> bool {
+    let src = st
+        .worker_lease_effective
+        .get(&source_id)
         .copied()
-        .filter(|wid| {
-            let effective = st.worker_lease_effective.get(wid).copied().unwrap_or(0);
-            let quota = st.worker_lease_quota.get(wid).copied().unwrap_or(0);
-            let threshold = quota + tolerant(quota, ctx.lease_tolerant_ratio);
-            effective < threshold as i64
-        })
-        .collect()
+        .unwrap_or(0);
+    let tgt = st
+        .worker_lease_effective
+        .get(&target_id)
+        .copied()
+        .unwrap_or(0);
+    let src_quota = st.worker_lease_quota.get(&source_id).copied().unwrap_or(0);
+    let tgt_quota = st.worker_lease_quota.get(&target_id).copied().unwrap_or(0);
+    let avg_quota = (src_quota + tgt_quota) / 2;
+    let tol = tolerant(avg_quota, tolerant_ratio) as i64;
+    src - tgt > 2 * tol
 }

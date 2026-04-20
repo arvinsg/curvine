@@ -90,7 +90,7 @@ impl PoolManager {
             self.journal_client
                 .propose(crate::pd::journal::PdEntry::SavePool(entry))?;
             // Re-acquire lock for next iteration
-            return self.ensure_default_pools(); // Recursive retry after propose
+            return self.ensure_default_pools();
         }
         Ok(())
     }

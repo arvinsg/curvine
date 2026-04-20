@@ -1,10 +1,10 @@
-use super::{Scheduler, SchedulerContext};
+use super::Scheduler;
 use crate::pd::node::{NodeEvent, NodeEventType};
-use crate::pd::schedule::operator::BGOperator;
-use crate::pd::schedule::CoordinatorContext;
-use curvine_common::state::NodeType;
-use curvine_common::FsResult;
+use crate::pd::schedule::operator::{BGOperator, OpPriority, OperatorBuilder, OperatorKind};
+use crate::pd::schedule::ManagerContext;
+use curvine_common::state::{BGOpState, NodeType, ReplicaState};
 use dashmap::DashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,13 +25,18 @@ pub struct RebuildTask {
 
 /// BGTable scheduler: handles initial table creation and event-driven rebuild
 /// with cooldown and reason merging.
+///
+/// `check_table_initialization` proposes new tables directly via Raft (no concurrent
+/// state to conflict with — new table). Rebuild produces `Rebuild` operators that
+/// flow through the operator pipeline (with Burst-class rate limiting for fast
+/// post-expansion rebalance).
 pub struct BGTableScheduler {
-    ctx: Arc<CoordinatorContext>,
+    ctx: Arc<ManagerContext>,
     pending_rebuilds: DashMap<u16, RebuildTask>,
 }
 
 impl BGTableScheduler {
-    pub fn new(ctx: Arc<CoordinatorContext>) -> Self {
+    pub fn new(ctx: Arc<ManagerContext>) -> Self {
         Self {
             ctx,
             pending_rebuilds: DashMap::new(),
@@ -92,6 +97,13 @@ impl BGTableScheduler {
                     .filter(|w| self.ctx.pool_manager.is_worker_available(*w))
                     .collect();
                 if workers.len() < replica_count as usize {
+                    log::warn!(
+                        "No enough workers for pool {} with {} buckets, {} replicas, {} workers",
+                        pool.pool_id,
+                        bucket_count,
+                        replica_count,
+                        workers.len()
+                    );
                     continue;
                 }
                 log::info!(
@@ -107,32 +119,92 @@ impl BGTableScheduler {
                     replica_count,
                     &workers,
                 ) {
-                    log::error!(
-                        "Failed to create BGTable for pool {}: {}",
-                        pool.pool_id,
-                        e
-                    );
+                    log::error!("Failed to create BGTable for pool {}: {}", pool.pool_id, e);
                 }
             }
         }
     }
 
-    fn execute_rebuild(
-        &self,
-        pool_id: u16,
-        reason: &RebuildReason,
-    ) -> curvine_common::FsResult<()> {
-        log::info!(
-            "Rebuilding BGTable for pool {} (reason: {:?})",
-            pool_id,
-            reason
-        );
-        self.ctx.bg_manager.rebuild_tables_for_pool(pool_id)?;
-        log::info!("BGTable for pool {} rebuild completed", pool_id);
-        Ok(())
+    /// Compute rebuild diff for the pool's tables and produce Rebuild operators.
+    fn compute_rebuild_operators(&self, pool_id: u16) -> Vec<BGOperator> {
+        let mut ops = Vec::new();
+        let table_ids: Vec<u32> = self
+            .ctx
+            .bg_manager
+            .list_tables()
+            .into_iter()
+            .filter(|t| t.pool_id() == pool_id)
+            .map(|t| t.table_id)
+            .collect();
+
+        for table_id in table_ids {
+            let diff = match self.ctx.bg_manager.compute_rebuild_diff(table_id) {
+                Ok(d) => d,
+                Err(e) => {
+                    log::error!("compute_rebuild_diff for table {} failed: {}", table_id, e);
+                    continue;
+                }
+            };
+
+            for (new_bg, old_replicas) in diff {
+                // Skip BGs already under operation.
+                if new_bg.op_state != BGOpState::Idle {
+                    continue;
+                }
+                let old_set: HashSet<u32> = old_replicas.iter().copied().collect();
+                let new_set: HashSet<u32> = new_bg.replica_set.iter().copied().collect();
+                let added: Vec<u32> = new_set.difference(&old_set).copied().collect();
+                let removed: Vec<u32> = old_set.difference(&new_set).copied().collect();
+                if added.is_empty() && removed.is_empty() {
+                    continue;
+                }
+
+                // Safety: limit single-round replacements to preserve Active replica count.
+                let max_replace = std::cmp::max(1, old_replicas.len() / 2);
+                let replace_count = std::cmp::min(added.len(), max_replace).min(removed.len());
+                let added = &added
+                    [..std::cmp::min(added.len(), replace_count.max(added.len().min(max_replace)))];
+                let removed = &removed[..std::cmp::min(removed.len(), replace_count.max(1))];
+
+                let mut builder = OperatorBuilder::new(
+                    OperatorKind::Rebuild,
+                    new_bg.bg_id,
+                    format!(
+                        "Rebuild bg {}: add {:?}, remove {:?}",
+                        new_bg.bg_id, added, removed
+                    ),
+                )
+                .bg_epoch(new_bg.bg_epoch.saturating_sub(1))
+                .priority(OpPriority::REBUILD);
+
+                for w in added {
+                    builder = builder.add_replica(*w);
+                    builder = builder.wait_replica_ready(*w, ReplicaState::Active);
+                }
+
+                // Lease transfer if owner changed.
+                if let Some(new_lease) = &new_bg.lease_owner {
+                    let old_owner = old_replicas
+                        .iter()
+                        .find(|w| !new_set.contains(w))
+                        .copied()
+                        .unwrap_or(0);
+                    if old_owner != 0 && old_owner != new_lease.node_id {
+                        builder = builder.transfer_lease(old_owner, new_lease.node_id);
+                    }
+                }
+
+                for w in removed {
+                    builder = builder.remove_replica(*w);
+                }
+
+                ops.push(builder.build());
+            }
+        }
+        ops
     }
 
-    fn check_and_execute_rebuilds(&self) {
+    fn check_and_execute_rebuilds(&self) -> Vec<BGOperator> {
         let now = orpc::common::LocalTime::mills();
         let ready: Vec<(u16, RebuildTask)> = self
             .pending_rebuilds
@@ -141,12 +213,17 @@ impl BGTableScheduler {
             .map(|e| (*e.key(), e.value().clone()))
             .collect();
 
+        let mut all_ops = Vec::new();
         for (pool_id, task) in ready {
             self.pending_rebuilds.remove(&pool_id);
-            if let Err(e) = self.execute_rebuild(pool_id, &task.reason) {
-                log::error!("Rebuild BGTable for pool {} failed: {}", pool_id, e);
-            }
+            log::info!(
+                "Rebuilding BGTable for pool {} (reason: {:?})",
+                pool_id,
+                task.reason
+            );
+            all_ops.extend(self.compute_rebuild_operators(pool_id));
         }
+        all_ops
     }
 }
 
@@ -155,17 +232,12 @@ impl Scheduler for BGTableScheduler {
         "bg-table-scheduler"
     }
 
-    fn scheduler_type(&self) -> &str {
-        "bg-table"
-    }
-
-    fn schedule(&self, _ctx: &SchedulerContext<'_>) -> Vec<BGOperator> {
+    fn schedule(&self, _ctx: &ManagerContext) -> Vec<BGOperator> {
         self.check_table_initialization();
-        self.check_and_execute_rebuilds();
-        Vec::new() // BGTableScheduler doesn't produce operators
+        self.check_and_execute_rebuilds()
     }
 
-    fn is_schedule_allowed(&self, _ctx: &SchedulerContext<'_>) -> bool {
+    fn is_schedule_allowed(&self, _ctx: &ManagerContext) -> bool {
         true
     }
 
@@ -214,13 +286,6 @@ impl Scheduler for BGTableScheduler {
             }
             _ => {}
         }
-    }
-
-    fn encode_config(&self) -> FsResult<serde_json::Value> {
-        Ok(serde_json::json!({
-            "type": self.scheduler_type(),
-            "pending_rebuilds": self.pending_rebuilds.len(),
-        }))
     }
 }
 
@@ -284,11 +349,10 @@ mod tests {
 
     #[test]
     fn name_and_type() {
-        let ctx = crate::pd::schedule::checker::tests_common::test_coordinator_context(
+        let ctx = crate::pd::schedule::checker::tests_common::test_context(
             std::collections::HashMap::new(),
         );
         let s = BGTableScheduler::new(ctx);
         assert_eq!(s.name(), "bg-table-scheduler");
-        assert_eq!(s.scheduler_type(), "bg-table");
     }
 }

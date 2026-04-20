@@ -25,6 +25,7 @@ use curvine_common::{FsError, FsResult};
 use dashmap::DashMap;
 use log::info;
 use orpc::common::LocalTime;
+use orpc::runtime::RpcRuntime;
 use std::sync::Arc;
 use std::sync::RwLock;
 use tokio::sync::broadcast;
@@ -432,24 +433,25 @@ impl NodeManager {
         )
     }
 
-    // TODO: 是否使用统一的 async
-    // ========== Internal liveness loop ==========
-
     /// Start the internal liveness detection loop.
-    /// This loop handles:
-    /// - Live→Lost detection (heartbeat timeout, memory-only)
-    /// - Lost→Offline promotion (recovery window exceeded, persisted via Raft)
-    pub fn start_liveness_loop(self: Arc<Self>) {
+    pub fn start_liveness_loop(
+        self: Arc<Self>,
+        runtime: Arc<orpc::runtime::Runtime>,
+        token: tokio_util::sync::CancellationToken,
+    ) {
         let mgr = self.clone();
-        tokio::spawn(async move {
-            mgr.liveness_loop().await;
+        runtime.spawn(async move {
+            mgr.liveness_loop(token).await;
         });
     }
 
-    async fn liveness_loop(&self) {
+    async fn liveness_loop(&self, token: tokio_util::sync::CancellationToken) {
         loop {
             let check_interval = self.liveness_check_interval_ms();
-            tokio::time::sleep(std::time::Duration::from_millis(check_interval)).await;
+            tokio::select! {
+                _ = token.cancelled() => break,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(check_interval)) => {}
+            }
 
             let now = LocalTime::mills();
 
@@ -497,6 +499,7 @@ impl NodeManager {
                 log::info!("Node {} recovered from Lost state", node_id);
             }
         }
+        log::info!("Liveness loop stopped");
     }
 
     /// Finish decommission: emit event and propose DeleteNode via Raft.

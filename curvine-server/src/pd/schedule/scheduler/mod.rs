@@ -14,56 +14,34 @@
 
 pub mod bg_balance;
 pub mod bg_table;
+pub mod decommission;
 pub mod lease_balance;
 pub mod stats;
 
-use crate::pd::bg::BGManager;
-use crate::pd::config::ConfigManager;
-use crate::pd::node::{NodeEvent, NodeManager};
-use crate::pd::pool::PoolManager;
+use crate::pd::bg::placement::context::PendingInfluence;
+use crate::pd::node::NodeEvent;
 use crate::pd::schedule::operator::BGOperator;
 use crate::pd::schedule::operator_controller::OperatorController;
-use curvine_common::FsResult;
+use crate::pd::schedule::ManagerContext;
 use std::time::Duration;
 
 /// Scheduler trait: proactive, optimization-driven scheduling.
 ///
 /// Schedulers differ from Checkers:
-/// - Checkers ensure correctness (always active, per-BG patrol)
+/// - Checkers ensure correctness (always active)
 /// - Schedulers optimize distribution (pluggable, pausable, adaptive intervals)
 pub trait Scheduler: Send + Sync {
-    /// Unique scheduler name.
     fn name(&self) -> &str;
 
-    /// Type name for registry and creation.
-    fn scheduler_type(&self) -> &str;
+    fn schedule(&self, ctx: &ManagerContext) -> Vec<BGOperator>;
 
-    /// Attempt to produce operators. Empty vec means no work found.
-    fn schedule(&self, ctx: &SchedulerContext<'_>) -> Vec<BGOperator>;
+    fn is_schedule_allowed(&self, ctx: &ManagerContext) -> bool;
 
-    /// Whether scheduling is currently allowed (check rate limits, etc).
-    fn is_schedule_allowed(&self, ctx: &SchedulerContext<'_>) -> bool;
-
-    /// Minimum scheduling interval.
     fn min_interval(&self) -> Duration;
 
-    /// Compute next interval based on current (for adaptive backoff).
     fn next_interval(&self, current: Duration) -> Duration;
 
-    /// Encode current config for API display.
-    fn encode_config(&self) -> FsResult<serde_json::Value>;
-
-    /// Handle node event (optional, default no-op).
     fn on_event(&self, _event: &NodeEvent) {}
-}
-
-/// Context passed to schedulers (read-only refs to managers + operator controller).
-pub struct SchedulerContext<'a> {
-    pub pool_manager: &'a PoolManager,
-    pub bg_manager: &'a BGManager,
-    pub node_manager: &'a NodeManager,
-    pub config_manager: &'a ConfigManager,
-    pub operator_controller: &'a OperatorController,
 }
 
 /// Default adaptive interval logic.
@@ -74,23 +52,29 @@ impl BaseScheduler {
     pub const MAX_INTERVAL: Duration = Duration::from_secs(5);
     const BACKOFF_FACTOR: f64 = 1.3;
 
-    /// Exponential backoff: current * 1.3, capped at MAX_INTERVAL.
     pub fn default_next_interval(current: Duration) -> Duration {
         let next_ms = (current.as_millis() as f64 * Self::BACKOFF_FACTOR) as u64;
         Duration::from_millis(next_ms).min(Self::MAX_INTERVAL)
     }
 }
 
+/// Extract pending influence from OperatorController into a pure data struct.
+pub fn build_pending_influence(oc: &OperatorController) -> PendingInfluence {
+    let (bg_delta, lease_delta) = oc.get_all_pending_deltas();
+    PendingInfluence {
+        bg_delta,
+        lease_delta,
+    }
+}
+
 /// Build the default set of schedulers.
-pub fn default_schedulers(
-    ctx: std::sync::Arc<super::CoordinatorContext>,
-    operator_controller: std::sync::Arc<OperatorController>,
-) -> Vec<Box<dyn Scheduler>> {
+pub fn default_schedulers(ctx: std::sync::Arc<ManagerContext>) -> Vec<Box<dyn Scheduler>> {
     vec![
-        Box::new(bg_balance::BGBalanceScheduler::new(ctx.clone())),
-        Box::new(lease_balance::LeaseBalanceScheduler::new(ctx.clone())),
+        Box::new(bg_balance::BGBalanceScheduler),
+        Box::new(lease_balance::LeaseBalanceScheduler),
         Box::new(bg_table::BGTableScheduler::new(ctx.clone())),
-        Box::new(stats::StatsScheduler::new(ctx, operator_controller)),
+        Box::new(decommission::DecommissionScheduler),
+        Box::new(stats::StatsScheduler::new()),
     ]
 }
 

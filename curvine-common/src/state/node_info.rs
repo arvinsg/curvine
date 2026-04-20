@@ -65,7 +65,8 @@ impl NodeInfo {
         match (&mut self.payload, &source.payload) {
             (NodePayload::Worker(ref mut dst), NodePayload::Worker(ref src)) => {
                 dst.storage_stats = src.storage_stats.clone();
-                dst.bg_ids = src.bg_ids.clone();
+                dst.bg_epochs = src.bg_epochs.clone();
+                dst.bg_reports = src.bg_reports.clone();
             }
             (NodePayload::Meta(ref mut dst), NodePayload::Meta(ref src)) => {
                 dst.stats = src.stats.clone();

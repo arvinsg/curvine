@@ -50,7 +50,6 @@ pub struct PdMetrics {
     // ---- BG ----
     pub(crate) bg_total: Gauge,
     pub(crate) bg_count: GaugeVec,
-    pub(crate) bg_suspect_count: Gauge,
     pub(crate) bg_used_bytes: Gauge,
     pub(crate) bg_block_count: Gauge,
 
@@ -164,10 +163,6 @@ impl PdMetrics {
                 "pd_bg_count",
                 "Number of block groups by state",
                 &["state"],
-            )?,
-            bg_suspect_count: m::new_gauge(
-                "pd_bg_suspect_count",
-                "Number of suspect block groups",
             )?,
             bg_used_bytes: m::new_gauge(
                 "pd_bg_used_bytes",
@@ -329,9 +324,6 @@ impl PdMetrics {
         }
         self.bg_used_bytes.set(total_used as i64);
         self.bg_block_count.set(total_blocks as i64);
-
-        self.bg_suspect_count
-            .set(self.bg_manager.suspect_count() as i64);
     }
 
     fn snapshot_bg_table_gauges(&self) {

@@ -12,18 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::operator::{BGCommands, BGOperator, OpStatus, OpStep};
+use super::operator::{BGCommands, BGOperator, OpStatus, OpStep, OperatorClass};
 use crate::pd::bg::BGManager;
 use crate::pd::config::ConfigManager;
 use crate::pd::pd_server::Pd;
-use curvine_common::state::BGOpState;
-use dashmap::DashMap;
+use curvine_common::state::{BGOpState, ReplicaState};
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
-
-// ========== Token Bucket ==========
 
 struct TokenBucket {
     rate: f64,
@@ -62,12 +59,38 @@ impl TokenBucket {
     }
 }
 
-// ========== Store Limiter ==========
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum StoreLimitType {
     AddReplica,
     RemoveReplica,
+    TransferLease,
+    /// Burst class for rebuild operators — separate quota allows fast bulk rebalance.
+    RebuildAddReplica,
+    RebuildRemoveReplica,
+}
+
+impl StoreLimitType {
+    fn for_step(step: &OpStep, class: OperatorClass) -> Option<Self> {
+        match (step, class) {
+            (OpStep::AddReplica { .. }, OperatorClass::Normal) => Some(Self::AddReplica),
+            (OpStep::RemoveReplica { .. }, OperatorClass::Normal) => Some(Self::RemoveReplica),
+            (OpStep::AddReplica { .. }, OperatorClass::Burst) => Some(Self::RebuildAddReplica),
+            (OpStep::RemoveReplica { .. }, OperatorClass::Burst) => {
+                Some(Self::RebuildRemoveReplica)
+            }
+            (OpStep::TransferLease { .. }, _) => Some(Self::TransferLease),
+            (OpStep::WaitReplicaReady { .. }, _) => None,
+        }
+    }
+
+    fn worker_id(step: &OpStep) -> u32 {
+        match step {
+            OpStep::AddReplica { worker_id } => *worker_id,
+            OpStep::RemoveReplica { worker_id } => *worker_id,
+            OpStep::TransferLease { from_worker, .. } => *from_worker,
+            OpStep::WaitReplicaReady { worker_id, .. } => *worker_id,
+        }
+    }
 }
 
 struct StoreLimiter {
@@ -107,33 +130,48 @@ impl StoreLimiter {
                 ) as f64;
                 (rate, capacity)
             }
+            StoreLimitType::TransferLease => {
+                let rate = self.config_manager.get_u32(
+                    crate::pd::config::keys::PD_SCHEDULE_STORE_LIMIT_TRANSFER_LEASE_RATE,
+                    crate::pd::config::keys::PD_SCHEDULE_STORE_LIMIT_TRANSFER_LEASE_RATE_DEFAULT,
+                ) as f64;
+                let capacity = self.config_manager.get_u32(
+                    crate::pd::config::keys::PD_SCHEDULE_STORE_LIMIT_TRANSFER_LEASE_CAPACITY,
+                    crate::pd::config::keys::PD_SCHEDULE_STORE_LIMIT_TRANSFER_LEASE_CAPACITY_DEFAULT,
+                ) as f64;
+                (rate, capacity)
+            }
+            StoreLimitType::RebuildAddReplica | StoreLimitType::RebuildRemoveReplica => {
+                let rate = self.config_manager.get_u32(
+                    crate::pd::config::keys::PD_SCHEDULE_STORE_LIMIT_REBUILD_RATE,
+                    crate::pd::config::keys::PD_SCHEDULE_STORE_LIMIT_REBUILD_RATE_DEFAULT,
+                ) as f64;
+                let capacity = self.config_manager.get_u32(
+                    crate::pd::config::keys::PD_SCHEDULE_STORE_LIMIT_REBUILD_CAPACITY,
+                    crate::pd::config::keys::PD_SCHEDULE_STORE_LIMIT_REBUILD_CAPACITY_DEFAULT,
+                ) as f64;
+                (rate, capacity)
+            }
         }
     }
 
     /// Check whether an operator can proceed without consuming tokens.
     fn check_operator(&self, op: &BGOperator, now_ms: u64) -> bool {
+        let class = op.class();
         let mut buckets = self.buckets.lock().unwrap();
         for step in &op.steps {
-            match step {
-                OpStep::AddReplica { worker_id } => {
-                    let key = (*worker_id, StoreLimitType::AddReplica);
-                    let (rate, capacity) = self.get_config(StoreLimitType::AddReplica);
-                    let bucket = buckets.entry(key).or_insert_with(|| TokenBucket::new(rate, capacity));
-                    bucket.refill(now_ms);
-                    if bucket.tokens < 1.0 {
-                        return false;
-                    }
-                }
-                OpStep::RemoveReplica { worker_id } => {
-                    let key = (*worker_id, StoreLimitType::RemoveReplica);
-                    let (rate, capacity) = self.get_config(StoreLimitType::RemoveReplica);
-                    let bucket = buckets.entry(key).or_insert_with(|| TokenBucket::new(rate, capacity));
-                    bucket.refill(now_ms);
-                    if bucket.tokens < 1.0 {
-                        return false;
-                    }
-                }
-                OpStep::TransferLease { .. } => {} // lease transfers are not rate-limited
+            let limit_type = match StoreLimitType::for_step(step, class) {
+                Some(t) => t,
+                None => continue,
+            };
+            let key = (StoreLimitType::worker_id(step), limit_type);
+            let (rate, capacity) = self.get_config(limit_type);
+            let bucket = buckets
+                .entry(key)
+                .or_insert_with(|| TokenBucket::new(rate, capacity));
+            bucket.refill(now_ms);
+            if bucket.tokens < 1.0 {
+                return false;
             }
         }
         true
@@ -141,23 +179,19 @@ impl StoreLimiter {
 
     /// Consume tokens for an operator's steps.
     fn consume_operator(&self, op: &BGOperator, now_ms: u64) {
+        let class = op.class();
         let mut buckets = self.buckets.lock().unwrap();
         for step in &op.steps {
-            match step {
-                OpStep::AddReplica { worker_id } => {
-                    let key = (*worker_id, StoreLimitType::AddReplica);
-                    let (rate, capacity) = self.get_config(StoreLimitType::AddReplica);
-                    let bucket = buckets.entry(key).or_insert_with(|| TokenBucket::new(rate, capacity));
-                    bucket.try_consume(1.0, now_ms);
-                }
-                OpStep::RemoveReplica { worker_id } => {
-                    let key = (*worker_id, StoreLimitType::RemoveReplica);
-                    let (rate, capacity) = self.get_config(StoreLimitType::RemoveReplica);
-                    let bucket = buckets.entry(key).or_insert_with(|| TokenBucket::new(rate, capacity));
-                    bucket.try_consume(1.0, now_ms);
-                }
-                OpStep::TransferLease { .. } => {}
-            }
+            let limit_type = match StoreLimitType::for_step(step, class) {
+                Some(t) => t,
+                None => continue,
+            };
+            let key = (StoreLimitType::worker_id(step), limit_type);
+            let (rate, capacity) = self.get_config(limit_type);
+            let bucket = buckets
+                .entry(key)
+                .or_insert_with(|| TokenBucket::new(rate, capacity));
+            bucket.try_consume(1.0, now_ms);
         }
     }
 }
@@ -188,11 +222,44 @@ impl Ord for PriorityOperator {
     }
 }
 
+/// Mutable state protected by a single Mutex inside OperatorController.
+struct OperatorState {
+    waiting: BinaryHeap<PriorityOperator>,
+    /// bg_id of every operator currently in `waiting`. Used for O(1) dedup.
+    waiting_bg_ids: HashSet<u32>,
+    /// Active operators keyed by bg_id. At most one running operator per BG.
+    running: HashMap<u32, BGOperator>,
+    /// Per-worker running operator count for concurrency limiting.
+    worker_op_count: HashMap<u32, u32>,
+}
+
+impl OperatorState {
+    fn new() -> Self {
+        Self {
+            waiting: BinaryHeap::new(),
+            waiting_bg_ids: HashSet::new(),
+            running: HashMap::new(),
+            worker_op_count: HashMap::new(),
+        }
+    }
+
+    fn increment_worker_counts(&mut self, op: &BGOperator) {
+        for w in workers_in_op(op) {
+            *self.worker_op_count.entry(w).or_insert(0) += 1;
+        }
+    }
+
+    fn decrement_worker_counts(&mut self, op: &BGOperator) {
+        for w in workers_in_op(op) {
+            if let Some(count) = self.worker_op_count.get_mut(&w) {
+                *count = count.saturating_sub(1);
+            }
+        }
+    }
+}
+
 pub struct OperatorController {
-    waiting_operators: Mutex<BinaryHeap<PriorityOperator>>,
-    running_operators: DashMap<u32, BGOperator>,
-    /// Per-worker running operator count for concurrency limiting
-    worker_op_count: DashMap<u32, u32>,
+    inner: Mutex<OperatorState>,
     config_manager: Arc<ConfigManager>,
     bg_manager: Arc<BGManager>,
     next_op_id: AtomicU64,
@@ -203,9 +270,7 @@ impl OperatorController {
     pub fn new(config_manager: Arc<ConfigManager>, bg_manager: Arc<BGManager>) -> Self {
         let store_limiter = StoreLimiter::new(config_manager.clone());
         Self {
-            waiting_operators: Mutex::new(BinaryHeap::new()),
-            running_operators: DashMap::new(),
-            worker_op_count: DashMap::new(),
+            inner: Mutex::new(OperatorState::new()),
             config_manager,
             bg_manager,
             next_op_id: AtomicU64::new(1),
@@ -213,161 +278,89 @@ impl OperatorController {
         }
     }
 
+    /// Add an operator. Returns true if accepted into the waiting queue.
+    /// Deduplicates by bg_id (both waiting and running) and replaces lower-priority running ops.
     pub fn add_operator(&self, op: BGOperator) -> bool {
-        let max_waiting = self
-            .config_manager
-            .get_u32("pd.schedule.max_waiting_operators", 100);
+        let max_waiting = self.config_manager.get_u32(
+            crate::pd::config::keys::PD_SCHEDULE_MAX_WAITING_OPERATORS,
+            crate::pd::config::keys::PD_SCHEDULE_MAX_WAITING_OPERATORS_DEFAULT,
+        );
 
-        let mut queue = self.waiting_operators.lock().unwrap();
+        let mut state = self.inner.lock().unwrap();
 
-        // Priority replacement: if a running operator exists for this BG,
-        // replace it only if the new operator has higher priority.
-        if let Some(existing) = self.running_operators.get(&op.bg_id) {
+        // Already in waiting queue for this BG → reject (dedup).
+        if state.waiting_bg_ids.contains(&op.bg_id) {
+            return false;
+        }
+
+        // Already running for this BG → priority replacement.
+        if let Some(existing) = state.running.get(&op.bg_id) {
             if op.priority > existing.priority {
-                // New operator has higher priority -> replace
-                drop(existing);
-                if let Some((_, mut old_op)) = self.running_operators.remove(&op.bg_id) {
+                if let Some(mut old_op) = state.running.remove(&op.bg_id) {
                     old_op.status = OpStatus::Replaced;
-                    self.decrement_worker_counts(&old_op);
-                    self.bg_manager
-                        .set_op_state(op.bg_id, curvine_common::state::BGOpState::Idle);
-                    self.bg_manager.mark_suspect(op.bg_id);
+                    state.decrement_worker_counts(&old_op);
+                    self.bg_manager.set_op_state(op.bg_id, BGOpState::Idle);
                 }
             } else {
                 return false;
             }
         }
 
-        if queue.len() >= max_waiting as usize {
+        if state.waiting.len() >= max_waiting as usize {
             return false;
         }
-        queue.push(PriorityOperator(op));
+
+        state.waiting_bg_ids.insert(op.bg_id);
+        state.waiting.push(PriorityOperator(op));
         true
     }
 
-    /// Dispatch next batch of operators from waiting to running.
-    /// Respects per-worker concurrency limit and store rate limiting.
-    pub fn dispatch_next(&self) -> Vec<BGOperator> {
-        let max_per_worker = self
-            .config_manager
-            .get_u32("pd.schedule.max_operators_per_worker", 5);
-        let now_ms = orpc::common::LocalTime::mills();
-
-        let mut queue = self.waiting_operators.lock().unwrap();
-        let mut to_dispatch = Vec::new();
-        let mut deferred = Vec::new();
-
-        while let Some(PriorityOperator(op)) = queue.pop() {
-            if self.running_operators.contains_key(&op.bg_id) {
-                continue;
-            }
-
-            // Check per-worker concurrency limit
-            let workers = Self::workers_in_op(&op);
-            let exceeds_limit = workers.iter().any(|w| {
-                self.worker_op_count
-                    .get(w)
-                    .map(|c| *c >= max_per_worker)
-                    .unwrap_or(false)
-            });
-            if exceeds_limit {
-                deferred.push(PriorityOperator(op));
-                continue;
-            }
-
-            // Check store rate limit (soft limit)
-            if !self.store_limiter.check_operator(&op, now_ms) {
-                deferred.push(PriorityOperator(op));
-                continue;
-            }
-
-            // Consume tokens
-            self.store_limiter.consume_operator(&op, now_ms);
-
-            let mut op = op;
-            op.status = OpStatus::Running;
-            op.step_start_time_ms = orpc::common::LocalTime::mills();
-
-            // Set BG op_state to reflect the operation in progress
-            self.bg_manager.set_op_state(op.bg_id, op.bg_op_state());
-            self.increment_worker_counts(&op);
-            self.running_operators.insert(op.bg_id, op.clone());
-            to_dispatch.push(op);
-        }
-
-        // Put deferred operators back into the queue
-        for op in deferred {
-            queue.push(op);
-        }
-
-        to_dispatch
+    pub fn tick(&self, now_ms: u64) {
+        let mut state = self.inner.lock().unwrap();
+        self.check_progress_locked(&mut state, now_ms);
+        self.dispatch_locked(&mut state, now_ms);
     }
 
-    /// Build commands for a worker from running operators (add_bgs / remove_bgs).
-    pub fn dispatch_to_worker(&self, worker_id: u32) -> BGCommands {
-        let mut add_bgs = Vec::new();
-        let mut remove_bgs = Vec::new();
-        for mut entry in self.running_operators.iter_mut() {
-            let op = entry.value_mut();
-            let step = match op.steps.get(op.current_step) {
-                Some(s) => s,
-                None => continue,
-            };
-            match step {
-                OpStep::AddReplica { worker_id: w } if *w == worker_id => {
-                    if let Some(bg) = self.bg_manager.get_bg(op.bg_id) {
-                        add_bgs.push(bg);
-                    }
-                }
-                OpStep::RemoveReplica { worker_id: w } if *w == worker_id => {
-                    remove_bgs.push(op.bg_id);
-                }
-                _ => {}
-            }
-        }
-        BGCommands { add_bgs, remove_bgs }
-    }
-
-    /// Check progress via step.is_finish(bg) and handle per-step timeouts.
-    /// Also detects stale operators (epoch mismatch or max lifetime exceeded).
-    /// On terminal states: resets BG op_state to Idle and refreshes flags on success.
-    pub fn check_progress(&self, now_ms: u64) {
+    fn check_progress_locked(&self, state: &mut OperatorState, now_ms: u64) {
         let max_lifetime = self.config_manager.get_u64(
             crate::pd::config::keys::PD_SCHEDULE_OPERATOR_MAX_LIFETIME_MS,
             crate::pd::config::keys::PD_SCHEDULE_OPERATOR_MAX_LIFETIME_MS_DEFAULT,
         );
 
         let mut to_remove = Vec::new();
-        for mut entry in self.running_operators.iter_mut() {
-            let op = entry.value_mut();
-
-            // Check operator max lifetime
+        for (&bg_id, op) in state.running.iter_mut() {
+            // Max lifetime check
             if now_ms.saturating_sub(op.create_time_ms) > max_lifetime {
                 log::warn!(
                     "Operator {} for bg {} exceeded max lifetime {}ms, cancelling",
-                    op.id, op.bg_id, max_lifetime
+                    op.id,
+                    op.bg_id,
+                    max_lifetime
                 );
                 op.status = OpStatus::Cancelled;
-                to_remove.push(op.bg_id);
+                to_remove.push(bg_id);
                 continue;
             }
 
-            // Check bg_epoch staleness (skip if bg_epoch==0 for backward compat)
+            // bg_epoch staleness check
             if op.bg_epoch > 0 {
                 if let Some(bg) = self.bg_manager.get_bg(op.bg_id) {
                     if bg.bg_epoch != op.bg_epoch {
                         log::warn!(
                             "Operator {} for bg {} stale: op_epoch={} current_epoch={}, cancelling",
-                            op.id, op.bg_id, op.bg_epoch, bg.bg_epoch
+                            op.id,
+                            op.bg_id,
+                            op.bg_epoch,
+                            bg.bg_epoch
                         );
                         op.status = OpStatus::Cancelled;
-                        to_remove.push(op.bg_id);
+                        to_remove.push(bg_id);
                         continue;
                     }
                 }
             }
 
-            // Check per-step timeout based on step type
+            // Per-step timeout
             let step_timeout = match op.steps.get(op.current_step) {
                 Some(OpStep::TransferLease { .. }) => self.config_manager.get_u64(
                     crate::pd::config::keys::PD_SCHEDULE_STEP_TIMEOUT_TRANSFER_LEASE_MS,
@@ -381,18 +374,22 @@ impl OperatorController {
                     crate::pd::config::keys::PD_SCHEDULE_STEP_TIMEOUT_REMOVE_REPLICA_MS,
                     crate::pd::config::keys::PD_SCHEDULE_STEP_TIMEOUT_REMOVE_REPLICA_MS_DEFAULT,
                 ),
-                None => 3_000,
+                Some(OpStep::WaitReplicaReady { .. }) => self.config_manager.get_u64(
+                    crate::pd::config::keys::PD_SCHEDULE_STEP_TIMEOUT_WAIT_REPLICA_READY_MS,
+                    crate::pd::config::keys::PD_SCHEDULE_STEP_TIMEOUT_WAIT_REPLICA_READY_MS_DEFAULT,
+                ),
+                None => 10_000,
             };
             if now_ms.saturating_sub(op.step_start_time_ms) > step_timeout {
                 op.status = OpStatus::Timeout;
-                to_remove.push(op.bg_id);
+                to_remove.push(bg_id);
                 continue;
             }
 
-            // Check step completion via is_finish(bg)
+            // Step completion via is_finish(bg)
             if let Some(step) = op.steps.get(op.current_step) {
                 if let Some(bg) = self.bg_manager.get_bg(op.bg_id) {
-                    if step.is_finish(&bg) {
+                    if step.is_finish(&bg, &self.bg_manager) {
                         op.current_step += 1;
                         op.step_start_time_ms = now_ms;
                     }
@@ -401,38 +398,138 @@ impl OperatorController {
 
             if op.current_step >= op.steps.len() {
                 op.status = OpStatus::Success;
-                to_remove.push(op.bg_id);
+                to_remove.push(bg_id);
             }
         }
 
-        // Terminal state cleanup
         for bg_id in to_remove {
-            if let Some((_, op)) = self.running_operators.remove(&bg_id) {
+            if let Some(op) = state.running.remove(&bg_id) {
                 Pd::get_metrics()
                     .operator_finish_total
                     .with_label_values(&[op.status.as_str()])
                     .inc();
-                self.decrement_worker_counts(&op);
-                // Reset op_state to Idle so checkers can re-evaluate this BG
+                state.decrement_worker_counts(&op);
                 self.bg_manager.set_op_state(bg_id, BGOpState::Idle);
-                // Mark BG as suspect so checkers re-evaluate it promptly
-                self.bg_manager.mark_suspect(bg_id);
             }
         }
     }
 
+    fn dispatch_locked(&self, state: &mut OperatorState, now_ms: u64) {
+        let max_per_worker = self.config_manager.get_u32(
+            crate::pd::config::keys::PD_SCHEDULE_MAX_OPERATORS_PER_WORKER,
+            crate::pd::config::keys::PD_SCHEDULE_MAX_OPERATORS_PER_WORKER_DEFAULT,
+        );
+
+        let mut deferred = Vec::new();
+
+        while let Some(PriorityOperator(op)) = state.waiting.pop() {
+            if state.running.contains_key(&op.bg_id) {
+                state.waiting_bg_ids.remove(&op.bg_id);
+                continue;
+            }
+
+            // Per-worker concurrency limit
+            let workers = workers_in_op(&op);
+            let exceeds_limit = workers
+                .iter()
+                .any(|w| state.worker_op_count.get(w).copied().unwrap_or(0) >= max_per_worker);
+            if exceeds_limit {
+                deferred.push(PriorityOperator(op));
+                continue;
+            }
+
+            // Store rate limit
+            if !self.store_limiter.check_operator(&op, now_ms) {
+                deferred.push(PriorityOperator(op));
+                continue;
+            }
+
+            self.store_limiter.consume_operator(&op, now_ms);
+
+            let mut op = op;
+            op.status = OpStatus::Running;
+            op.step_start_time_ms = now_ms;
+
+            self.bg_manager.set_op_state(op.bg_id, op.bg_op_state());
+            state.increment_worker_counts(&op);
+            state.waiting_bg_ids.remove(&op.bg_id);
+            state.running.insert(op.bg_id, op);
+        }
+
+        for op in deferred {
+            state.waiting.push(op);
+        }
+    }
+
+    /// Build commands for a worker from running operators (add_bgs / remove_bgs).
+    pub fn dispatch_to_worker(&self, worker_id: u32) -> BGCommands {
+        let state = self.inner.lock().unwrap();
+        let mut add_bgs = Vec::new();
+        let mut remove_bgs = Vec::new();
+        for op in state.running.values() {
+            let step = match op.steps.get(op.current_step) {
+                Some(s) => s,
+                None => continue,
+            };
+            match step {
+                OpStep::AddReplica { worker_id: w } if *w == worker_id => {
+                    if let Some(bg) = self.bg_manager.get_bg(op.bg_id) {
+                        add_bgs.push(bg);
+                    }
+                }
+                OpStep::RemoveReplica { worker_id: w } if *w == worker_id => {
+                    // Safety: check serving replicas after removal >= desired
+                    let serving = self.bg_manager.get_serving_replicas(op.bg_id);
+                    let serving_after = serving.iter().filter(|&&s| s != *w).count();
+                    let desired = self
+                        .bg_manager
+                        .get_table(
+                            self.bg_manager
+                                .get_bg(op.bg_id)
+                                .map(|bg| bg.table_id)
+                                .unwrap_or(0),
+                        )
+                        .map(|t| t.replica_count() as usize)
+                        .unwrap_or(1);
+                    if serving_after >= desired {
+                        if let Err(e) = self.bg_manager.propose_remove_replica(op.bg_id, *w) {
+                            log::error!(
+                                "Failed to propose RemoveReplica for bg {}: {}",
+                                op.bg_id,
+                                e
+                            );
+                        }
+                    }
+                    remove_bgs.push(op.bg_id);
+                }
+                OpStep::TransferLease { to_worker, .. } if *to_worker == worker_id => {
+                    // TransferLease target must be Active
+                    if self.bg_manager.get_replica_state(op.bg_id, *to_worker)
+                        != ReplicaState::Active
+                    {
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
+        BGCommands {
+            add_bgs,
+            remove_bgs,
+        }
+    }
+
     pub fn running_count(&self) -> usize {
-        self.running_operators.len()
+        self.inner.lock().unwrap().running.len()
     }
 
     pub fn waiting_count(&self) -> usize {
-        self.waiting_operators.lock().unwrap().len()
+        self.inner.lock().unwrap().waiting.len()
     }
 
-    /// Check if there are any running operators involving the given node.
     pub fn has_running_operators_for_node(&self, node_id: u32) -> bool {
-        self.running_operators.iter().any(|entry| {
-            let op = entry.value();
+        let state = self.inner.lock().unwrap();
+        state.running.values().any(|op| {
             op.steps.iter().any(|step| match step {
                 OpStep::AddReplica { worker_id } => *worker_id == node_id,
                 OpStep::RemoveReplica { worker_id } => *worker_id == node_id,
@@ -440,41 +537,50 @@ impl OperatorController {
                     from_worker,
                     to_worker,
                 } => *from_worker == node_id || *to_worker == node_id,
+                OpStep::WaitReplicaReady { worker_id, .. } => *worker_id == node_id,
             })
         })
     }
 
-    /// Generate next operator id
     pub fn next_operator_id(&self) -> u64 {
         self.next_op_id.fetch_add(1, AtomicOrdering::SeqCst)
     }
 
-    /// Get the net BG count influence of all running operators on a worker.
+    /// Net BG count delta on a worker from all running operators.
     pub fn get_bg_influence(&self, worker_id: u32) -> i32 {
+        let state = self.inner.lock().unwrap();
         let mut delta = 0i32;
-        for entry in self.running_operators.iter() {
-            let influence = entry.value().compute_influence();
-            delta += influence.bg_count_delta.get(&worker_id).copied().unwrap_or(0);
+        for op in state.running.values() {
+            let influence = op.compute_influence();
+            delta += influence
+                .bg_count_delta
+                .get(&worker_id)
+                .copied()
+                .unwrap_or(0);
         }
         delta
     }
 
-    /// Get the net leader count influence of all running operators on a worker.
     pub fn get_leader_influence(&self, worker_id: u32) -> i32 {
+        let state = self.inner.lock().unwrap();
         let mut delta = 0i32;
-        for entry in self.running_operators.iter() {
-            let influence = entry.value().compute_influence();
-            delta += influence.leader_count_delta.get(&worker_id).copied().unwrap_or(0);
+        for op in state.running.values() {
+            let influence = op.compute_influence();
+            delta += influence
+                .leader_count_delta
+                .get(&worker_id)
+                .copied()
+                .unwrap_or(0);
         }
         delta
     }
 
-    /// Get pending BG add/remove counts for a worker from all running operators.
     pub fn get_worker_pending_bg_delta(&self, worker_id: u32) -> (u32, u32) {
+        let state = self.inner.lock().unwrap();
         let mut add = 0u32;
         let mut remove = 0u32;
-        for entry in self.running_operators.iter() {
-            for step in &entry.value().steps {
+        for op in state.running.values() {
+            for step in &op.steps {
                 match step {
                     OpStep::AddReplica { worker_id: w } if *w == worker_id => add += 1,
                     OpStep::RemoveReplica { worker_id: w } if *w == worker_id => remove += 1,
@@ -485,13 +591,17 @@ impl OperatorController {
         (add, remove)
     }
 
-    /// Get pending lease transfer in/out counts for a worker from all running operators.
     pub fn get_worker_pending_lease_delta(&self, worker_id: u32) -> (u32, u32) {
+        let state = self.inner.lock().unwrap();
         let mut lease_in = 0u32;
         let mut lease_out = 0u32;
-        for entry in self.running_operators.iter() {
-            for step in &entry.value().steps {
-                if let OpStep::TransferLease { from_worker, to_worker } = step {
+        for op in state.running.values() {
+            for step in &op.steps {
+                if let OpStep::TransferLease {
+                    from_worker,
+                    to_worker,
+                } = step
+                {
                     if *to_worker == worker_id {
                         lease_in += 1;
                     }
@@ -504,41 +614,74 @@ impl OperatorController {
         (lease_in, lease_out)
     }
 
-    // ========== Per-worker concurrency helpers ==========
-
-    fn workers_in_op(op: &BGOperator) -> Vec<u32> {
-        let mut workers = Vec::new();
-        for step in &op.steps {
-            match step {
-                OpStep::AddReplica { worker_id } => workers.push(*worker_id),
-                OpStep::RemoveReplica { worker_id } => workers.push(*worker_id),
-                OpStep::TransferLease {
-                    from_worker,
-                    to_worker,
-                } => {
-                    workers.push(*from_worker);
-                    workers.push(*to_worker);
+    /// Get all pending deltas for all workers in one pass.
+    pub fn get_all_pending_deltas(&self) -> (HashMap<u32, (u32, u32)>, HashMap<u32, (u32, u32)>) {
+        let state = self.inner.lock().unwrap();
+        let mut bg_delta: HashMap<u32, (u32, u32)> = HashMap::new();
+        let mut lease_delta: HashMap<u32, (u32, u32)> = HashMap::new();
+        for op in state.running.values() {
+            for step in &op.steps {
+                match step {
+                    OpStep::AddReplica { worker_id } => {
+                        bg_delta.entry(*worker_id).or_default().0 += 1;
+                    }
+                    OpStep::RemoveReplica { worker_id } => {
+                        bg_delta.entry(*worker_id).or_default().1 += 1;
+                    }
+                    OpStep::TransferLease {
+                        from_worker,
+                        to_worker,
+                    } => {
+                        lease_delta.entry(*to_worker).or_default().0 += 1;
+                        lease_delta.entry(*from_worker).or_default().1 += 1;
+                    }
+                    OpStep::WaitReplicaReady { .. } => {}
                 }
             }
         }
-        workers.sort_unstable();
-        workers.dedup();
-        workers
+        (bg_delta, lease_delta)
     }
 
-    fn increment_worker_counts(&self, op: &BGOperator) {
-        for w in Self::workers_in_op(op) {
-            *self.worker_op_count.entry(w).or_insert(0) += 1;
-        }
+    #[cfg(test)]
+    pub fn check_progress(&self, now_ms: u64) {
+        let mut state = self.inner.lock().unwrap();
+        self.check_progress_locked(&mut state, now_ms);
     }
 
-    fn decrement_worker_counts(&self, op: &BGOperator) {
-        for w in Self::workers_in_op(op) {
-            if let Some(mut count) = self.worker_op_count.get_mut(&w) {
-                *count = count.saturating_sub(1);
+    #[cfg(test)]
+    pub fn dispatch_next(&self) -> Vec<BGOperator> {
+        let now_ms = orpc::common::LocalTime::mills();
+        let mut state = self.inner.lock().unwrap();
+        let before: std::collections::HashSet<u32> = state.running.keys().copied().collect();
+        self.dispatch_locked(&mut state, now_ms);
+        state
+            .running
+            .iter()
+            .filter(|(bg_id, _)| !before.contains(bg_id))
+            .map(|(_, op)| op.clone())
+            .collect()
+    }
+}
+
+fn workers_in_op(op: &BGOperator) -> Vec<u32> {
+    let mut workers = Vec::new();
+    for step in &op.steps {
+        match step {
+            OpStep::AddReplica { worker_id } => workers.push(*worker_id),
+            OpStep::RemoveReplica { worker_id } => workers.push(*worker_id),
+            OpStep::TransferLease {
+                from_worker,
+                to_worker,
+            } => {
+                workers.push(*from_worker);
+                workers.push(*to_worker);
             }
+            OpStep::WaitReplicaReady { worker_id, .. } => workers.push(*worker_id),
         }
     }
+    workers.sort_unstable();
+    workers.dedup();
+    workers
 }
 
 #[cfg(test)]
@@ -563,7 +706,15 @@ mod tests {
         let pool_store = Arc::new(crate::pd::pool::PoolStore::new(store.clone()));
         let pool_mgr = Arc::new(PoolManager::new(pool_store, node_mgr, jc.clone()));
         let bg_store = Arc::new(crate::pd::bg::BGStore::new(store));
-        let bg_mgr = Arc::new(BGManager::new(bg_store, pool_mgr, jc, 1024, vec![3], vec![]));
+        let bg_mgr = Arc::new(BGManager::new(
+            bg_store,
+            pool_mgr,
+            jc.clone(),
+            config.clone(),
+            1024,
+            vec![3],
+            vec![],
+        ));
         let ctrl = OperatorController::new(config.clone(), bg_mgr.clone());
         (ctrl, config, bg_mgr)
     }
@@ -643,12 +794,6 @@ mod tests {
         let op = make_op(43, 11, vec![OpStep::AddReplica { worker_id: 1 }], 1);
         assert!(ctrl.add_operator(op));
         ctrl.dispatch_next();
-        // step_start_time_ms is set to current time during dispatch_next,
-        // but in tests it will be near 0 or current. Simulate by calling check_progress
-        // with a time far in the future (700s after step start).
-        // Since step_start_time_ms is set during dispatch, we need to check relative to that.
-        // In test, dispatch_next sets step_start_time_ms = LocalTime::mills() (real clock).
-        // We'll just use a huge now_ms to ensure timeout.
         ctrl.check_progress(orpc::common::LocalTime::mills() + 700_000);
         assert_eq!(ctrl.running_count(), 0);
     }
@@ -698,9 +843,9 @@ mod tests {
         assert!(ctrl.add_operator(high));
         assert!(ctrl.add_operator(mid));
 
-        let dispatched = ctrl.dispatch_next();
+        let mut dispatched = ctrl.dispatch_next();
         assert_eq!(dispatched.len(), 3);
-        // Higher priority dispatched first
+        dispatched.sort_by(|a, b| b.priority.cmp(&a.priority));
         assert_eq!(dispatched[0].bg_id, 11); // priority 100
         assert_eq!(dispatched[1].bg_id, 12); // priority 50
         assert_eq!(dispatched[2].bg_id, 10); // priority 1
@@ -750,12 +895,7 @@ mod tests {
             .unwrap();
 
         // Operator with AddReplica step targeting worker 5
-        let op = make_op(
-            1,
-            20,
-            vec![OpStep::AddReplica { worker_id: 5 }],
-            1,
-        );
+        let op = make_op(1, 20, vec![OpStep::AddReplica { worker_id: 5 }], 1);
         assert!(ctrl.add_operator(op));
         ctrl.dispatch_next();
 
@@ -790,10 +930,7 @@ mod tests {
             stats: Default::default(),
         };
         bg_mgr
-            .apply_create_bg(&crate::pd::journal::entry::BGEntry {
-                op_ms: 0,
-                info: bg,
-            })
+            .apply_create_bg(&crate::pd::journal::entry::BGEntry { op_ms: 0, info: bg })
             .unwrap();
 
         // Step already satisfied (worker 1 in replica_set)
@@ -850,7 +987,8 @@ mod tests {
                 replica_set: Some(vec![1, 2, 3]),
                 state: None,
                 lease_owner: None,
-                bg_epoch: None,
+                new_bg_epoch: 2,
+                new_table_epoch: None,
             })
             .unwrap();
         // bg_epoch should now be 2

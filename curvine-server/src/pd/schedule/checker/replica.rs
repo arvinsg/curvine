@@ -12,91 +12,51 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::CheckerContext;
-use crate::pd::schedule::operator::{BGOperator, OperatorBuilder, OperatorKind};
-use curvine_common::state::{BGState, BlockGroupInfo, NodeState};
-use std::sync::Arc;
+use crate::pd::bg::placement::isolation_score;
+use crate::pd::schedule::operator::{BGOperator, OpPriority, OperatorBuilder, OperatorKind};
+use crate::pd::schedule::ManagerContext;
+use curvine_common::state::BlockGroupInfo;
 
-pub struct ReplicaChecker {
-    ctx: Arc<crate::pd::schedule::CoordinatorContext>,
-}
+pub struct ReplicaChecker;
 
 impl ReplicaChecker {
-    pub fn new(ctx: Arc<crate::pd::schedule::CoordinatorContext>) -> Self {
-        Self { ctx }
-    }
-
-    fn build_decommission_repair(
-        &self,
-        bg: &BlockGroupInfo,
-        decom_worker: u32,
-        ctx: &CheckerContext<'_>,
-    ) -> Option<BGOperator> {
-        let _table = ctx.bg_manager.get_table(bg.table_id)?;
-        let pool_id = (bg.table_id >> 16) as u16;
-
-        let new_workers = ctx
-            .bg_manager
-            .select_workers(pool_id, 1, &bg.replica_set)
-            .ok()?;
-        let new_worker = *new_workers.first()?;
-
-        let mut builder = OperatorBuilder::new(
-            OperatorKind::DecommissionRepair,
-            bg.bg_id,
-            format!("Decommission repair: replace {} with {}", decom_worker, new_worker),
-        )
-        .bg_epoch(bg.bg_epoch)
-        .priority(120)
-        .add_replica(new_worker);
-
-        if bg
-            .lease_owner
-            .as_ref()
-            .map(|l| l.node_id == decom_worker)
-            .unwrap_or(false)
-        {
-            let to_worker = bg
-                .replica_set
-                .iter()
-                .filter(|&&w| w != decom_worker)
-                .find(|&&w| ctx.pool_manager.is_worker_available(w))
-                .copied()
-                .unwrap_or(new_worker);
-            builder = builder.transfer_lease(decom_worker, to_worker);
-        }
-
-        Some(builder.remove_replica(decom_worker).build())
-    }
-
     fn build_under_replicated_repair(
-        &self,
         bg: &BlockGroupInfo,
-        available_replicas: &[u32],
-        ctx: &CheckerContext<'_>,
+        resident_replicas: &[u32],
+        ctx: &ManagerContext,
     ) -> Option<BGOperator> {
         let table = ctx.bg_manager.get_table(bg.table_id)?;
-        let desired = table.policy.replicas as usize;
-        if available_replicas.len() >= desired {
+        let desired = table.replica_count() as usize;
+        if resident_replicas.len() >= desired {
             return None;
         }
-        let needed = desired - available_replicas.len();
-        let pool_id = (bg.table_id >> 16) as u16;
+        let needed = desired - resident_replicas.len();
         let new_workers = ctx
             .bg_manager
-            .select_workers(pool_id, needed as u16, &bg.replica_set)
+            .select_replacement_workers(bg, needed as u16)
             .ok()?;
         if new_workers.is_empty() {
+            log::error!(
+                "BG {} under-replicated ({}/{}), no replacement workers available",
+                bg.bg_id,
+                resident_replicas.len(),
+                desired
+            );
             return None;
         }
 
         let mut builder = OperatorBuilder::new(
             OperatorKind::Repair,
             bg.bg_id,
-            format!("Add {} replicas", new_workers.len()),
+            format!(
+                "Add {} replicas ({}/{})",
+                new_workers.len(),
+                resident_replicas.len(),
+                desired
+            ),
         )
         .bg_epoch(bg.bg_epoch)
-        .priority(100);
+        .priority(OpPriority::UNDER_REPLICA_REPAIR);
 
         for &w in &new_workers {
             builder = builder.add_replica(w);
@@ -106,35 +66,18 @@ impl ReplicaChecker {
     }
 
     fn build_over_replicated_repair(
-        &self,
         bg: &BlockGroupInfo,
-        available_replicas: &[u32],
-        ctx: &CheckerContext<'_>,
+        resident_replicas: &[u32],
+        ctx: &ManagerContext,
     ) -> Option<BGOperator> {
         let table = ctx.bg_manager.get_table(bg.table_id)?;
-        let desired = table.policy.replicas as usize;
-        if available_replicas.len() <= desired {
+        let desired = table.replica_count() as usize;
+        if resident_replicas.len() <= desired {
             return None;
         }
-        let excess = available_replicas.len() - desired;
-        let lease_owner_id = bg.lease_owner.as_ref().map(|l| l.node_id).unwrap_or(0);
+        let excess = resident_replicas.len() - desired;
 
-        let mut to_remove: Vec<u32> = available_replicas
-            .iter()
-            .filter(|&&w| w != lease_owner_id)
-            .copied()
-            .take(excess)
-            .collect();
-        if to_remove.len() < excess {
-            to_remove.extend(
-                available_replicas
-                    .iter()
-                    .filter(|&&w| w == lease_owner_id)
-                    .copied()
-                    .take(excess - to_remove.len()),
-            );
-        }
-
+        let to_remove = Self::select_replicas_to_remove(bg, resident_replicas, excess, ctx);
         if to_remove.is_empty() {
             return None;
         }
@@ -145,13 +88,61 @@ impl ReplicaChecker {
             format!("Remove {} excess replicas", to_remove.len()),
         )
         .bg_epoch(bg.bg_epoch)
-        .priority(60);
+        .priority(OpPriority::OVER_REPLICA_REPAIR);
 
         for &w in &to_remove {
             builder = builder.remove_replica(w);
         }
 
         Some(builder.build())
+    }
+
+    fn select_replicas_to_remove(
+        bg: &BlockGroupInfo,
+        resident_replicas: &[u32],
+        count: usize,
+        ctx: &ManagerContext,
+    ) -> Vec<u32> {
+        let lease_owner_id = bg.lease_owner.as_ref().map(|l| l.node_id).unwrap_or(0);
+        let rule = ctx.bg_manager.placement_rule();
+
+        if !rule.is_empty() && !rule.location_labels.is_empty() {
+            let worker_labels = ctx.pool_manager.get_workers_labels(resident_replicas);
+            let mut candidates: Vec<(u32, f64)> = resident_replicas
+                .iter()
+                .filter(|&&w| w != lease_owner_id)
+                .map(|&w| {
+                    // Score without this replica — higher means this replica is less valuable
+                    let without: Vec<u32> = resident_replicas
+                        .iter()
+                        .filter(|&&r| r != w)
+                        .copied()
+                        .collect();
+                    let score = isolation_score(&without, &rule.location_labels, &worker_labels);
+                    (w, score)
+                })
+                .collect();
+            candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            candidates.iter().map(|(w, _)| *w).take(count).collect()
+        } else {
+            // Fallback: prefer non-lease-owner
+            let mut to_remove: Vec<u32> = resident_replicas
+                .iter()
+                .filter(|&&w| w != lease_owner_id)
+                .copied()
+                .take(count)
+                .collect();
+            if to_remove.len() < count {
+                to_remove.extend(
+                    resident_replicas
+                        .iter()
+                        .filter(|&&w| w == lease_owner_id)
+                        .copied()
+                        .take(count - to_remove.len()),
+                );
+            }
+            to_remove
+        }
     }
 }
 
@@ -160,65 +151,36 @@ impl super::Checker for ReplicaChecker {
         "replica-checker"
     }
 
-    fn check_bg(&self, bg: &BlockGroupInfo, ctx: &CheckerContext<'_>) -> Option<BGOperator> {
+    fn check_bg(&self, bg: &BlockGroupInfo, ctx: &ManagerContext) -> Option<BGOperator> {
         let table = ctx.bg_manager.get_table(bg.table_id)?;
-        let desired = table.policy.replicas as usize;
+        let desired = table.replica_count() as usize;
+        let resident_replicas = ctx.bg_manager.get_resident_replicas(bg.bg_id);
 
-        // Decommission repair: highest priority
-        let decom_worker = bg
-            .replica_set
-            .iter()
-            .find(|&&w| {
-                ctx.pool_manager
-                    .get_worker_node(w)
-                    .map(|n| n.state == NodeState::Decommission)
-                    .unwrap_or(false)
-            })
-            .copied();
-        if let Some(dw) = decom_worker {
-            return self.build_decommission_repair(bg, dw, ctx);
+        if resident_replicas.len() < desired {
+            return Self::build_under_replicated_repair(bg, &resident_replicas, ctx);
         }
 
-        // Compute available replicas
-        let available_replicas: Vec<u32> = bg
-            .replica_set
-            .iter()
-            .filter(|w| ctx.pool_manager.is_worker_available(**w))
-            .copied()
-            .collect();
-
-        if available_replicas.is_empty() {
-            log::error!("BG {} all replicas lost!", bg.bg_id);
-            return None;
-        }
-
-        if available_replicas.len() < desired || bg.state == BGState::Degraded {
-            return self.build_under_replicated_repair(bg, &available_replicas, ctx);
-        }
-
-        if available_replicas.len() > desired {
-            return self.build_over_replicated_repair(bg, &available_replicas, ctx);
+        if resident_replicas.len() > desired {
+            return Self::build_over_replicated_repair(bg, &resident_replicas, ctx);
         }
 
         None
     }
 
     fn priority(&self) -> u32 {
-        20
+        super::CheckerPriority::REPLICA
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pd::schedule::checker::{Checker, CheckerContext};
-    use crate::pd::schedule::CoordinatorContext;
-    use curvine_common::state::{BGLease, BGOpState, BGState, BlockGroupInfo};
+    use crate::pd::schedule::checker::Checker;
+    use crate::pd::schedule::ManagerContext;
+    use curvine_common::state::{BGLease, BGOpState, BGState};
 
-    fn test_ctx() -> Arc<CoordinatorContext> {
-        crate::pd::schedule::checker::tests_common::test_coordinator_context(
-            std::collections::HashMap::new(),
-        )
+    fn test_ctx() -> std::sync::Arc<ManagerContext> {
+        crate::pd::schedule::checker::tests_common::test_context(std::collections::HashMap::new())
     }
 
     fn make_bg(bg_id: u32, table_id: u32, replica_set: Vec<u32>) -> BlockGroupInfo {
@@ -239,43 +201,33 @@ mod tests {
         }
     }
 
-    fn checker_ctx(ctx: &CoordinatorContext) -> CheckerContext<'_> {
-        CheckerContext {
-            pool_manager: &ctx.pool_manager,
-            bg_manager: &ctx.bg_manager,
-            node_manager: &ctx.node_manager,
-            config_manager: &ctx.config_manager,
-        }
-    }
-
     #[test]
     fn no_ops_for_healthy_bgs() {
         let ctx = test_ctx();
-        let checker = ReplicaChecker::new(ctx.clone());
+        let checker = ReplicaChecker;
         let bg = make_bg(1, 0x0001_0003, vec![100, 101, 102]);
         ctx.bg_manager
-            .apply_create_bg(&crate::pd::journal::entry::BGEntry { op_ms: 0, info: bg.clone() })
+            .apply_create_bg(&crate::pd::journal::entry::BGEntry {
+                op_ms: 0,
+                info: bg.clone(),
+            })
             .unwrap();
-        let cctx = checker_ctx(&ctx);
-        // No workers registered -> not available -> all replicas lost -> None
-        assert!(checker.check_bg(&bg, &cctx).is_none());
+        // No workers registered -> all replicas are Pending (Resident) -> count=3 == desired=3 -> None
+        assert!(checker.check_bg(&bg, &ctx).is_none());
     }
 
     #[test]
     fn skips_bg_without_table() {
         let ctx = test_ctx();
-        let checker = ReplicaChecker::new(ctx.clone());
-        // BG references a table that doesn't exist
+        let checker = ReplicaChecker;
         let bg = make_bg(1, 0x0001_0003, vec![100]);
-        let cctx = checker_ctx(&ctx);
-        assert!(checker.check_bg(&bg, &cctx).is_none());
+        assert!(checker.check_bg(&bg, &ctx).is_none());
     }
 
     #[test]
     fn name_and_priority() {
-        let ctx = test_ctx();
-        let checker = ReplicaChecker::new(ctx);
+        let checker = ReplicaChecker;
         assert_eq!(checker.name(), "replica-checker");
-        assert_eq!(checker.priority(), 20);
+        assert_eq!(checker.priority(), super::super::CheckerPriority::REPLICA);
     }
 }

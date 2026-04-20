@@ -26,6 +26,6 @@ pub use pd_server::Pd;
 pub use pool::{PoolManager, PoolStore};
 pub use bg::{BGManager, BGStore, BGTable, BGTableSummary};
 pub use cluster::ClusterManager;
-pub use schedule::{Coordinator, CoordinatorContext, BGCommands, OperatorController};
+pub use schedule::{Manager, ManagerContext, BGCommands, OperatorController};
 pub use rpc_context::RpcContext;
 pub use rpc_handler::PdRpcHandler;

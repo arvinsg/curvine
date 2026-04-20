@@ -12,49 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::CheckerContext;
-use crate::pd::schedule::operator::{BGOperator, OperatorBuilder, OperatorKind};
-use crate::pd::schedule::CoordinatorContext;
-use curvine_common::state::BlockGroupInfo;
-use std::sync::Arc;
+use crate::pd::schedule::operator::{BGOperator, OpPriority, OperatorBuilder, OperatorKind};
+use crate::pd::schedule::ManagerContext;
+use curvine_common::state::{BlockGroupInfo, ReplicaState};
 
-/// LeaseValidityChecker: detects invalid leases and generates LeaseTransfer operators.
-pub struct LeaseValidityChecker {
-    ctx: Arc<CoordinatorContext>,
-}
+pub struct LeaseValidityChecker;
 
 impl LeaseValidityChecker {
-    pub fn new(ctx: Arc<CoordinatorContext>) -> Self {
-        Self { ctx }
-    }
-
-    fn is_lease_invalid(&self, bg: &BlockGroupInfo, ctx: &CheckerContext<'_>) -> bool {
+    fn is_lease_invalid(bg: &BlockGroupInfo, ctx: &ManagerContext) -> bool {
         match bg.lease_owner.as_ref() {
             None => true,
             Some(lease) => {
                 !bg.replica_set.contains(&lease.node_id)
                     || !ctx.pool_manager.is_worker_available(lease.node_id)
+                    || ctx.bg_manager.get_replica_state(bg.bg_id, lease.node_id)
+                        == ReplicaState::Offline
             }
         }
     }
 
-    fn build_lease_transfer(
-        &self,
-        bg: &BlockGroupInfo,
-        ctx: &CheckerContext<'_>,
-    ) -> Option<BGOperator> {
+    fn build_lease_transfer(bg: &BlockGroupInfo, ctx: &ManagerContext) -> Option<BGOperator> {
         let lease_counts = ctx.bg_manager.get_worker_lease_counts();
 
-        let new_owner = bg
-            .replica_set
+        let serving = ctx.bg_manager.get_serving_replicas(bg.bg_id);
+        let new_owner = serving
             .iter()
-            .filter(|w| ctx.pool_manager.is_worker_available(**w))
-            .min_by_key(|&&w| {
-                (
-                    lease_counts.get(&w).copied().unwrap_or(0),
-                    w,
-                )
-            })
+            .min_by_key(|&&w| (lease_counts.get(&w).copied().unwrap_or(0), w))
             .copied()?;
 
         let old_worker = bg.lease_owner.as_ref().map(|l| l.node_id).unwrap_or(0);
@@ -66,11 +49,14 @@ impl LeaseValidityChecker {
             OperatorBuilder::new(
                 OperatorKind::LeaseTransfer,
                 bg.bg_id,
-                format!("Transfer lease from {} to {} (validity fix)", old_worker, new_owner),
+                format!(
+                    "Transfer lease from {} to {} (validity fix)",
+                    old_worker, new_owner
+                ),
             )
             .bg_epoch(bg.bg_epoch)
             .transfer_lease(old_worker, new_owner)
-            .priority(80)
+            .priority(OpPriority::LEASE_VALIDITY_FIX)
             .build(),
         )
     }
@@ -81,26 +67,26 @@ impl super::Checker for LeaseValidityChecker {
         "lease-validity-checker"
     }
 
-    fn check_bg(&self, bg: &BlockGroupInfo, ctx: &CheckerContext<'_>) -> Option<BGOperator> {
-        if !self.is_lease_invalid(bg, ctx) {
+    fn check_bg(&self, bg: &BlockGroupInfo, ctx: &ManagerContext) -> Option<BGOperator> {
+        if !Self::is_lease_invalid(bg, ctx) {
             return None;
         }
-        self.build_lease_transfer(bg, ctx)
+        Self::build_lease_transfer(bg, ctx)
     }
 
     fn priority(&self) -> u32 {
-        10
+        super::CheckerPriority::LEASE_VALIDITY
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pd::schedule::checker::{Checker, CheckerContext};
+    use crate::pd::schedule::checker::Checker;
     use curvine_common::state::{BGLease, BGOpState, BGState};
 
-    fn test_ctx() -> Arc<CoordinatorContext> {
-        crate::pd::schedule::checker::tests_common::test_coordinator_context(
+    fn test_ctx() -> std::sync::Arc<ManagerContext> {
+        crate::pd::schedule::checker::tests_common::test_context(
             std::collections::HashMap::new(),
         )
     }
@@ -123,32 +109,27 @@ mod tests {
         }
     }
 
-    fn checker_ctx(ctx: &CoordinatorContext) -> CheckerContext<'_> {
-        CheckerContext {
-            pool_manager: &ctx.pool_manager,
-            bg_manager: &ctx.bg_manager,
-            node_manager: &ctx.node_manager,
-            config_manager: &ctx.config_manager,
-        }
-    }
-
     #[test]
     fn no_op_for_bg_with_no_available_workers() {
         let ctx = test_ctx();
-        let checker = LeaseValidityChecker::new(ctx.clone());
+        let checker = LeaseValidityChecker;
         let bg = make_bg(1, 0x0001_0001, vec![100, 101]);
         ctx.bg_manager
-            .apply_create_bg(&crate::pd::journal::entry::BGEntry { op_ms: 0, info: bg.clone() })
+            .apply_create_bg(&crate::pd::journal::entry::BGEntry {
+                op_ms: 0,
+                info: bg.clone(),
+            })
             .unwrap();
-        let cctx = checker_ctx(&ctx);
-        assert!(checker.check_bg(&bg, &cctx).is_none());
+        assert!(checker.check_bg(&bg, &ctx).is_none());
     }
 
     #[test]
     fn name_and_priority() {
-        let ctx = test_ctx();
-        let checker = LeaseValidityChecker::new(ctx);
+        let checker = LeaseValidityChecker;
         assert_eq!(checker.name(), "lease-validity-checker");
-        assert_eq!(checker.priority(), 10);
+        assert_eq!(
+            checker.priority(),
+            super::super::CheckerPriority::LEASE_VALIDITY
+        );
     }
 }

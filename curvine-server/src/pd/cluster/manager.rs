@@ -14,22 +14,58 @@
 
 use crate::pd::bg::BGManager;
 use crate::pd::config::ConfigManager;
-use crate::pd::journal;
 use crate::pd::meta::MetaManager;
 use crate::pd::mount::MountManager;
 use crate::pd::node::NodeManager;
 use crate::pd::pool::PoolManager;
-use crate::pd::schedule::coordinator::LeaderChecker;
-use crate::pd::schedule::{Coordinator, CoordinatorContext};
+use crate::pd::schedule::operator_controller::OperatorController;
+use crate::pd::schedule::{Manager, ManagerContext};
+use curvine_common::raft::RoleState;
 use curvine_common::state::{
-    HeartbeatRequest, HeartbeatResponse, HeartbeatResponsePayload,
-    MetaHeartbeatResponse, NodePayload, NodeState, RegisterRequest,
-    WorkerHeartbeatResponse,
+    HeartbeatRequest, HeartbeatResponse, HeartbeatResponsePayload, MetaHeartbeatResponse,
+    NodePayload, NodeState, RegisterRequest, WorkerHeartbeatResponse,
 };
 use curvine_common::{FsError, FsResult};
-use std::sync::Arc;
+use orpc::runtime::RpcRuntime;
+use orpc::sync::StateCtl;
+use std::sync::{Arc, Mutex};
+use tokio_util::sync::CancellationToken;
 
-/// Cluster manager: ties node, pool, bg, config, mount, meta (MetaNode Federation) and the schedule coordinator.
+/// Trait for checking PD leader status.
+pub trait LeaderChecker: Send + Sync {
+    fn is_leader(&self) -> bool;
+}
+
+/// Raft-based leader checker.
+pub struct RaftLeaderChecker {
+    role_ctl: StateCtl,
+}
+
+impl RaftLeaderChecker {
+    pub fn new(role_ctl: StateCtl) -> Self {
+        Self { role_ctl }
+    }
+}
+
+impl LeaderChecker for RaftLeaderChecker {
+    fn is_leader(&self) -> bool {
+        let state: RoleState = self.role_ctl.state();
+        state == RoleState::Leader
+    }
+}
+
+#[cfg(test)]
+pub struct AlwaysLeader;
+
+#[cfg(test)]
+impl LeaderChecker for AlwaysLeader {
+    fn is_leader(&self) -> bool {
+        true
+    }
+}
+
+/// Cluster manager: ties node, pool, bg and schedule manager.
+/// Owns the leader lifecycle: starts/stops schedule+liveness loops on leader change.
 pub struct ClusterManager {
     node_manager: Arc<NodeManager>,
     pool_manager: Arc<PoolManager>,
@@ -37,8 +73,10 @@ pub struct ClusterManager {
     config_manager: Arc<ConfigManager>,
     mount_manager: Arc<MountManager>,
     meta_manager: Arc<MetaManager>,
-    journal_client: Arc<journal::Client>,
-    coordinator: Arc<Coordinator>,
+    schedule_manager: Arc<Manager>,
+    leader_checker: Arc<dyn LeaderChecker>,
+    runtime: Arc<orpc::runtime::Runtime>,
+    leader_token: Mutex<Option<CancellationToken>>,
 }
 
 impl ClusterManager {
@@ -49,22 +87,22 @@ impl ClusterManager {
         config_manager: Arc<ConfigManager>,
         mount_manager: Arc<MountManager>,
         meta_manager: Option<Arc<MetaManager>>,
-        journal_client: Arc<journal::Client>,
         leader_checker: Arc<dyn LeaderChecker>,
+        runtime: Arc<orpc::runtime::Runtime>,
     ) -> Self {
-        let event_rx = node_manager.subscribe();
-        let ctx = Arc::new(CoordinatorContext {
+        let operator_controller = Arc::new(OperatorController::new(
+            config_manager.clone(),
+            bg_manager.clone(),
+        ));
+        let ctx = Arc::new(ManagerContext {
             node_manager: node_manager.clone(),
             pool_manager: pool_manager.clone(),
             bg_manager: bg_manager.clone(),
             config_manager: config_manager.clone(),
-            journal_client: journal_client.clone(),
-            leader_checker,
+            operator_controller,
+            runtime: runtime.clone(),
         });
-        let coordinator = Arc::new(Coordinator::new(ctx));
-        coordinator.clone().run(event_rx);
-
-        node_manager.clone().start_liveness_loop();
+        let schedule_manager = Arc::new(Manager::new(ctx));
 
         let meta_manager = meta_manager.expect("MetaManager is required");
         Self {
@@ -74,12 +112,59 @@ impl ClusterManager {
             config_manager,
             mount_manager,
             meta_manager,
-            journal_client,
-            coordinator,
+            schedule_manager,
+            leader_checker,
+            runtime,
+            leader_token: Mutex::new(None),
         }
     }
 
-    // ========== Worker registration & heartbeat ==========
+    /// Start the leader lifecycle monitor. Polls leadership status and
+    /// starts/stops schedule+liveness loops accordingly.
+    pub fn start_leader_monitor(self: &Arc<Self>) {
+        let mgr = self.clone();
+        self.runtime.spawn(async move {
+            mgr.leader_lifecycle_loop().await;
+        });
+    }
+
+    async fn leader_lifecycle_loop(&self) {
+        let mut was_leader = false;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let is_leader = self.leader_checker.is_leader();
+            if is_leader && !was_leader {
+                self.on_leader_start();
+                was_leader = true;
+            } else if !is_leader && was_leader {
+                self.on_leader_stop();
+                was_leader = false;
+            }
+        }
+    }
+
+    fn on_leader_start(&self) {
+        let mut guard = self.leader_token.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+        log::info!("PD became leader, starting schedule and liveness loops");
+        let token = CancellationToken::new();
+        let event_rx = self.node_manager.subscribe();
+        self.schedule_manager.clone().start(event_rx, token.clone());
+        self.node_manager
+            .clone()
+            .start_liveness_loop(self.runtime.clone(), token.clone());
+        *guard = Some(token);
+    }
+
+    fn on_leader_stop(&self) {
+        let mut guard = self.leader_token.lock().unwrap();
+        if let Some(token) = guard.take() {
+            log::info!("PD lost leadership, stopping schedule and liveness loops");
+            token.cancel();
+        }
+    }
 
     pub fn handle_worker_register(&self, req: RegisterRequest) -> FsResult<HeartbeatResponse> {
         let worker_payload = match &req.payload {
@@ -87,14 +172,11 @@ impl ClusterManager {
             _ => return Err(FsError::common("expected Worker payload")),
         };
 
-        // NodeManager.register() validates, builds NodeInfo, and proposes via Raft.
         let (node_info, new_epoch) = self.node_manager.register(req)?;
 
         let _pool_ids = self
             .pool_manager
             .assign_worker_to_pools(node_info.base.node_id, &worker_payload.storage_specs)?;
-
-        // Coordinator event_loop handles rebuild scheduling via NodeEvent::Registered
 
         let worker_bgs = self.bg_manager.get_bgs_on_worker(node_info.base.node_id);
 
@@ -112,20 +194,31 @@ impl ClusterManager {
     }
 
     pub fn handle_worker_heartbeat(&self, req: HeartbeatRequest) -> FsResult<HeartbeatResponse> {
+        if let curvine_common::state::HeartbeatPayload::Worker(ref w) = req.payload {
+            if !w.bg_reports.is_empty() {
+                self.bg_manager
+                    .update_replica_states_from_reports(req.node_id, &w.bg_reports);
+            } else if !w.bg_epochs.is_empty() {
+                let bg_ids: Vec<u32> = w.bg_epochs.keys().copied().collect();
+                self.bg_manager
+                    .update_replica_states_from_bg_ids(req.node_id, &bg_ids);
+            }
+        }
+
         let mut resp = self.node_manager.handle_heartbeat(req.clone())?;
         resp.mount_version = self.mount_manager.version();
         resp.table_epochs = self.bg_manager.get_table_epochs();
 
-        let commands = self.coordinator.dispatch_operators(req.node_id);
+        let commands = self.schedule_manager.dispatch_operators(req.node_id);
         if let HeartbeatResponsePayload::Worker(ref mut w) = resp.payload {
             w.add_bgs.extend(commands.add_bgs);
             w.remove_bgs.extend(commands.remove_bgs);
+            let extra = self.bg_manager.drain_extra_remove_bgs(req.node_id);
+            w.remove_bgs.extend(extra);
         }
 
         Ok(resp)
     }
-
-    // ========== MetaNode registration & heartbeat ==========
 
     pub fn handle_meta_register(&self, req: RegisterRequest) -> FsResult<HeartbeatResponse> {
         if !matches!(&req.payload, NodePayload::Meta(_)) {
@@ -161,13 +254,9 @@ impl ClusterManager {
         Ok(resp)
     }
 
-    // ========== Decommission ==========
-
     pub fn handle_decommission(&self, node_id: u32) -> FsResult<NodeState> {
         self.node_manager.start_decommission(node_id)
     }
-
-    // ========== Accessors ==========
 
     pub fn node_manager(&self) -> Arc<NodeManager> {
         self.node_manager.clone()

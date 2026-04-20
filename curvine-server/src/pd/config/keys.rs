@@ -44,6 +44,27 @@ pub const PD_BG_REBUILD_COOLDOWN_MS_DEFAULT: u64 = 60_000;
 pub const PD_BG_REBUILD_AUTO_ENABLED: &str = "pd.bg.rebuild.auto_enabled";
 pub const PD_BG_REBUILD_AUTO_ENABLED_DEFAULT: bool = true;
 
+/// Placement policy strategy (`quota` / `capacity`).
+pub const PD_BG_BALANCE_POLICY: &str = "pd.bg.balance_policy";
+pub const PD_BG_BALANCE_POLICY_DEFAULT: &str = "quota";
+
+/// Placement policy for replica isolation (`default` / `topology_aware`).
+/// `topology_aware` uses `location_labels` from server config for hierarchical isolation.
+/// Applies globally to all pools.
+pub const PD_BG_PLACEMENT_POLICY: &str = "pd.bg.placement_policy";
+pub const PD_BG_PLACEMENT_POLICY_DEFAULT: &str = "default";
+
+/// Hard minimum isolation level (a label name from `location_labels`).
+/// When set, replicas MUST NOT share the same value at this level.
+/// Empty string = no hard isolation (only soft score preference).
+pub const PD_BG_MIN_ISOLATION_LEVEL: &str = "pd.bg.min_isolation_level";
+pub const PD_BG_MIN_ISOLATION_LEVEL_DEFAULT: &str = "";
+
+/// Tolerant ratio (basis points) applied by the planner during build/rebuild.
+/// 100 bps = 1%. Default 1000 bps = 10%.
+pub const PD_BG_REBUILD_TOLERANT_RATIO_BPS: &str = "pd.bg.rebuild.tolerant_ratio_bps";
+pub const PD_BG_REBUILD_TOLERANT_RATIO_BPS_DEFAULT: u32 = 1000;
+
 /// BG assignment check interval (in milliseconds).
 pub const PD_SCHEDULE_BG_CHECK_INTERVAL_MS: &str = "pd.schedule.bg_check_interval_ms";
 pub const PD_SCHEDULE_BG_CHECK_INTERVAL_MS_DEFAULT: u64 = 10_000;
@@ -51,6 +72,10 @@ pub const PD_SCHEDULE_BG_CHECK_INTERVAL_MS_DEFAULT: u64 = 10_000;
 /// Patrol interval for checkers (in milliseconds).
 pub const PD_SCHEDULE_PATROL_INTERVAL_MS: &str = "pd.schedule.patrol_interval_ms";
 pub const PD_SCHEDULE_PATROL_INTERVAL_MS_DEFAULT: u64 = 10_000;
+
+/// Operator tick interval (in milliseconds).
+pub const PD_SCHEDULE_OPERATOR_TICK_INTERVAL_MS: &str = "pd.schedule.operator_tick_interval_ms";
+pub const PD_SCHEDULE_OPERATOR_TICK_INTERVAL_MS_DEFAULT: u64 = 200;
 
 /// Lease check interval (in milliseconds).
 pub const PD_SCHEDULE_LEASE_CHECK_INTERVAL_MS: &str = "pd.schedule.lease_check_interval_ms";
@@ -62,7 +87,7 @@ pub const PD_SCHEDULE_MAX_WAITING_OPERATORS_DEFAULT: u32 = 100;
 
 /// Max concurrent operators per worker.
 pub const PD_SCHEDULE_MAX_OPERATORS_PER_WORKER: &str = "pd.schedule.max_operators_per_worker";
-pub const PD_SCHEDULE_MAX_OPERATORS_PER_WORKER_DEFAULT: u32 = 5;
+pub const PD_SCHEDULE_MAX_OPERATORS_PER_WORKER_DEFAULT: u32 = 10;
 
 /// Max concurrent recovery operators.
 pub const PD_RECOVERY_MAX_CONCURRENT: &str = "pd.recovery.max_concurrent";
@@ -73,44 +98,67 @@ pub const PD_NODE_LIVENESS_CHECK_INTERVAL_MS: &str = "pd.node.liveness_check_int
 pub const PD_NODE_LIVENESS_CHECK_INTERVAL_MS_DEFAULT: u64 = 5_000;
 
 /// Per-step timeout for TransferLease operators, in milliseconds.
-pub const PD_SCHEDULE_STEP_TIMEOUT_TRANSFER_LEASE_MS: &str = "pd.schedule.step_timeout.transfer_lease_ms";
-pub const PD_SCHEDULE_STEP_TIMEOUT_TRANSFER_LEASE_MS_DEFAULT: u64 = 30_000;
+pub const PD_SCHEDULE_STEP_TIMEOUT_TRANSFER_LEASE_MS: &str =
+    "pd.schedule.step_timeout.transfer_lease_ms";
+pub const PD_SCHEDULE_STEP_TIMEOUT_TRANSFER_LEASE_MS_DEFAULT: u64 = 300_000;
 
 /// Per-step timeout for AddReplica operators, in milliseconds.
 pub const PD_SCHEDULE_STEP_TIMEOUT_ADD_REPLICA_MS: &str = "pd.schedule.step_timeout.add_replica_ms";
-pub const PD_SCHEDULE_STEP_TIMEOUT_ADD_REPLICA_MS_DEFAULT: u64 = 600_000;
+pub const PD_SCHEDULE_STEP_TIMEOUT_ADD_REPLICA_MS_DEFAULT: u64 = 180_000;
 
 /// Per-step timeout for RemoveReplica operators, in milliseconds.
-pub const PD_SCHEDULE_STEP_TIMEOUT_REMOVE_REPLICA_MS: &str = "pd.schedule.step_timeout.remove_replica_ms";
+pub const PD_SCHEDULE_STEP_TIMEOUT_REMOVE_REPLICA_MS: &str =
+    "pd.schedule.step_timeout.remove_replica_ms";
 pub const PD_SCHEDULE_STEP_TIMEOUT_REMOVE_REPLICA_MS_DEFAULT: u64 = 60_000;
+
+/// Per-step timeout for WaitReplicaReady operators, in milliseconds.
+pub const PD_SCHEDULE_STEP_TIMEOUT_WAIT_REPLICA_READY_MS: &str =
+    "pd.schedule.step_timeout.wait_replica_ready_ms";
+pub const PD_SCHEDULE_STEP_TIMEOUT_WAIT_REPLICA_READY_MS_DEFAULT: u64 = 1800_000;
 
 /// Max operator lifetime before cancellation, in milliseconds.
 pub const PD_SCHEDULE_OPERATOR_MAX_LIFETIME_MS: &str = "pd.schedule.operator_max_lifetime_ms";
-pub const PD_SCHEDULE_OPERATOR_MAX_LIFETIME_MS_DEFAULT: u64 = 3_600_000; // 1 hour
-
-/// Max times a suspect BG is checked before auto-clearing.
-pub const PD_SCHEDULE_SUSPECT_MAX_CHECKS: &str = "pd.schedule.suspect_max_checks";
-pub const PD_SCHEDULE_SUSPECT_MAX_CHECKS_DEFAULT: u32 = 5;
-
-/// TTL for suspect BG entries, in milliseconds.
-pub const PD_SCHEDULE_SUSPECT_TTL_MS: &str = "pd.schedule.suspect_ttl_ms";
-pub const PD_SCHEDULE_SUSPECT_TTL_MS_DEFAULT: u64 = 300_000; // 5 minutes
+pub const PD_SCHEDULE_OPERATOR_MAX_LIFETIME_MS_DEFAULT: u64 = 7_200_000; // 2 hour
 
 /// Store limit: AddReplica token refill rate (tokens/sec per worker).
-pub const PD_SCHEDULE_STORE_LIMIT_ADD_REPLICA_RATE: &str = "pd.schedule.store_limit.add_replica_rate";
+pub const PD_SCHEDULE_STORE_LIMIT_ADD_REPLICA_RATE: &str =
+    "pd.schedule.store_limit.add_replica_rate";
 pub const PD_SCHEDULE_STORE_LIMIT_ADD_REPLICA_RATE_DEFAULT: u32 = 5;
 
 /// Store limit: AddReplica burst capacity per worker.
-pub const PD_SCHEDULE_STORE_LIMIT_ADD_REPLICA_CAPACITY: &str = "pd.schedule.store_limit.add_replica_capacity";
+pub const PD_SCHEDULE_STORE_LIMIT_ADD_REPLICA_CAPACITY: &str =
+    "pd.schedule.store_limit.add_replica_capacity";
 pub const PD_SCHEDULE_STORE_LIMIT_ADD_REPLICA_CAPACITY_DEFAULT: u32 = 5;
 
 /// Store limit: RemoveReplica token refill rate (tokens/sec per worker).
-pub const PD_SCHEDULE_STORE_LIMIT_REMOVE_REPLICA_RATE: &str = "pd.schedule.store_limit.remove_replica_rate";
+pub const PD_SCHEDULE_STORE_LIMIT_REMOVE_REPLICA_RATE: &str =
+    "pd.schedule.store_limit.remove_replica_rate";
 pub const PD_SCHEDULE_STORE_LIMIT_REMOVE_REPLICA_RATE_DEFAULT: u32 = 5;
 
 /// Store limit: RemoveReplica burst capacity per worker.
-pub const PD_SCHEDULE_STORE_LIMIT_REMOVE_REPLICA_CAPACITY: &str = "pd.schedule.store_limit.remove_replica_capacity";
+pub const PD_SCHEDULE_STORE_LIMIT_REMOVE_REPLICA_CAPACITY: &str =
+    "pd.schedule.store_limit.remove_replica_capacity";
 pub const PD_SCHEDULE_STORE_LIMIT_REMOVE_REPLICA_CAPACITY_DEFAULT: u32 = 5;
+
+/// Store limit: TransferLease token refill rate (tokens/sec per worker).
+pub const PD_SCHEDULE_STORE_LIMIT_TRANSFER_LEASE_RATE: &str =
+    "pd.schedule.store_limit.transfer_lease_rate";
+pub const PD_SCHEDULE_STORE_LIMIT_TRANSFER_LEASE_RATE_DEFAULT: u32 = 10;
+
+/// Store limit: TransferLease burst capacity per worker.
+pub const PD_SCHEDULE_STORE_LIMIT_TRANSFER_LEASE_CAPACITY: &str =
+    "pd.schedule.store_limit.transfer_lease_capacity";
+pub const PD_SCHEDULE_STORE_LIMIT_TRANSFER_LEASE_CAPACITY_DEFAULT: u32 = 10;
+
+/// Store limit: Rebuild AddReplica/RemoveReplica token refill rate (tokens/sec per worker).
+/// Higher than normal to allow fast bulk rebalancing after expansion.
+pub const PD_SCHEDULE_STORE_LIMIT_REBUILD_RATE: &str = "pd.schedule.store_limit.rebuild_rate";
+pub const PD_SCHEDULE_STORE_LIMIT_REBUILD_RATE_DEFAULT: u32 = 100;
+
+/// Store limit: Rebuild burst capacity per worker.
+pub const PD_SCHEDULE_STORE_LIMIT_REBUILD_CAPACITY: &str =
+    "pd.schedule.store_limit.rebuild_capacity";
+pub const PD_SCHEDULE_STORE_LIMIT_REBUILD_CAPACITY_DEFAULT: u32 = 100;
 
 /// Enable BG count balance scheduler.
 pub const PD_SCHEDULE_BALANCE_BG_ENABLED: &str = "pd.schedule.balance_bg_enabled";
@@ -128,13 +176,13 @@ pub const PD_SCHEDULE_BALANCE_LEADER_ENABLED_DEFAULT: bool = true;
 pub const PD_SCHEDULE_BALANCE_LEADER_INTERVAL_MS: &str = "pd.schedule.balance_leader_interval_ms";
 pub const PD_SCHEDULE_BALANCE_LEADER_INTERVAL_MS_DEFAULT: u64 = 30_000;
 
-/// Balance tolerant ratio in basis points (e.g. 500 = 5%).
+/// Balance tolerant ratio in basis points (e.g. 1000 = 10%).
 pub const PD_SCHEDULE_BALANCE_TOLERANT_RATIO_BPS: &str = "pd.schedule.balance_tolerant_ratio_bps";
-pub const PD_SCHEDULE_BALANCE_TOLERANT_RATIO_BPS_DEFAULT: u32 = 500;
+pub const PD_SCHEDULE_BALANCE_TOLERANT_RATIO_BPS_DEFAULT: u32 = 1000;
 
 /// Max balance operators per cycle.
 pub const PD_SCHEDULE_BALANCE_MAX_OPS_PER_CYCLE: &str = "pd.schedule.balance_max_ops_per_cycle";
-pub const PD_SCHEDULE_BALANCE_MAX_OPS_PER_CYCLE_DEFAULT: u32 = 3;
+pub const PD_SCHEDULE_BALANCE_MAX_OPS_PER_CYCLE_DEFAULT: u32 = 5;
 
 /// Enable placement rule violation checker.
 pub const PD_SCHEDULE_PLACEMENT_CHECK_ENABLED: &str = "pd.schedule.placement_check_enabled";
@@ -172,6 +220,26 @@ pub static DYNAMIC_CONFIG_ITEMS: &[DynamicConfigItem] = &[
         desc: "Enable auto-rebuild of BGTable on node join/remove",
     },
     DynamicConfigItem {
+        key: PD_BG_BALANCE_POLICY,
+        default: "quota",
+        desc: "Placement policy strategy: quota / capacity",
+    },
+    DynamicConfigItem {
+        key: PD_BG_PLACEMENT_POLICY,
+        default: "default",
+        desc: "Placement policy: default / topology_aware",
+    },
+    DynamicConfigItem {
+        key: PD_BG_MIN_ISOLATION_LEVEL,
+        default: "",
+        desc: "Hard minimum isolation level (label name). Empty = soft only",
+    },
+    DynamicConfigItem {
+        key: PD_BG_REBUILD_TOLERANT_RATIO_BPS,
+        default: "1000",
+        desc: "Planner tolerant ratio (basis points) used during build/rebuild",
+    },
+    DynamicConfigItem {
         key: PD_SCHEDULE_BG_CHECK_INTERVAL_MS,
         default: "10000",
         desc: "BG assignment check interval in milliseconds",
@@ -180,6 +248,11 @@ pub static DYNAMIC_CONFIG_ITEMS: &[DynamicConfigItem] = &[
         key: PD_SCHEDULE_PATROL_INTERVAL_MS,
         default: "10000",
         desc: "Patrol interval for checkers in milliseconds",
+    },
+    DynamicConfigItem {
+        key: PD_SCHEDULE_OPERATOR_TICK_INTERVAL_MS,
+        default: "200",
+        desc: "Operator tick interval in milliseconds",
     },
     DynamicConfigItem {
         key: PD_SCHEDULE_LEASE_CHECK_INTERVAL_MS,
@@ -222,19 +295,14 @@ pub static DYNAMIC_CONFIG_ITEMS: &[DynamicConfigItem] = &[
         desc: "Per-step timeout for RemoveReplica operators in milliseconds",
     },
     DynamicConfigItem {
+        key: PD_SCHEDULE_STEP_TIMEOUT_WAIT_REPLICA_READY_MS,
+        default: "600000",
+        desc: "Per-step timeout for WaitReplicaReady operators in milliseconds",
+    },
+    DynamicConfigItem {
         key: PD_SCHEDULE_OPERATOR_MAX_LIFETIME_MS,
         default: "3600000",
         desc: "Max operator lifetime before cancellation in milliseconds",
-    },
-    DynamicConfigItem {
-        key: PD_SCHEDULE_SUSPECT_MAX_CHECKS,
-        default: "5",
-        desc: "Max times a suspect BG is checked before auto-clearing",
-    },
-    DynamicConfigItem {
-        key: PD_SCHEDULE_SUSPECT_TTL_MS,
-        default: "300000",
-        desc: "TTL for suspect BG entries in milliseconds",
     },
     DynamicConfigItem {
         key: PD_SCHEDULE_STORE_LIMIT_ADD_REPLICA_RATE,
@@ -255,6 +323,26 @@ pub static DYNAMIC_CONFIG_ITEMS: &[DynamicConfigItem] = &[
         key: PD_SCHEDULE_STORE_LIMIT_REMOVE_REPLICA_CAPACITY,
         default: "5",
         desc: "Store limit: RemoveReplica burst capacity per worker",
+    },
+    DynamicConfigItem {
+        key: PD_SCHEDULE_STORE_LIMIT_TRANSFER_LEASE_RATE,
+        default: "15",
+        desc: "Store limit: TransferLease token refill rate per worker per second",
+    },
+    DynamicConfigItem {
+        key: PD_SCHEDULE_STORE_LIMIT_TRANSFER_LEASE_CAPACITY,
+        default: "15",
+        desc: "Store limit: TransferLease burst capacity per worker",
+    },
+    DynamicConfigItem {
+        key: PD_SCHEDULE_STORE_LIMIT_REBUILD_RATE,
+        default: "100",
+        desc: "Store limit: Rebuild token refill rate per worker per second (burst class)",
+    },
+    DynamicConfigItem {
+        key: PD_SCHEDULE_STORE_LIMIT_REBUILD_CAPACITY,
+        default: "100",
+        desc: "Store limit: Rebuild burst capacity per worker",
     },
     DynamicConfigItem {
         key: PD_SCHEDULE_BALANCE_BG_ENABLED,

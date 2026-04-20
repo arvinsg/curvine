@@ -12,23 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{NodeAddress, NodeState, StorageType};
+use super::{NodeAddress, NodeState};
 use serde::{Deserialize, Serialize};
-
-/// Placement policy for replica selection
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PlacementPolicy {
-    Default,
-    CrossAZ,
-}
-
-/// BlockGroup policy (persisted)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlockGroupPolicy {
-    pub storage_type: StorageType,
-    pub replicas: u16,
-    pub placement: PlacementPolicy,
-}
 
 /// BG state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +56,26 @@ impl BGState {
         BGState::Rebalancing,
         BGState::Deleting,
     ];
+}
+
+/// Replica lifecycle state (PD runtime, not Raft-persisted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ReplicaState {
+    Pending,
+    Syncing,
+    Active,
+    Offline,
+}
+
+impl ReplicaState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReplicaState::Pending => "pending",
+            ReplicaState::Syncing => "syncing",
+            ReplicaState::Active => "active",
+            ReplicaState::Offline => "offline",
+        }
+    }
 }
 
 /// Lease info
