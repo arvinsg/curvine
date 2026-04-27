@@ -28,8 +28,8 @@ pub use policy::{
 };
 pub use quota_policy::QuotaPolicy;
 pub use rule::{
-    best_isolation_candidates, filter_min_isolation, isolation_score, worst_replica,
-    LabelConstraint, LabelOp, Labels, PlacementRule,
+    best_isolation_candidates, check_isolation_violation, filter_min_isolation, isolation_score,
+    worker_passes_constraints, worst_replica, LabelConstraint, LabelOp, Labels, PlacementRule,
 };
 
 /// Create a placement policy by strategy name.

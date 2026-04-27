@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Per-worker load snapshot for one table, constructed by the scheduler layer.
 #[derive(Debug, Clone)]
@@ -115,56 +115,59 @@ pub fn build_table_snapshot(
     let pool_id = (table_id >> 16) as u16;
     let live_workers = pool_manager.get_live_workers(pool_id);
 
-    let table_bgs = bg_manager
-        .get_table(table_id)
-        .map(|t| {
-            let bgs_lock = bg_manager.list_bgs();
-            let bucket_set: std::collections::HashSet<u32> = t.buckets.iter().copied().collect();
-            bgs_lock
-                .into_iter()
-                .filter(|bg| bucket_set.contains(&bg.bg_id))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let Some(table) = bg_manager.get_table(table_id) else {
+        return HashMap::new();
+    };
+    let bucket_set: HashSet<u32> = table.buckets.iter().copied().collect();
+    let table_bgs: Vec<_> = bg_manager
+        .list_bgs()
+        .into_iter()
+        .filter(|bg| bucket_set.contains(&bg.bg_id))
+        .collect();
 
     live_workers
         .iter()
-        .map(|&wid| {
-            let table_bg_count = table_bgs
-                .iter()
-                .filter(|bg| bg.replica_set.contains(&wid))
-                .count() as u32;
-
-            let table_lease_count = table_bgs
-                .iter()
-                .filter(|bg| bg.lease_owner.as_ref().map(|l| l.node_id) == Some(wid))
-                .count() as u32;
-
-            let (pending_bg_add, pending_bg_remove) =
-                influence.bg_delta.get(&wid).copied().unwrap_or((0, 0));
-            let (pending_lease_in, pending_lease_out) =
-                influence.lease_delta.get(&wid).copied().unwrap_or((0, 0));
-
-            let labels = pool_manager.get_worker_labels(wid).unwrap_or_default();
-            let (capacity, used) = pool_manager
-                .get_worker_storage_stats(wid, media)
-                .unwrap_or((0, 0));
-
-            (
-                wid,
-                WorkerLoadSnapshot {
-                    worker_id: wid,
-                    actual_bg: table_bg_count,
-                    actual_lease: table_lease_count,
-                    pending_bg_add,
-                    pending_bg_remove,
-                    pending_lease_in,
-                    pending_lease_out,
-                    capacity_bytes: capacity as u64,
-                    used_bytes: used as u64,
-                    labels,
-                },
-            )
-        })
+        .map(|&wid| (wid, build_worker_snapshot(wid, &table_bgs, pool_manager, influence, media)))
         .collect()
+}
+
+fn build_worker_snapshot(
+    wid: u32,
+    table_bgs: &[curvine_common::state::BlockGroupInfo],
+    pool_manager: &crate::pd::pool::PoolManager,
+    influence: &PendingInfluence,
+    media: curvine_common::state::StorageType,
+) -> WorkerLoadSnapshot {
+    let actual_bg = table_bgs
+        .iter()
+        .filter(|bg| bg.replica_set.contains(&wid))
+        .count() as u32;
+
+    let actual_lease = table_bgs
+        .iter()
+        .filter(|bg| bg.lease_owner.as_ref().map(|l| l.node_id) == Some(wid))
+        .count() as u32;
+
+    let (pending_bg_add, pending_bg_remove) =
+        influence.bg_delta.get(&wid).copied().unwrap_or((0, 0));
+    let (pending_lease_in, pending_lease_out) =
+        influence.lease_delta.get(&wid).copied().unwrap_or((0, 0));
+
+    let labels = pool_manager.get_worker_labels(wid).unwrap_or_default();
+    let (capacity, used) = pool_manager
+        .get_worker_storage_stats(wid, media)
+        .unwrap_or((0, 0));
+
+    WorkerLoadSnapshot {
+        worker_id: wid,
+        actual_bg,
+        actual_lease,
+        pending_bg_add,
+        pending_bg_remove,
+        pending_lease_in,
+        pending_lease_out,
+        capacity_bytes: capacity as u64,
+        used_bytes: used as u64,
+        labels,
+    }
 }

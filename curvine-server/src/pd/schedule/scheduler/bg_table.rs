@@ -1,12 +1,16 @@
 use super::Scheduler;
+use crate::pd::config::keys;
 use crate::pd::node::{NodeEvent, NodeEventType};
-use crate::pd::schedule::operator::{BGOperator, OpPriority, OperatorBuilder, OperatorKind};
-use crate::pd::schedule::ManagerContext;
+use crate::pd::schedule::{BGOperator, ManagerContext, OpPriority, OperatorBuilder, OperatorKind};
 use curvine_common::state::{BGOpState, NodeType, ReplicaState};
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+
+const BGTABLE_MIN_INTERVAL: Duration = Duration::from_secs(5);
+const BGTABLE_MAX_INTERVAL: Duration = Duration::from_secs(60);
+const BGTABLE_BACKOFF_FACTOR: f64 = 1.5;
 
 /// Reason for BGTable rebuild.
 #[derive(Clone, Debug)]
@@ -44,10 +48,10 @@ impl BGTableScheduler {
     }
 
     pub fn schedule_rebuild(&self, pool_ids: Vec<u16>, reason: RebuildReason) {
-        let auto_enabled = self
-            .ctx
-            .config_manager
-            .get_bool("pd.bg.rebuild.auto_enabled", true);
+        let auto_enabled = self.ctx.config_manager.get_bool(
+            keys::PD_BG_REBUILD_AUTO_ENABLED,
+            keys::PD_BG_REBUILD_AUTO_ENABLED_DEFAULT,
+        );
 
         if !auto_enabled {
             log::info!(
@@ -57,10 +61,10 @@ impl BGTableScheduler {
             return;
         }
 
-        let cooldown = self
-            .ctx
-            .config_manager
-            .get_u64("pd.bg.rebuild.cooldown_ms", 60_000);
+        let cooldown = self.ctx.config_manager.get_u64(
+            keys::PD_BG_REBUILD_COOLDOWN_MS,
+            keys::PD_BG_REBUILD_COOLDOWN_MS_DEFAULT,
+        );
         let scheduled_time = orpc::common::LocalTime::mills() + cooldown;
 
         for pool_id in pool_ids {
@@ -242,11 +246,12 @@ impl Scheduler for BGTableScheduler {
     }
 
     fn min_interval(&self) -> Duration {
-        Duration::from_secs(5) // Same as old rebuild_loop
+        BGTABLE_MIN_INTERVAL
     }
 
     fn next_interval(&self, current: Duration) -> Duration {
-        current // Fixed interval for table management
+        let ms = (current.as_millis() as f64 * BGTABLE_BACKOFF_FACTOR) as u64;
+        Duration::from_millis(ms).min(BGTABLE_MAX_INTERVAL)
     }
 
     fn on_event(&self, event: &NodeEvent) {
@@ -314,6 +319,32 @@ fn merge_reasons(existing: &RebuildReason, new: &RebuildReason) -> RebuildReason
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pd::pool::POOL_ID_SSD;
+    use crate::pd::schedule::checker::tests_common::{test_context, Fixture};
+    use std::collections::HashMap;
+
+    #[test]
+    fn name_and_type() {
+        let ctx = test_context(HashMap::new());
+        let s = BGTableScheduler::new(ctx);
+        assert_eq!(s.name(), "bg-table-scheduler");
+    }
+
+    #[test]
+    fn interval_backoff() {
+        let ctx = test_context(HashMap::new());
+        let s = BGTableScheduler::new(ctx);
+        // min_interval = 5s; next_interval grows by 1.5x up to 60s.
+        assert_eq!(s.min_interval(), Duration::from_secs(5));
+        let i1 = s.next_interval(s.min_interval());
+        assert!(i1 > Duration::from_secs(5) && i1 <= Duration::from_secs(60));
+        // Converges to the cap.
+        let mut cur = s.min_interval();
+        for _ in 0..20 {
+            cur = s.next_interval(cur);
+        }
+        assert_eq!(cur, Duration::from_secs(60));
+    }
 
     #[test]
     fn merge_same_type_joined() {
@@ -347,12 +378,256 @@ mod tests {
         }
     }
 
+    fn scheduler_for(f: &Fixture) -> BGTableScheduler {
+        BGTableScheduler::new(f.ctx.clone())
+    }
+
     #[test]
-    fn name_and_type() {
-        let ctx = crate::pd::schedule::checker::tests_common::test_context(
-            std::collections::HashMap::new(),
+    fn table_init_skips_when_not_enough_workers() {
+        // Only 2 workers but replica_count=3 → skip; no Raft propose attempted.
+        let f = Fixture::new();
+        f.add_workers(&[100, 101], POOL_ID_SSD);
+        let s = scheduler_for(&f);
+
+        s.check_table_initialization();
+
+        let table_id = ((POOL_ID_SSD as u32) << 16) | 3;
+        assert!(
+            f.ctx.bg_manager.get_table(table_id).is_none(),
+            "table must not be initialized with only 2 workers for replica_count=3"
         );
-        let s = BGTableScheduler::new(ctx);
-        assert_eq!(s.name(), "bg-table-scheduler");
+    }
+
+    #[test]
+    fn table_init_skips_when_table_already_exists() {
+        let f = Fixture::new();
+        f.add_workers(&[100, 101, 102], POOL_ID_SSD);
+        let existing_id = f.insert_table(POOL_ID_SSD, 3);
+        let s = scheduler_for(&f);
+
+        // Should see the existing table and short-circuit without touching Raft.
+        s.check_table_initialization();
+
+        assert!(f.ctx.bg_manager.get_table(existing_id).is_some());
+    }
+
+    #[test]
+    fn schedule_rebuild_stores_task_with_cooldown() {
+        let f = Fixture::new();
+        let s = scheduler_for(&f);
+        let before = orpc::common::LocalTime::mills();
+
+        s.schedule_rebuild(
+            vec![POOL_ID_SSD],
+            RebuildReason::NodeJoined {
+                node_ids: vec![100],
+            },
+        );
+
+        let task = s.pending_rebuilds.get(&POOL_ID_SSD).expect("pending task");
+        // Default cooldown is 60_000 ms.
+        assert!(
+            task.scheduled_time_ms >= before + 60_000,
+            "task.scheduled_time_ms should be at least now+cooldown"
+        );
+        matches!(task.reason, RebuildReason::NodeJoined { .. });
+    }
+
+    #[test]
+    fn schedule_rebuild_merges_same_pool() {
+        let f = Fixture::new();
+        let s = scheduler_for(&f);
+
+        s.schedule_rebuild(
+            vec![POOL_ID_SSD],
+            RebuildReason::NodeJoined {
+                node_ids: vec![100],
+            },
+        );
+        s.schedule_rebuild(
+            vec![POOL_ID_SSD],
+            RebuildReason::NodeJoined {
+                node_ids: vec![101],
+            },
+        );
+
+        let task = s.pending_rebuilds.get(&POOL_ID_SSD).unwrap();
+        match &task.reason {
+            RebuildReason::NodeJoined { node_ids } => assert_eq!(node_ids, &vec![100, 101]),
+            _ => panic!("expected merged NodeJoined"),
+        }
+    }
+
+    #[test]
+    fn schedule_rebuild_takes_later_scheduled_time() {
+        let f = Fixture::new();
+        let s = scheduler_for(&f);
+
+        s.schedule_rebuild(vec![POOL_ID_SSD], RebuildReason::Manual);
+        let first = s
+            .pending_rebuilds
+            .get(&POOL_ID_SSD)
+            .unwrap()
+            .scheduled_time_ms;
+
+        // Call again — should not decrease scheduled_time_ms.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        s.schedule_rebuild(vec![POOL_ID_SSD], RebuildReason::Manual);
+        let second = s
+            .pending_rebuilds
+            .get(&POOL_ID_SSD)
+            .unwrap()
+            .scheduled_time_ms;
+
+        assert!(second >= first, "scheduled_time_ms must be monotonic (max)");
+    }
+
+    #[test]
+    fn schedule_rebuild_disabled_by_config() {
+        let f = Fixture::with_overrides(
+            [(keys::PD_BG_REBUILD_AUTO_ENABLED, "false")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        let s = scheduler_for(&f);
+
+        s.schedule_rebuild(vec![POOL_ID_SSD], RebuildReason::Manual);
+
+        assert!(
+            s.pending_rebuilds.is_empty(),
+            "auto_enabled=false must skip pending insertion"
+        );
+    }
+
+    fn make_event(event_type: NodeEventType, node_type: NodeType, node_id: u32) -> NodeEvent {
+        NodeEvent {
+            event_type,
+            node_id,
+            node_type,
+            old_state: None,
+            new_state: None,
+            epoch: 1,
+            event_time_ms: 0,
+        }
+    }
+
+    struct EventCase {
+        name: &'static str,
+        event_type: NodeEventType,
+        node_type: NodeType,
+        expect_pending: bool,
+        expect_reason_matches_removed: bool,
+    }
+
+    fn event_cases() -> Vec<EventCase> {
+        vec![
+            EventCase {
+                name: "Worker Registered → NodeJoined",
+                event_type: NodeEventType::Registered,
+                node_type: NodeType::Worker,
+                expect_pending: true,
+                expect_reason_matches_removed: false,
+            },
+            EventCase {
+                name: "Worker Offline → NodeRemoved",
+                event_type: NodeEventType::Offline,
+                node_type: NodeType::Worker,
+                expect_pending: true,
+                expect_reason_matches_removed: true,
+            },
+            EventCase {
+                name: "Worker DecommissionFinished → NodeRemoved",
+                event_type: NodeEventType::DecommissionFinished,
+                node_type: NodeType::Worker,
+                expect_pending: true,
+                expect_reason_matches_removed: true,
+            },
+            EventCase {
+                name: "Worker Lost → no-op",
+                event_type: NodeEventType::Lost,
+                node_type: NodeType::Worker,
+                expect_pending: false,
+                expect_reason_matches_removed: false,
+            },
+            EventCase {
+                name: "Meta Registered → no-op",
+                event_type: NodeEventType::Registered,
+                node_type: NodeType::Meta,
+                expect_pending: false,
+                expect_reason_matches_removed: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn on_event_dispatch_table_driven() {
+        for case in event_cases() {
+            let f = Fixture::new();
+            // Register worker 100 and add to pool so get_pools_by_worker returns SSD.
+            f.add_worker(100, POOL_ID_SSD, &[]);
+            let s = scheduler_for(&f);
+
+            let event = make_event(case.event_type, case.node_type, 100);
+            s.on_event(&event);
+
+            if case.expect_pending {
+                let task = s.pending_rebuilds.get(&POOL_ID_SSD);
+                assert!(task.is_some(), "{}: expected a pending task", case.name);
+                if case.expect_reason_matches_removed {
+                    matches!(task.unwrap().reason, RebuildReason::NodeRemoved { .. });
+                }
+            } else {
+                assert!(
+                    s.pending_rebuilds.is_empty(),
+                    "{}: expected no pending task, got {:?}",
+                    case.name,
+                    s.pending_rebuilds
+                        .iter()
+                        .map(|e| *e.key())
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn check_and_execute_skips_future_tasks() {
+        let f = Fixture::new();
+        let s = scheduler_for(&f);
+
+        // Default cooldown is 60s → scheduled_time > now, task should stay pending.
+        s.schedule_rebuild(vec![POOL_ID_SSD], RebuildReason::Manual);
+        let before = s.pending_rebuilds.len();
+
+        let ops = s.check_and_execute_rebuilds();
+        assert!(ops.is_empty(), "future-scheduled tasks produce no ops");
+        assert_eq!(
+            s.pending_rebuilds.len(),
+            before,
+            "task must remain in pending until its scheduled_time"
+        );
+    }
+
+    #[test]
+    fn check_and_execute_releases_ready_tasks() {
+        let f = Fixture::new();
+        let s = scheduler_for(&f);
+
+        // Manually insert a task whose scheduled_time is in the past.
+        s.pending_rebuilds.insert(
+            POOL_ID_SSD,
+            RebuildTask {
+                pool_id: POOL_ID_SSD,
+                reason: RebuildReason::Manual,
+                scheduled_time_ms: 0, // already past
+            },
+        );
+
+        let _ops = s.check_and_execute_rebuilds();
+        assert!(
+            s.pending_rebuilds.is_empty(),
+            "ready task must be removed from pending"
+        );
     }
 }

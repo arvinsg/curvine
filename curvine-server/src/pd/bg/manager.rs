@@ -17,7 +17,7 @@ use super::placement::{
     create_policy, PlacementContext, PlacementRule, RebuildOptions, WorkerLoadSnapshot,
 };
 use super::state_machine;
-use super::{BGStore, BGTable};
+use super::{BGStore, BGTable, BGTableStats};
 use crate::pd::config::{keys, ConfigManager};
 use crate::pd::journal::entry::{BGDeleteEntry, BGEntry, BGUpdateEntry, BatchBGEntry};
 use crate::pd::journal::{self, PdEntry};
@@ -37,7 +37,6 @@ pub struct BGManager {
     bgs: RwLock<HashMap<u32, BlockGroupInfo>>,
     worker_to_bgs: RwLock<HashMap<u32, HashSet<u32>>>,
     replica_states: RwLock<HashMap<u32, HashMap<u32, ReplicaState>>>,
-    extra_remove_bgs: RwLock<HashMap<u32, Vec<u32>>>,
     epoch_dirty: AtomicBool,
     store: Arc<BGStore>,
     pool_manager: Arc<PoolManager>,
@@ -65,7 +64,6 @@ impl BGManager {
             bgs: RwLock::new(HashMap::new()),
             worker_to_bgs: RwLock::new(HashMap::new()),
             replica_states: RwLock::new(HashMap::new()),
-            extra_remove_bgs: RwLock::new(HashMap::new()),
             epoch_dirty: AtomicBool::new(false),
             store,
             pool_manager,
@@ -236,25 +234,6 @@ impl BGManager {
             .collect()
     }
 
-    /// Record extra BGs that a worker holds but PD doesn't expect.
-    pub fn add_extra_remove_bg(&self, worker_id: u32, bg_id: u32) {
-        self.extra_remove_bgs
-            .write()
-            .unwrap()
-            .entry(worker_id)
-            .or_default()
-            .push(bg_id);
-    }
-
-    /// Drain extra remove_bgs for a worker (called during heartbeat response).
-    pub fn drain_extra_remove_bgs(&self, worker_id: u32) -> Vec<u32> {
-        self.extra_remove_bgs
-            .write()
-            .unwrap()
-            .remove(&worker_id)
-            .unwrap_or_default()
-    }
-
     /// Propose Raft removal of a worker from a BG's replica_set.
     pub fn propose_remove_replica(&self, bg_id: u32, worker_id: u32) -> FsResult<()> {
         let bg = self
@@ -272,6 +251,66 @@ impl BGManager {
             state: None,
             replica_set: Some(new_rs),
             lease_owner: None,
+            new_bg_epoch: bg.bg_epoch.saturating_add(1),
+            new_table_epoch: None,
+        };
+        self.journal_client
+            .propose(crate::pd::journal::PdEntry::UpdateBG(entry))
+    }
+
+    /// Propose Raft addition of a worker to a BG's replica_set.
+    pub fn propose_add_replica(&self, bg_id: u32, worker_id: u32) -> FsResult<()> {
+        let bg = self
+            .get_bg(bg_id)
+            .ok_or_else(|| FsError::common(format!("bg {} not found", bg_id)))?;
+        if bg.replica_set.contains(&worker_id) {
+            return Ok(());
+        }
+        let mut new_rs = bg.replica_set.clone();
+        new_rs.push(worker_id);
+        let entry = crate::pd::journal::entry::BGUpdateEntry {
+            op_ms: orpc::common::LocalTime::mills(),
+            bg_id,
+            state: None,
+            replica_set: Some(new_rs),
+            lease_owner: None,
+            new_bg_epoch: bg.bg_epoch.saturating_add(1),
+            new_table_epoch: None,
+        };
+        self.journal_client
+            .propose(crate::pd::journal::PdEntry::UpdateBG(entry))
+    }
+
+    /// Propose Raft transfer of lease owner.
+    pub fn propose_transfer_lease(
+        &self,
+        bg_id: u32,
+        from_worker: u32,
+        to_worker: u32,
+    ) -> FsResult<()> {
+        let bg = self
+            .get_bg(bg_id)
+            .ok_or_else(|| FsError::common(format!("bg {} not found", bg_id)))?;
+        let current_owner = bg.lease_owner.as_ref().map(|l| l.node_id).unwrap_or(0);
+        if current_owner != from_worker {
+            return Ok(());
+        }
+        let new_epoch = bg
+            .lease_owner
+            .as_ref()
+            .map(|l| l.epoch.saturating_add(1))
+            .unwrap_or(1);
+        let lease = curvine_common::state::BGLease {
+            node_id: to_worker,
+            epoch: new_epoch,
+            grant_time_ms: orpc::common::LocalTime::mills(),
+        };
+        let entry = crate::pd::journal::entry::BGUpdateEntry {
+            op_ms: orpc::common::LocalTime::mills(),
+            bg_id,
+            state: None,
+            replica_set: None,
+            lease_owner: Some(lease),
             new_bg_epoch: bg.bg_epoch.saturating_add(1),
             new_table_epoch: None,
         };
@@ -582,6 +621,7 @@ impl BGManager {
             epoch: 0,
             create_time_ms: 0,
             last_rebuild_ms: 0,
+            stats: BGTableStats::default(),
         };
         let worker_snapshots = self.build_worker_snapshots(&stub_table, pool.media, true);
 
@@ -697,24 +737,41 @@ impl BGManager {
         }
     }
 
-    /// Aggregate stats for a table from its BGs (runtime computation).
-    pub fn compute_table_stats(&self, table_id: u32) -> BGStats {
-        let tables = self.tables.read().unwrap();
-        let table = match tables.get(&table_id) {
-            Some(t) => t,
-            None => return BGStats::default(),
-        };
-        let bgs = self.bgs.read().unwrap();
-        let mut agg = BGStats::default();
-        for &bg_id in &table.buckets {
-            if let Some(bg) = bgs.get(&bg_id) {
-                agg.used_bytes += bg.stats.used_bytes;
-                agg.free_bytes += bg.stats.free_bytes;
-                agg.block_count += bg.stats.block_count;
-                agg.last_report_ms = agg.last_report_ms.max(bg.stats.last_report_ms);
+    pub fn get_table_stats(&self, table_id: u32) -> BGTableStats {
+        self.tables
+            .read()
+            .unwrap()
+            .get(&table_id)
+            .map(|t| t.stats.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn refresh_table_stats(&self) {
+        // Phase 1: read-only aggregation.
+        let mut aggregates: HashMap<u32, BGTableStats> = HashMap::new();
+        {
+            let tables = self.tables.read().unwrap();
+            let bgs = self.bgs.read().unwrap();
+            for (&table_id, table) in tables.iter() {
+                let mut agg = BGTableStats::default();
+                for &bg_id in &table.buckets {
+                    if let Some(bg) = bgs.get(&bg_id) {
+                        agg.used_bytes += bg.stats.used_bytes;
+                        agg.free_bytes += bg.stats.free_bytes;
+                        agg.block_count += bg.stats.block_count;
+                        agg.last_report_ms = agg.last_report_ms.max(bg.stats.last_report_ms);
+                    }
+                }
+                aggregates.insert(table_id, agg);
             }
         }
-        agg
+        // Phase 2: short write lock to publish.
+        let mut tables = self.tables.write().unwrap();
+        for (table_id, agg) in aggregates {
+            if let Some(t) = tables.get_mut(&table_id) {
+                t.stats = agg;
+            }
+        }
     }
 
     /// BGs that have this worker in replica_set (uses worker_to_bgs index).
@@ -795,7 +852,7 @@ impl BGManager {
                     .collect();
                 let mut filtered_bg = bg.clone();
                 filtered_bg.replica_set = serving;
-                block_group_info_to_view(&filtered_bg, &self.pool_manager)
+                Self::block_group_info_to_view(&filtered_bg, &self.pool_manager)
             })
             .collect();
         drop(rs);
@@ -1218,6 +1275,14 @@ impl BGManager {
 
     pub fn replica_counts(&self) -> &[u16] {
         &self.replica_counts
+    }
+}
+
+#[cfg(test)]
+impl BGManager {
+    /// Insert a BGTable directly into the in-memory index, bypassing Raft propose.
+    pub fn test_insert_table(&self, table: super::BGTable) {
+        self.tables.write().unwrap().insert(table.table_id, table);
     }
 }
 

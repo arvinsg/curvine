@@ -23,4 +23,4 @@ pub use curvine_common::state::BGTableSummary;
 pub use id_allocator::IdAllocator;
 pub use manager::BGManager;
 pub use store::BGStore;
-pub use table::BGTable;
+pub use table::{BGTable, BGTableStats};

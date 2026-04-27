@@ -20,9 +20,7 @@ pub mod stats;
 
 use crate::pd::bg::placement::context::PendingInfluence;
 use crate::pd::node::NodeEvent;
-use crate::pd::schedule::operator::BGOperator;
-use crate::pd::schedule::operator_controller::OperatorController;
-use crate::pd::schedule::ManagerContext;
+use crate::pd::schedule::{BGOperator, ManagerContext, OperatorController};
 use std::time::Duration;
 
 /// Scheduler trait: proactive, optimization-driven scheduling.

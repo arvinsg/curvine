@@ -16,7 +16,7 @@ use crate::pd::bg::BGManager;
 use crate::pd::config::ConfigManager;
 use crate::pd::node::{NodeEvent, NodeEventType, NodeManager};
 use crate::pd::pool::PoolManager;
-use curvine_common::state::NodeType;
+use curvine_common::state::{BlockGroupInfo, NodeType};
 use orpc::runtime::RpcRuntime;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +35,25 @@ pub struct ManagerContext {
     pub config_manager: Arc<ConfigManager>,
     pub operator_controller: Arc<OperatorController>,
     pub runtime: Arc<orpc::runtime::Runtime>,
+}
+
+impl ManagerContext {
+    /// Pick a lease transfer target from `bg.replica_set`, excluding `leaving` and
+    /// preferring the available worker with the fewest current leases (load balance).
+    pub fn pick_lease_fallback(
+        &self,
+        bg: &BlockGroupInfo,
+        leaving: u32,
+        default_target: u32,
+    ) -> u32 {
+        let lease_counts = self.bg_manager.get_worker_lease_counts();
+        bg.replica_set
+            .iter()
+            .copied()
+            .filter(|&w| w != leaving && self.pool_manager.is_worker_available(w))
+            .min_by_key(|w| lease_counts.get(w).copied().unwrap_or(0))
+            .unwrap_or(default_target)
+    }
 }
 
 /// Central orchestrator: manages checker, scheduler, and operator loops.
@@ -193,7 +212,13 @@ impl Manager {
         self.scheduler_controller.on_event(event);
     }
 
-    pub fn dispatch_operators(&self, worker_id: u32) -> BGCommands {
-        self.ctx.operator_controller.dispatch_to_worker(worker_id)
+    pub fn dispatch_operators(
+        &self,
+        worker_id: u32,
+        reported_bg_epochs: &std::collections::HashMap<u32, u64>,
+    ) -> BGCommands {
+        self.ctx
+            .operator_controller
+            .build_worker_commands(worker_id, reported_bg_epochs)
     }
 }

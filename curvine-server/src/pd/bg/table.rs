@@ -16,6 +16,15 @@ use curvine_common::state::{table_id_pool_id, table_id_replica_count};
 use orpc::common::Utils;
 use serde::{Deserialize, Serialize};
 
+/// Aggregate stats for a BGTable (sum of its BGs' stats).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BGTableStats {
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+    pub block_count: u64,
+    pub last_report_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BGTable {
     pub table_id: u32,
@@ -24,6 +33,9 @@ pub struct BGTable {
     pub epoch: u64,
     pub create_time_ms: u64,
     pub last_rebuild_ms: u64,
+    /// Runtime aggregate; not persisted.
+    #[serde(skip)]
+    pub stats: BGTableStats,
 }
 
 impl BGTable {
@@ -58,6 +70,7 @@ mod tests {
             epoch: 0,
             create_time_ms: 0,
             last_rebuild_ms: 0,
+            stats: BGTableStats::default(),
         };
         assert_eq!(t.lookup(b"key"), 0);
     }
@@ -71,6 +84,7 @@ mod tests {
             epoch: 0,
             create_time_ms: 0,
             last_rebuild_ms: 0,
+            stats: BGTableStats::default(),
         };
         let bg_id = t.lookup(b"some_key");
         assert!(bg_id == 10 || bg_id == 20 || bg_id == 30 || bg_id == 40);
@@ -85,6 +99,7 @@ mod tests {
             epoch: 0,
             create_time_ms: 0,
             last_rebuild_ms: 0,
+            stats: BGTableStats::default(),
         };
         assert_eq!(t.lookup(b"foo"), t.lookup(b"foo"));
         assert_eq!(t.lookup(b"bar"), t.lookup(b"bar"));

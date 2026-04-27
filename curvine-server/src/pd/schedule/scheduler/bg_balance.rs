@@ -13,14 +13,13 @@
 // limitations under the License.
 
 use super::{build_pending_influence, BaseScheduler, Scheduler};
+use crate::pd::bg::placement::context::build_table_snapshot;
 use crate::pd::bg::placement::{
-    best_isolation_candidates, create_policy, filter_min_isolation,
-    isolation_score, is_bg_gap_sufficient, PlacementContext,
+    best_isolation_candidates, create_policy, filter_min_isolation, is_bg_gap_sufficient,
+    isolation_score, PlacementContext,
 };
 use crate::pd::config::keys;
-use crate::pd::schedule::operator::{BGOperator, OpPriority, OperatorBuilder, OperatorKind};
-use crate::pd::bg::placement::context::build_table_snapshot;
-use crate::pd::schedule::ManagerContext;
+use crate::pd::schedule::{BGOperator, ManagerContext, OpPriority, OperatorBuilder, OperatorKind};
 use curvine_common::state::{BGOpState, ReplicaState};
 use std::collections::HashSet;
 use std::time::Duration;
@@ -137,7 +136,11 @@ impl Scheduler for BGBalanceScheduler {
                             &rule.location_labels,
                             &worker_labels,
                         );
-                        if f.is_empty() { constrained.clone() } else { f }
+                        if f.is_empty() {
+                            constrained.clone()
+                        } else {
+                            f
+                        }
                     } else {
                         constrained.clone()
                     };
@@ -166,11 +169,8 @@ impl Scheduler for BGBalanceScheduler {
 
                     // Safety check 2: isolation must not worsen.
                     if !rule.location_labels.is_empty() {
-                        let old_iso = isolation_score(
-                            &resident,
-                            &rule.location_labels,
-                            &worker_labels,
-                        );
+                        let old_iso =
+                            isolation_score(&resident, &rule.location_labels, &worker_labels);
                         let mut new_set = resident.clone();
                         if let Some(pos) = new_set.iter().position(|&w| w == source_id) {
                             new_set[pos] = picked;
@@ -186,10 +186,7 @@ impl Scheduler for BGBalanceScheduler {
                     let mut builder = OperatorBuilder::new(
                         OperatorKind::Balance,
                         bg.bg_id,
-                        format!(
-                            "Balance BG: move from worker {} to {}",
-                            source_id, picked
-                        ),
+                        format!("Balance BG: move from worker {} to {}", source_id, picked),
                     )
                     .bg_epoch(bg.bg_epoch)
                     .priority(OpPriority::BG_BALANCE)
@@ -202,13 +199,7 @@ impl Scheduler for BGBalanceScheduler {
                         .map(|l| l.node_id == source_id)
                         .unwrap_or(false)
                     {
-                        let to_worker = bg
-                            .replica_set
-                            .iter()
-                            .filter(|&&w| w != source_id)
-                            .find(|&&w| ctx.pool_manager.is_worker_available(w))
-                            .copied()
-                            .unwrap_or(picked);
+                        let to_worker = ctx.pick_lease_fallback(bg, source_id, picked);
                         builder = builder.transfer_lease(source_id, to_worker);
                     }
 
@@ -239,16 +230,213 @@ impl Scheduler for BGBalanceScheduler {
     fn next_interval(&self, current: Duration) -> Duration {
         BaseScheduler::default_next_interval(current)
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pd::pool::POOL_ID_SSD;
+    use crate::pd::schedule::checker::tests_common::{decompose, Fixture};
+    use curvine_common::state::BGOpState;
+    use std::collections::HashMap;
 
     #[test]
     fn name_and_type() {
         let s = BGBalanceScheduler;
         assert_eq!(s.name(), "bg-balance-scheduler");
+    }
+
+    fn config_with(overrides: &[(&str, &str)]) -> HashMap<String, String> {
+        overrides
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn seed_imbalanced_bgs(
+        f: &Fixture,
+        table_id: u32,
+        workers: &[u32],
+        replica_count: usize,
+        bg_count: u32,
+    ) {
+        assert!(workers.len() >= replica_count);
+        let replica_set: Vec<u32> = workers[..replica_count].to_vec();
+        let bg_ids: Vec<u32> = (0..bg_count).map(|i| 1_000 + i).collect();
+        for &bg_id in &bg_ids {
+            f.insert_bg(bg_id, table_id, replica_set.clone(), None);
+            f.activate_all_replicas(bg_id);
+        }
+        f.set_table_buckets(table_id, &bg_ids);
+    }
+
+    #[test]
+    fn disabled_by_config_reports_not_allowed() {
+        let f = Fixture::with_overrides(config_with(&[(
+            crate::pd::config::keys::PD_SCHEDULE_BALANCE_BG_ENABLED,
+            "false",
+        )]));
+        assert!(!BGBalanceScheduler.is_schedule_allowed(&f.ctx));
+    }
+
+    #[test]
+    fn enabled_by_default() {
+        let f = Fixture::new();
+        assert!(BGBalanceScheduler.is_schedule_allowed(&f.ctx));
+    }
+
+    #[test]
+    fn no_ops_when_fewer_than_two_workers() {
+        let f = Fixture::new();
+        f.add_worker(100, POOL_ID_SSD, &[]);
+        f.insert_table(POOL_ID_SSD, 3);
+        assert!(BGBalanceScheduler.schedule(&f.ctx).is_empty());
+    }
+
+    #[test]
+    fn no_ops_when_balanced() {
+        // 4 workers, 4 BGs each with replica_count=3 → 12 replica slots / 4 workers = 3 each.
+        let f = Fixture::new();
+        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
+        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        let bg_ids: Vec<u32> = vec![10, 11, 12, 13];
+        for (bg_id, set) in [
+            (10, vec![100, 101, 102]),
+            (11, vec![101, 102, 103]),
+            (12, vec![102, 103, 100]),
+            (13, vec![103, 100, 101]),
+        ] {
+            f.insert_bg(bg_id, table_id, set, None);
+            f.activate_all_replicas(bg_id);
+        }
+        f.set_table_buckets(table_id, &bg_ids);
+
+        let ops = BGBalanceScheduler.schedule(&f.ctx);
+        assert!(
+            ops.is_empty(),
+            "balanced cluster should produce no ops, got {:?}",
+            ops
+        );
+    }
+
+    #[test]
+    fn imbalanced_triggers_balance_op() {
+        // 4 workers, 8 BGs all pinned to first 3 → worker 103 has 0 replicas.
+        // bucket_count=8 → per-worker quota = 24/4 = 6, threshold = 7. Overloaded 100/101/102 hold 8.
+        let f = Fixture::new();
+        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
+        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        seed_imbalanced_bgs(&f, table_id, &[100, 101, 102, 103], 3, 8);
+
+        let ops = BGBalanceScheduler.schedule(&f.ctx);
+        assert!(
+            !ops.is_empty(),
+            "imbalanced cluster should produce at least one op"
+        );
+
+        let op = &ops[0];
+        assert_eq!(op.priority, OpPriority::BG_BALANCE);
+        let (add, remove, _) = decompose(op);
+        assert_eq!(add.len(), 1, "one AddReplica");
+        assert_eq!(remove.len(), 1, "one RemoveReplica");
+        assert!(
+            [100, 101, 102].contains(&remove[0]),
+            "source from overloaded workers"
+        );
+        assert_eq!(add[0], 103, "target is the underloaded worker");
+    }
+
+    #[test]
+    fn max_ops_per_cycle_caps_output() {
+        let f = Fixture::with_overrides(config_with(&[(
+            crate::pd::config::keys::PD_SCHEDULE_BALANCE_MAX_OPS_PER_CYCLE,
+            "1",
+        )]));
+        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
+        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        seed_imbalanced_bgs(&f, table_id, &[100, 101, 102, 103], 3, 8);
+
+        let ops = BGBalanceScheduler.schedule(&f.ctx);
+        assert_eq!(ops.len(), 1, "max_ops=1 enforces single op per cycle");
+    }
+
+    #[test]
+    fn non_idle_bgs_are_skipped() {
+        let f = Fixture::new();
+        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
+        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        seed_imbalanced_bgs(&f, table_id, &[100, 101, 102, 103], 3, 8);
+        for bg_id in 1_000..1_008 {
+            f.ctx.bg_manager.set_op_state(bg_id, BGOpState::Recovering);
+        }
+
+        let ops = BGBalanceScheduler.schedule(&f.ctx);
+        assert!(ops.is_empty(), "all BGs non-Idle → no balance ops");
+    }
+
+    #[test]
+    fn source_lease_owner_triggers_lease_transfer() {
+        let f = Fixture::new();
+        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
+        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        let bg_ids: Vec<u32> = (0..8).map(|i| 1_000 + i).collect();
+        for &bg_id in &bg_ids {
+            f.insert_bg(bg_id, table_id, vec![100, 101, 102], Some(100));
+            f.activate_all_replicas(bg_id);
+        }
+        f.set_table_buckets(table_id, &bg_ids);
+
+        let ops = BGBalanceScheduler.schedule(&f.ctx);
+        let op = ops.iter().find(|o| {
+            let (_, remove, _) = decompose(o);
+            remove.first() == Some(&100)
+        });
+        let op = op.expect("expected an op whose source is lease owner 100");
+        let (_, _, transfer) = decompose(op);
+        assert_eq!(
+            transfer.len(),
+            1,
+            "lease owner removal requires TransferLease"
+        );
+        assert_eq!(transfer[0].0, 100, "transfer from lease owner");
+        assert!(
+            [101, 102, 103].contains(&transfer[0].1),
+            "transfer to available replica/target, got {}",
+            transfer[0].1
+        );
+    }
+
+    #[test]
+    fn source_not_lease_owner_has_no_lease_transfer() {
+        // Lease owner = one of the overloaded workers, but another overloaded worker can also
+        // be the source. When source != lease owner, the op must NOT contain TransferLease.
+        let f = Fixture::new();
+        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
+        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        let bg_ids: Vec<u32> = (0..8).map(|i| 1_000 + i).collect();
+        for &bg_id in &bg_ids {
+            f.insert_bg(bg_id, table_id, vec![100, 101, 102], Some(100));
+            f.activate_all_replicas(bg_id);
+        }
+        f.set_table_buckets(table_id, &bg_ids);
+
+        let ops = BGBalanceScheduler.schedule(&f.ctx);
+        // For each op, the presence of TransferLease must match (source == lease owner).
+        for op in &ops {
+            let (_, remove, transfer) = decompose(op);
+            let source = remove[0];
+            let bg_id = op.bg_id;
+            let bg = f.ctx.bg_manager.get_bg(bg_id).unwrap();
+            let lease = bg.lease_owner.as_ref().unwrap().node_id;
+            if source == lease {
+                assert_eq!(transfer.len(), 1, "source==lease → expected TransferLease");
+            } else {
+                assert!(
+                    transfer.is_empty(),
+                    "source!=lease → expected no TransferLease, got {:?}",
+                    transfer
+                );
+            }
+        }
     }
 }

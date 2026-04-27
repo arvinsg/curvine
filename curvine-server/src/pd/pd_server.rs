@@ -297,3 +297,38 @@ impl Pd {
         });
     }
 }
+
+#[cfg(test)]
+pub fn init_metrics_for_test() {
+    use crate::pd::bg::{BGManager, BGStore};
+    use crate::pd::journal::Client;
+    use crate::pd::node::{NodeManager, NodeStore};
+    use crate::pd::pool::{PoolManager, PoolStore};
+    use crate::pd::store::{KvStore, MemoryKvEngine};
+    use std::collections::HashMap;
+
+    PD_METRICS.get_or_init(|| {
+        let store: Arc<dyn KvStore> = Arc::new(MemoryKvEngine::new());
+        let raft = curvine_common::raft::RaftClient::from_conf(
+            curvine_common::conf::JournalConf::default().create_runtime(),
+            &curvine_common::conf::JournalConf::default(),
+        );
+        let jc = Arc::new(Client::new(raft));
+        let config = Arc::new(ConfigManager::new(store.clone(), jc.clone(), HashMap::new()));
+        let node_store = Arc::new(NodeStore::new(store.clone()));
+        let node_mgr = Arc::new(NodeManager::new(node_store, config.clone(), jc.clone()));
+        let pool_store = Arc::new(PoolStore::new(store.clone()));
+        let pool_mgr = Arc::new(PoolManager::new(pool_store, node_mgr.clone(), jc.clone()));
+        let bg_store = Arc::new(BGStore::new(store));
+        let bg_mgr = Arc::new(BGManager::new(
+            bg_store,
+            pool_mgr.clone(),
+            jc.clone(),
+            config.clone(),
+            1024,
+            vec![3],
+            vec![],
+        ));
+        PdMetrics::new(node_mgr, pool_mgr, bg_mgr).expect("Failed to init test metrics")
+    });
+}

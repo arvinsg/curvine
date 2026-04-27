@@ -42,6 +42,13 @@ impl CheckerController {
 
     /// Run one patrol cycle. Returns operators added during this cycle.
     pub fn patrol(&self) -> Vec<BGOperator> {
+        if !self.ctx.config_manager.get_bool(
+            crate::pd::config::keys::PD_SCHEDULE_CHECKER_ENABLED,
+            crate::pd::config::keys::PD_SCHEDULE_CHECKER_ENABLED_DEFAULT,
+        ) {
+            return vec![];
+        }
+
         let mut added_ops = Vec::new();
 
         // Phase 1: Per-BG scan

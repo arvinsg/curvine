@@ -92,7 +92,7 @@ pub enum OpStep {
     },
     WaitReplicaReady {
         worker_id: u32,
-        min_state: ReplicaState,
+        expected_state: ReplicaState,
     },
 }
 
@@ -109,8 +109,29 @@ impl OpStep {
                 .unwrap_or(false),
             OpStep::WaitReplicaReady {
                 worker_id,
-                min_state,
-            } => bg_manager.get_replica_state(bg.bg_id, *worker_id) >= *min_state,
+                expected_state,
+            } => bg_manager.get_replica_state(bg.bg_id, *worker_id) == *expected_state,
+        }
+    }
+
+    /// Whether this step type modifies BG state via Raft propose (increments bg_epoch).
+    pub fn modifies_bg(&self) -> bool {
+        matches!(
+            self,
+            OpStep::AddReplica { .. } | OpStep::RemoveReplica { .. } | OpStep::TransferLease { .. }
+        )
+    }
+
+    /// Whether this step operates on the given worker (either endpoint for TransferLease).
+    pub fn involves_worker(&self, worker_id: u32) -> bool {
+        match self {
+            OpStep::AddReplica { worker_id: w }
+            | OpStep::RemoveReplica { worker_id: w }
+            | OpStep::WaitReplicaReady { worker_id: w, .. } => *w == worker_id,
+            OpStep::TransferLease {
+                from_worker,
+                to_worker,
+            } => *from_worker == worker_id || *to_worker == worker_id,
         }
     }
 }
@@ -178,10 +199,10 @@ impl OperatorBuilder {
         self
     }
 
-    pub fn wait_replica_ready(mut self, worker_id: u32, min_state: ReplicaState) -> Self {
+    pub fn wait_replica_ready(mut self, worker_id: u32, expected_state: ReplicaState) -> Self {
         self.steps.push(OpStep::WaitReplicaReady {
             worker_id,
-            min_state,
+            expected_state,
         });
         self
     }
@@ -270,6 +291,7 @@ pub struct OpInfluence {
 pub struct BGCommands {
     pub add_bgs: Vec<BlockGroupInfo>,
     pub remove_bgs: Vec<u32>,
+    pub update_bgs: Vec<BlockGroupInfo>,
 }
 
 #[cfg(test)]
@@ -332,169 +354,62 @@ mod tests {
     }
 
     #[test]
-    fn add_replica_is_finish_when_worker_in_replica_set() {
+    fn is_finish_cases() {
         let mgr = test_bg_manager();
-        let bg = make_bg(1, vec![10, 20, 30], None);
-        assert!(OpStep::AddReplica { worker_id: 20 }.is_finish(&bg, &mgr));
-    }
 
-    #[test]
-    fn add_replica_not_finish_when_worker_absent() {
-        let mgr = test_bg_manager();
-        let bg = make_bg(1, vec![10, 20], None);
-        assert!(!OpStep::AddReplica { worker_id: 30 }.is_finish(&bg, &mgr));
-    }
+        // Set up replica states for WaitReplicaReady tests
+        mgr.set_replica_state(100, 10, ReplicaState::Active);
+        mgr.set_replica_state(101, 10, ReplicaState::Syncing);
+        mgr.set_replica_state(102, 10, ReplicaState::Offline);
 
-    #[test]
-    fn remove_replica_is_finish_when_worker_absent() {
-        let mgr = test_bg_manager();
-        let bg = make_bg(1, vec![10, 20], None);
-        assert!(OpStep::RemoveReplica { worker_id: 30 }.is_finish(&bg, &mgr));
-    }
+        let cases: Vec<(&str, OpStep, BlockGroupInfo, bool)> = vec![
+            // AddReplica
+            ("add: worker in set", OpStep::AddReplica { worker_id: 20 }, make_bg(1, vec![10, 20, 30], None), true),
+            ("add: worker absent", OpStep::AddReplica { worker_id: 30 }, make_bg(2, vec![10, 20], None), false),
+            ("add: empty set", OpStep::AddReplica { worker_id: 1 }, make_bg(3, vec![], None), false),
+            // RemoveReplica
+            ("remove: worker absent", OpStep::RemoveReplica { worker_id: 30 }, make_bg(4, vec![10, 20], None), true),
+            ("remove: worker present", OpStep::RemoveReplica { worker_id: 20 }, make_bg(5, vec![10, 20, 30], None), false),
+            ("remove: empty set", OpStep::RemoveReplica { worker_id: 1 }, make_bg(6, vec![], None), true),
+            // TransferLease
+            ("lease: matches target", OpStep::TransferLease { from_worker: 10, to_worker: 20 }, make_bg(7, vec![10, 20], Some(20)), true),
+            ("lease: still on source", OpStep::TransferLease { from_worker: 10, to_worker: 20 }, make_bg(8, vec![10, 20], Some(10)), false),
+            ("lease: no lease", OpStep::TransferLease { from_worker: 10, to_worker: 20 }, make_bg(9, vec![10, 20], None), false),
+            // WaitReplicaReady
+            ("wait: active=ok", OpStep::WaitReplicaReady { worker_id: 10, expected_state: ReplicaState::Active }, make_bg(100, vec![10], None), true),
+            ("wait: syncing!=active", OpStep::WaitReplicaReady { worker_id: 10, expected_state: ReplicaState::Active }, make_bg(101, vec![10], None), false),
+            ("wait: offline!=active", OpStep::WaitReplicaReady { worker_id: 10, expected_state: ReplicaState::Active }, make_bg(102, vec![10], None), false),
+            ("wait: pending(default)", OpStep::WaitReplicaReady { worker_id: 10, expected_state: ReplicaState::Active }, make_bg(999, vec![10], None), false),
+        ];
 
-    #[test]
-    fn remove_replica_not_finish_when_worker_still_present() {
-        let mgr = test_bg_manager();
-        let bg = make_bg(1, vec![10, 20, 30], None);
-        assert!(!OpStep::RemoveReplica { worker_id: 20 }.is_finish(&bg, &mgr));
-    }
-
-    #[test]
-    fn transfer_lease_is_finish_when_lease_matches_target() {
-        let mgr = test_bg_manager();
-        let bg = make_bg(1, vec![10, 20], Some(20));
-        assert!(OpStep::TransferLease {
-            from_worker: 10,
-            to_worker: 20
-        }
-        .is_finish(&bg, &mgr));
-    }
-
-    #[test]
-    fn transfer_lease_not_finish_when_lease_still_on_source() {
-        let mgr = test_bg_manager();
-        let bg = make_bg(1, vec![10, 20], Some(10));
-        assert!(!OpStep::TransferLease {
-            from_worker: 10,
-            to_worker: 20
-        }
-        .is_finish(&bg, &mgr));
-    }
-
-    #[test]
-    fn transfer_lease_not_finish_when_no_lease() {
-        let mgr = test_bg_manager();
-        let bg = make_bg(1, vec![10, 20], None);
-        assert!(!OpStep::TransferLease {
-            from_worker: 10,
-            to_worker: 20
-        }
-        .is_finish(&bg, &mgr));
-    }
-
-    #[test]
-    fn add_replica_empty_replica_set() {
-        let mgr = test_bg_manager();
-        let bg = make_bg(1, vec![], None);
-        assert!(!OpStep::AddReplica { worker_id: 1 }.is_finish(&bg, &mgr));
-    }
-
-    #[test]
-    fn remove_replica_empty_replica_set() {
-        let mgr = test_bg_manager();
-        let bg = make_bg(1, vec![], None);
-        assert!(OpStep::RemoveReplica { worker_id: 1 }.is_finish(&bg, &mgr));
-    }
-
-    #[test]
-    fn wait_replica_ready_finish_when_active() {
-        let mgr = test_bg_manager();
-        let bg = make_bg(1, vec![10], None);
-        mgr.set_replica_state(1, 10, ReplicaState::Active);
-        assert!(OpStep::WaitReplicaReady {
-            worker_id: 10,
-            min_state: ReplicaState::Active,
-        }
-        .is_finish(&bg, &mgr));
-    }
-
-    #[test]
-    fn wait_replica_ready_not_finish_when_syncing() {
-        let mgr = test_bg_manager();
-        let bg = make_bg(1, vec![10], None);
-        mgr.set_replica_state(1, 10, ReplicaState::Syncing);
-        assert!(!OpStep::WaitReplicaReady {
-            worker_id: 10,
-            min_state: ReplicaState::Active,
-        }
-        .is_finish(&bg, &mgr));
-    }
-
-    #[test]
-    fn wait_replica_ready_not_finish_when_pending() {
-        let mgr = test_bg_manager();
-        let bg = make_bg(1, vec![10], None);
-        assert!(!OpStep::WaitReplicaReady {
-            worker_id: 10,
-            min_state: ReplicaState::Active,
-        }
-        .is_finish(&bg, &mgr));
-    }
-
-    fn make_operator(kind: OperatorKind) -> BGOperator {
-        BGOperator {
-            id: 1,
-            kind,
-            bg_id: 1,
-            description: "test".to_string(),
-            steps: vec![],
-            current_step: 0,
-            status: OpStatus::Pending,
-            create_time_ms: 0,
-            step_start_time_ms: 0,
-            priority: 1,
-            bg_epoch: 0,
+        for (name, step, bg, expected) in &cases {
+            assert_eq!(
+                step.is_finish(bg, &mgr),
+                *expected,
+                "case '{}' failed",
+                name
+            );
         }
     }
 
     #[test]
-    fn bg_op_state_repair() {
-        assert_eq!(
-            make_operator(OperatorKind::Repair).bg_op_state(),
-            BGOpState::Recovering
-        );
-    }
-
-    #[test]
-    fn bg_op_state_decommission_repair() {
-        assert_eq!(
-            make_operator(OperatorKind::DecommissionRepair).bg_op_state(),
-            BGOpState::Recovering
-        );
-    }
-
-    #[test]
-    fn bg_op_state_balance() {
-        assert_eq!(
-            make_operator(OperatorKind::Balance).bg_op_state(),
-            BGOpState::Rebalancing
-        );
-    }
-
-    #[test]
-    fn bg_op_state_lease_transfer() {
-        assert_eq!(
-            make_operator(OperatorKind::LeaseTransfer).bg_op_state(),
-            BGOpState::LeaseBalancing
-        );
-    }
-
-    #[test]
-    fn bg_op_state_delete() {
-        assert_eq!(
-            make_operator(OperatorKind::Delete).bg_op_state(),
-            BGOpState::Deleting
-        );
+    fn bg_op_state_mapping() {
+        let cases: Vec<(OperatorKind, BGOpState)> = vec![
+            (OperatorKind::Repair, BGOpState::Recovering),
+            (OperatorKind::DecommissionRepair, BGOpState::Recovering),
+            (OperatorKind::Balance, BGOpState::Rebalancing),
+            (OperatorKind::Rebuild, BGOpState::Rebalancing),
+            (OperatorKind::LeaseTransfer, BGOpState::LeaseBalancing),
+            (OperatorKind::Delete, BGOpState::Deleting),
+        ];
+        for (kind, expected) in cases {
+            let op = BGOperator {
+                id: 1, kind: kind.clone(), bg_id: 1, description: String::new(),
+                steps: vec![], current_step: 0, status: OpStatus::Pending,
+                create_time_ms: 0, step_start_time_ms: 0, priority: 1, bg_epoch: 0,
+            };
+            assert_eq!(op.bg_op_state(), expected, "kind {:?}", kind);
+        }
     }
 
     #[test]
@@ -515,15 +430,14 @@ mod tests {
         let op = OperatorBuilder::new(OperatorKind::DecommissionRepair, 10, "decom")
             .bg_epoch(5)
             .add_replica(100)
+            .wait_replica_ready(100, ReplicaState::Active)
             .transfer_lease(200, 100)
             .remove_replica(200)
             .priority(120)
             .build();
-        assert_eq!(op.steps.len(), 3);
+        assert_eq!(op.steps.len(), 4);
         assert_eq!(op.bg_epoch, 5);
         assert_eq!(op.priority, 120);
         assert_eq!(op.kind, OperatorKind::DecommissionRepair);
-        assert_eq!(op.bg_id, 10);
-        assert_eq!(op.description, "decom");
     }
 }

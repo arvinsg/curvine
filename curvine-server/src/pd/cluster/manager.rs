@@ -18,8 +18,7 @@ use crate::pd::meta::MetaManager;
 use crate::pd::mount::MountManager;
 use crate::pd::node::NodeManager;
 use crate::pd::pool::PoolManager;
-use crate::pd::schedule::operator_controller::OperatorController;
-use crate::pd::schedule::{Manager, ManagerContext};
+use crate::pd::schedule::{Manager, ManagerContext, OperatorController};
 use curvine_common::raft::RoleState;
 use curvine_common::state::{
     HeartbeatRequest, HeartbeatResponse, HeartbeatResponsePayload, MetaHeartbeatResponse,
@@ -194,27 +193,32 @@ impl ClusterManager {
     }
 
     pub fn handle_worker_heartbeat(&self, req: HeartbeatRequest) -> FsResult<HeartbeatResponse> {
-        if let curvine_common::state::HeartbeatPayload::Worker(ref w) = req.payload {
-            if !w.bg_reports.is_empty() {
-                self.bg_manager
-                    .update_replica_states_from_reports(req.node_id, &w.bg_reports);
-            } else if !w.bg_epochs.is_empty() {
-                let bg_ids: Vec<u32> = w.bg_epochs.keys().copied().collect();
-                self.bg_manager
-                    .update_replica_states_from_bg_ids(req.node_id, &bg_ids);
-            }
-        }
+        let reported_bg_epochs: std::collections::HashMap<u32, u64> =
+            if let curvine_common::state::HeartbeatPayload::Worker(ref w) = req.payload {
+                if !w.bg_reports.is_empty() {
+                    self.bg_manager
+                        .update_replica_states_from_reports(req.node_id, &w.bg_reports);
+                } else if !w.bg_epochs.is_empty() {
+                    let bg_ids: Vec<u32> = w.bg_epochs.keys().copied().collect();
+                    self.bg_manager
+                        .update_replica_states_from_bg_ids(req.node_id, &bg_ids);
+                }
+                w.bg_epochs.clone()
+            } else {
+                std::collections::HashMap::new()
+            };
 
         let mut resp = self.node_manager.handle_heartbeat(req.clone())?;
         resp.mount_version = self.mount_manager.version();
         resp.table_epochs = self.bg_manager.get_table_epochs();
 
-        let commands = self.schedule_manager.dispatch_operators(req.node_id);
+        let commands = self
+            .schedule_manager
+            .dispatch_operators(req.node_id, &reported_bg_epochs);
         if let HeartbeatResponsePayload::Worker(ref mut w) = resp.payload {
             w.add_bgs.extend(commands.add_bgs);
             w.remove_bgs.extend(commands.remove_bgs);
-            let extra = self.bg_manager.drain_extra_remove_bgs(req.node_id);
-            w.remove_bgs.extend(extra);
+            w.update_bgs.extend(commands.update_bgs);
         }
 
         Ok(resp)

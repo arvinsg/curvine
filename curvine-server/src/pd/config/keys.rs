@@ -184,9 +184,9 @@ pub const PD_SCHEDULE_BALANCE_TOLERANT_RATIO_BPS_DEFAULT: u32 = 1000;
 pub const PD_SCHEDULE_BALANCE_MAX_OPS_PER_CYCLE: &str = "pd.schedule.balance_max_ops_per_cycle";
 pub const PD_SCHEDULE_BALANCE_MAX_OPS_PER_CYCLE_DEFAULT: u32 = 5;
 
-/// Enable placement rule violation checker.
-pub const PD_SCHEDULE_PLACEMENT_CHECK_ENABLED: &str = "pd.schedule.placement_check_enabled";
-pub const PD_SCHEDULE_PLACEMENT_CHECK_ENABLED_DEFAULT: bool = true;
+/// Enable all checkers globally.
+pub const PD_SCHEDULE_CHECKER_ENABLED: &str = "pd.schedule.checker.enabled";
+pub const PD_SCHEDULE_CHECKER_ENABLED_DEFAULT: bool = true;
 
 /// Placement rule check interval (in milliseconds).
 pub const PD_SCHEDULE_PLACEMENT_CHECK_INTERVAL_MS: &str = "pd.schedule.placement_check_interval_ms";
@@ -375,9 +375,9 @@ pub static DYNAMIC_CONFIG_ITEMS: &[DynamicConfigItem] = &[
         desc: "Max balance operators per cycle",
     },
     DynamicConfigItem {
-        key: PD_SCHEDULE_PLACEMENT_CHECK_ENABLED,
+        key: PD_SCHEDULE_CHECKER_ENABLED,
         default: "true",
-        desc: "Enable placement rule violation checker",
+        desc: "Enable all checkers globally",
     },
     DynamicConfigItem {
         key: PD_SCHEDULE_PLACEMENT_CHECK_INTERVAL_MS,

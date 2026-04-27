@@ -565,6 +565,7 @@ mod tests {
     }
 
     fn test_manager_with_store(store: Arc<dyn crate::pd::store::KvStore>) -> NodeManager {
+        crate::pd::pd_server::init_metrics_for_test();
         let node_store = Arc::new(super::super::store::NodeStore::new(store.clone()));
         let raft = curvine_common::raft::RaftClient::from_conf(
             curvine_common::conf::JournalConf::default().create_runtime(),

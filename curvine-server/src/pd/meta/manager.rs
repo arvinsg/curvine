@@ -305,6 +305,9 @@ mod tests {
     use super::*;
 
     fn node_manager_with_meta() -> Arc<NodeManager> {
+        use curvine_common::state::{
+            MetaNodePayload, NodeAddress, NodeBase, NodeInfo, NodePayload, NodeState, NodeType,
+        };
         let store: Arc<dyn crate::pd::store::KvStore> =
             Arc::new(crate::pd::store::memory_kv_engine::MemoryKvEngine::new());
         let jc = Arc::new(journal::Client::new(
@@ -319,7 +322,29 @@ mod tests {
             std::collections::HashMap::new(),
         ));
         let node_store = Arc::new(crate::pd::node::NodeStore::new(store));
-        Arc::new(NodeManager::new(node_store, config, jc))
+        let nm = Arc::new(NodeManager::new(node_store, config, jc));
+        for (node_id, group_id) in [(1u32, 1u32), (2u32, 10u32)] {
+            nm.test_insert_node(NodeInfo {
+                base: NodeBase {
+                    node_id,
+                    node_type: NodeType::Meta,
+                    address: NodeAddress {
+                        hostname: format!("meta-{}", node_id),
+                        ip: format!("10.0.0.{}", node_id),
+                        rpc_port: 8000 + node_id as u16,
+                        web_port: 9000 + node_id as u16,
+                    },
+                    ..Default::default()
+                },
+                state: NodeState::Live,
+                payload: NodePayload::Meta(MetaNodePayload {
+                    group_id,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        nm
     }
 
     fn make_journal_client() -> Arc<journal::Client> {

@@ -336,7 +336,7 @@ impl PdMetrics {
                 .with_label_values(&[&tid])
                 .set(table.bucket_count as i64);
 
-            let stats = self.bg_manager.compute_table_stats(table.table_id);
+            let stats = self.bg_manager.get_table_stats(table.table_id);
             self.bg_table_used_bytes
                 .with_label_values(&[&tid])
                 .set(stats.used_bytes as i64);

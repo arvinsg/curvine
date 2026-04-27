@@ -49,19 +49,6 @@ pub fn validate_transition(current: BGState, target: BGState) -> FsResult<()> {
     }
 }
 
-/// Check whether the target state is reachable from the current state (transitive).
-pub fn is_reachable(current: BGState, target: BGState) -> bool {
-    if current == target {
-        return true;
-    }
-    for next in next_states(current) {
-        if next == target || is_reachable(next, target) {
-            return true;
-        }
-    }
-    false
-}
-
 fn next_states(state: BGState) -> Vec<BGState> {
     match state {
         BGState::Init => vec![BGState::Assigned, BGState::Deleting],
@@ -72,6 +59,27 @@ fn next_states(state: BGState) -> Vec<BGState> {
         BGState::Rebalancing => vec![BGState::Active, BGState::Deleting],
         BGState::Deleting => vec![],
     }
+}
+
+pub fn is_reachable(current: BGState, target: BGState) -> bool {
+    if current == target {
+        return true;
+    }
+    let mut visited: Vec<BGState> = Vec::new();
+    let mut stack = vec![current];
+    while let Some(s) = stack.pop() {
+        if visited.contains(&s) {
+            continue;
+        }
+        visited.push(s);
+        for next in next_states(s) {
+            if next == target {
+                return true;
+            }
+            stack.push(next);
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -115,6 +123,7 @@ mod tests {
         assert!(is_reachable(BGState::Assigned, BGState::Recovering));
         assert!(is_reachable(BGState::Init, BGState::Deleting));
         assert!(!is_reachable(BGState::Deleting, BGState::Init));
-        assert!(is_reachable(BGState::Degraded, BGState::Assigned));
+        // Degraded can loop (Degraded <-> Recovering <-> Active) but never reaches Assigned.
+        assert!(!is_reachable(BGState::Degraded, BGState::Assigned));
     }
 }

@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::pd::bg::placement::{isolation_score, worst_replica};
-use crate::pd::schedule::operator::{BGOperator, OpPriority, OperatorBuilder, OperatorKind};
+use crate::pd::bg::placement::{
+    check_isolation_violation, isolation_score, worker_passes_constraints, worst_replica,
+};
 use crate::pd::schedule::ManagerContext;
+use crate::pd::schedule::{BGOperator, OpPriority, OperatorBuilder, OperatorKind};
 use curvine_common::state::{BlockGroupInfo, ReplicaState};
 
 pub struct PlacementRuleChecker;
@@ -25,20 +27,18 @@ impl super::Checker for PlacementRuleChecker {
     }
 
     fn check_bg(&self, bg: &BlockGroupInfo, ctx: &ManagerContext) -> Option<BGOperator> {
-        if !ctx.config_manager.get_bool(
-            crate::pd::config::keys::PD_SCHEDULE_PLACEMENT_CHECK_ENABLED,
-            crate::pd::config::keys::PD_SCHEDULE_PLACEMENT_CHECK_ENABLED_DEFAULT,
-        ) {
-            return None;
-        }
-
         let rule = ctx.bg_manager.placement_rule();
-        if rule.is_empty() {
-            return None;
-        }
+        let min_level = rule.min_isolation_level.as_ref()?;
 
         let resident = ctx.bg_manager.get_resident_replicas(bg.bg_id);
+        if resident.len() < 2 {
+            return None;
+        }
+
         let worker_labels = ctx.pool_manager.get_workers_labels(&resident);
+        if !check_isolation_violation(&resident, min_level, &rule.location_labels, &worker_labels) {
+            return None;
+        }
 
         let worst_worker = worst_replica(&resident, &rule, &worker_labels)?;
         let current_score = isolation_score(&resident, &rule.location_labels, &worker_labels);
@@ -64,10 +64,8 @@ impl super::Checker for PlacementRuleChecker {
                 combined_labels.insert(candidate, lbl.clone());
             }
 
-            let passes = combined_labels
-                .get(&candidate)
-                .map(|l| rule.label_constraints.iter().all(|lc| lc.matches(l)))
-                .unwrap_or(rule.label_constraints.is_empty());
+            let passes =
+                worker_passes_constraints(candidate, &combined_labels, &rule.label_constraints);
             if !passes {
                 continue;
             }
@@ -100,13 +98,7 @@ impl super::Checker for PlacementRuleChecker {
             .map(|l| l.node_id == worst_worker)
             .unwrap_or(false)
         {
-            let to_worker = bg
-                .replica_set
-                .iter()
-                .filter(|&&w| w != worst_worker)
-                .find(|&&w| ctx.pool_manager.is_worker_available(w))
-                .copied()
-                .unwrap_or(new_worker);
+            let to_worker = ctx.pick_lease_fallback(bg, worst_worker, new_worker);
             builder = builder.transfer_lease(worst_worker, to_worker);
         }
 
@@ -122,51 +114,176 @@ impl super::Checker for PlacementRuleChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pd::pool::POOL_ID_SSD;
+    use crate::pd::schedule::checker::tests_common::{decompose, Fixture};
     use crate::pd::schedule::checker::Checker;
-    use curvine_common::state::{BGLease, BGOpState, BGState, BlockGroupInfo};
-
-    fn test_ctx() -> std::sync::Arc<ManagerContext> {
-        crate::pd::schedule::checker::tests_common::test_context(
-            std::collections::HashMap::new(),
-        )
-    }
-
-    fn make_bg(bg_id: u32, table_id: u32, replica_set: Vec<u32>) -> BlockGroupInfo {
-        let leader = replica_set.first().copied().unwrap_or(0);
-        BlockGroupInfo {
-            bg_id,
-            table_id,
-            bg_epoch: 1,
-            replica_set,
-            state: BGState::Assigned,
-            op_state: BGOpState::Idle,
-            lease_owner: Some(BGLease {
-                node_id: leader,
-                epoch: 1,
-                grant_time_ms: 0,
-            }),
-            stats: Default::default(),
-        }
-    }
-
-    #[test]
-    fn no_ops_when_no_rules() {
-        let ctx = test_ctx();
-        let checker = PlacementRuleChecker;
-        let bg = make_bg(1, 0x0001_0001, vec![100, 101, 102]);
-        ctx.bg_manager
-            .apply_create_bg(&crate::pd::journal::entry::BGEntry {
-                op_ms: 0,
-                info: bg.clone(),
-            })
-            .unwrap();
-        assert!(checker.check_bg(&bg, &ctx).is_none());
-    }
 
     #[test]
     fn name_and_priority() {
         let checker = PlacementRuleChecker;
         assert_eq!(checker.name(), "placement-rule-checker");
         assert_eq!(checker.priority(), 30);
+    }
+
+    #[test]
+    fn no_op_when_no_min_isolation_level() {
+        // topology_aware policy but min_isolation_level=None → no op.
+        let f = Fixture::with_topology(vec!["az"], None);
+        f.add_worker(100, POOL_ID_SSD, &[("az", "a")]);
+        f.add_worker(101, POOL_ID_SSD, &[("az", "a")]);
+        f.add_worker(102, POOL_ID_SSD, &[("az", "b")]);
+        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        let bg = f.insert_bg(1, table_id, vec![100, 101, 102], None);
+        assert!(PlacementRuleChecker.check_bg(&bg, &f.ctx).is_none());
+    }
+
+    #[derive(Debug)]
+    enum Expect {
+        None,
+        Fix {
+            // replicas whose worker has the violating label → one of these should be removed.
+            worst_candidates: Vec<u32>,
+            // candidates that could legally be used as the replacement (passing label constraints).
+            new_candidates: Vec<u32>,
+            expect_lease_transfer: bool,
+        },
+    }
+
+    struct Case {
+        name: &'static str,
+        replica_set: Vec<u32>,
+        lease_owner: u32,
+        /// (worker_id, pool, labels) — all workers registered as Live.
+        workers: Vec<(u32, &'static [(&'static str, &'static str)])>,
+        expect: Expect,
+    }
+
+    fn cases() -> Vec<Case> {
+        vec![
+            Case {
+                name: "no violation — all in distinct AZs",
+                replica_set: vec![100, 101, 102],
+                lease_owner: 100,
+                workers: vec![
+                    (100, &[("az", "a")]),
+                    (101, &[("az", "b")]),
+                    (102, &[("az", "c")]),
+                ],
+                expect: Expect::None,
+            },
+            Case {
+                name: "only one resident replica — skipped",
+                replica_set: vec![100],
+                lease_owner: 100,
+                workers: vec![(100, &[("az", "a")])],
+                expect: Expect::None,
+            },
+            Case {
+                name: "two replicas share AZ, no alternative candidate",
+                replica_set: vec![100, 101],
+                lease_owner: 100,
+                workers: vec![(100, &[("az", "a")]), (101, &[("az", "a")])],
+                expect: Expect::None,
+            },
+            Case {
+                name: "two share AZ, a third worker in another AZ → swap the shared one",
+                replica_set: vec![100, 101, 200],
+                lease_owner: 100,
+                workers: vec![
+                    (100, &[("az", "a")]),
+                    (101, &[("az", "a")]),
+                    (200, &[("az", "b")]),
+                    // Free candidate in a fresh AZ.
+                    (300, &[("az", "c")]),
+                ],
+                expect: Expect::Fix {
+                    worst_candidates: vec![100, 101],
+                    new_candidates: vec![300],
+                    expect_lease_transfer: true, // lease owner 100 is one of the worst candidates
+                },
+            },
+            Case {
+                name: "shared AZ but worst is not lease owner → no TransferLease",
+                replica_set: vec![100, 101, 200],
+                lease_owner: 200, // different AZ than 100/101
+                workers: vec![
+                    (100, &[("az", "a")]),
+                    (101, &[("az", "a")]),
+                    (200, &[("az", "b")]),
+                    (300, &[("az", "c")]),
+                ],
+                expect: Expect::Fix {
+                    worst_candidates: vec![100, 101],
+                    new_candidates: vec![300],
+                    expect_lease_transfer: false,
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn table_driven_check_bg() {
+        for case in cases() {
+            let f = Fixture::with_topology(vec!["az"], Some("az"));
+            for (wid, labels) in &case.workers {
+                f.add_worker(*wid, POOL_ID_SSD, labels);
+            }
+            let table_id = f.insert_table(POOL_ID_SSD, 3);
+            let bg = f.insert_bg(
+                1,
+                table_id,
+                case.replica_set.clone(),
+                Some(case.lease_owner),
+            );
+
+            let op = PlacementRuleChecker.check_bg(&bg, &f.ctx);
+            match case.expect {
+                Expect::None => {
+                    assert!(op.is_none(), "{}: expected None, got {:?}", case.name, op);
+                }
+                Expect::Fix {
+                    worst_candidates,
+                    new_candidates,
+                    expect_lease_transfer,
+                } => {
+                    let op = op.unwrap_or_else(|| panic!("{}: expected Fix op", case.name));
+                    assert_eq!(
+                        op.priority,
+                        OpPriority::PLACEMENT_FIX,
+                        "{}: priority",
+                        case.name
+                    );
+                    let (add, remove, transfer) = decompose(&op);
+
+                    assert_eq!(add.len(), 1, "{}: one Add step", case.name);
+                    assert_eq!(remove.len(), 1, "{}: one Remove step", case.name);
+                    assert!(
+                        worst_candidates.contains(&remove[0]),
+                        "{}: removed worker {} not in worst set {:?}",
+                        case.name,
+                        remove[0],
+                        worst_candidates
+                    );
+                    assert!(
+                        new_candidates.contains(&add[0]),
+                        "{}: added worker {} not in new set {:?}",
+                        case.name,
+                        add[0],
+                        new_candidates
+                    );
+
+                    if expect_lease_transfer {
+                        assert_eq!(transfer.len(), 1, "{}: expected lease transfer", case.name);
+                        assert_eq!(
+                            transfer[0].0, remove[0],
+                            "{}: transfer from worst replica",
+                            case.name
+                        );
+                    } else {
+                        assert!(transfer.is_empty(), "{}: no lease transfer", case.name);
+                    }
+                }
+            }
+        }
     }
 }

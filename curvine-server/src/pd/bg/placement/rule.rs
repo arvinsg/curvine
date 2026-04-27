@@ -93,13 +93,21 @@ impl PlacementRule {
         workers
             .iter()
             .copied()
-            .filter(|wid| {
-                labels
-                    .get(wid)
-                    .map(|l| self.label_constraints.iter().all(|lc| lc.matches(l)))
-                    .unwrap_or(false)
-            })
+            .filter(|wid| worker_passes_constraints(*wid, labels, &self.label_constraints))
             .collect()
+    }
+}
+
+/// Check whether a worker's labels satisfy every constraint.
+/// A worker with no labels passes only if the constraint list is empty.
+pub fn worker_passes_constraints(
+    worker_id: u32,
+    labels: &Labels,
+    constraints: &[LabelConstraint],
+) -> bool {
+    match labels.get(&worker_id) {
+        Some(l) => constraints.iter().all(|lc| lc.matches(l)),
+        None => constraints.is_empty(),
     }
 }
 
@@ -169,29 +177,60 @@ pub fn best_isolation_candidates(
     if location_labels.is_empty() || candidates.is_empty() {
         return candidates.to_vec();
     }
-    let scores: Vec<(u32, f64)> = candidates
-        .iter()
-        .map(|&wid| {
-            (
-                wid,
-                incremental_isolation_score(existing, wid, location_labels, labels),
-            )
-        })
-        .collect();
-    let max = scores
-        .iter()
-        .map(|(_, s)| *s)
-        .fold(f64::NEG_INFINITY, f64::max);
-    scores
-        .into_iter()
-        .filter(|(_, s)| (*s - max).abs() < f64::EPSILON)
-        .map(|(wid, _)| wid)
-        .collect()
+    let mut best: Vec<u32> = Vec::new();
+    let mut best_score = f64::NEG_INFINITY;
+    for &wid in candidates {
+        let score = incremental_isolation_score(existing, wid, location_labels, labels);
+        if score > best_score + f64::EPSILON {
+            best_score = score;
+            best.clear();
+            best.push(wid);
+        } else if (score - best_score).abs() < f64::EPSILON {
+            best.push(wid);
+        }
+    }
+    best
+}
+
+/// Check if two workers collide at the given isolation level.
+fn labels_collide(
+    a: u32,
+    b: u32,
+    min_idx: usize,
+    location_labels: &[String],
+    labels: &Labels,
+) -> bool {
+    (0..=min_idx).all(|lvl| {
+        let key = &location_labels[lvl];
+        let va = labels.get(&a).and_then(|l| l.get(key));
+        let vb = labels.get(&b).and_then(|l| l.get(key));
+        va == vb && va.is_some()
+    })
+}
+
+/// Check if any pair of existing replicas violates the min_isolation_level constraint.
+pub fn check_isolation_violation(
+    replicas: &[u32],
+    min_level: &str,
+    location_labels: &[String],
+    labels: &Labels,
+) -> bool {
+    let min_idx = match location_labels.iter().position(|l| l == min_level) {
+        Some(idx) => idx,
+        None => return false,
+    };
+    for (i, &a) in replicas.iter().enumerate() {
+        for &b in &replicas[i + 1..] {
+            if labels_collide(a, b, min_idx, location_labels, labels) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Hard isolation filter: from `candidates`, keep only workers whose label value
-/// at `min_level` (and all coarser levels in `location_labels`) does NOT collide
-/// with any existing replica.
+/// at `min_level` (and all coarser levels) does NOT collide with any existing replica.
 pub fn filter_min_isolation(
     candidates: &[u32],
     existing_replicas: &[u32],
@@ -203,23 +242,13 @@ pub fn filter_min_isolation(
         Some(idx) => idx,
         None => return candidates.to_vec(),
     };
-
     candidates
         .iter()
         .copied()
         .filter(|&wid| {
-            for &rid in existing_replicas {
-                let collides = (0..=min_idx).all(|lvl| {
-                    let key = &location_labels[lvl];
-                    let va = labels.get(&wid).and_then(|l| l.get(key));
-                    let vb = labels.get(&rid).and_then(|l| l.get(key));
-                    va == vb && va.is_some()
-                });
-                if collides {
-                    return false;
-                }
-            }
-            true
+            !existing_replicas
+                .iter()
+                .any(|&rid| labels_collide(wid, rid, min_idx, location_labels, labels))
         })
         .collect()
 }
@@ -237,11 +266,7 @@ pub fn worst_replica(replicas: &[u32], rule: &PlacementRule, labels: &Labels) ->
         let mut penalty = 0.0f64;
 
         // Constraint violation: very high penalty.
-        let wl = labels.get(&wid);
-        let passes = wl
-            .map(|l| rule.label_constraints.iter().all(|lc| lc.matches(l)))
-            .unwrap_or(rule.label_constraints.is_empty());
-        if !passes {
+        if !worker_passes_constraints(wid, labels, &rule.label_constraints) {
             penalty += ISOLATION_CONSTRAINT_PENALTY;
         }
 

@@ -56,3 +56,6 @@ pub trait KvStore: Send + Sync {
 
 #[cfg(test)]
 pub mod memory_kv_engine;
+
+#[cfg(test)]
+pub use memory_kv_engine::MemoryKvEngine;

@@ -105,8 +105,7 @@ impl PlacementPolicy for QuotaPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pd::bg::placement::context::WorkerLoadSnapshot;
-    use crate::pd::bg::placement::policy::ReplicaReplaceReason;
+    use crate::pd::bg::placement::{ReplicaReplaceReason, WorkerLoadSnapshot};
     use curvine_common::state::{BGLease, BGOpState, BGState};
     use std::collections::HashMap;
 

@@ -18,4 +18,7 @@ pub mod entry;
 
 pub use app_storage::PdAppStorage;
 pub use client::Client;
-pub use entry::PdEntry;
+pub use entry::{
+    BGDeleteEntry, BGEntry, BGUpdateEntry, BatchBGEntry, ConfigEntry, MountEntry, NodeEntry,
+    PdEntry, PoolEntry, UnMountEntry,
+};

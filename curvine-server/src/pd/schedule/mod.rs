@@ -21,7 +21,10 @@ pub mod scheduler;
 pub mod scheduler_controller;
 
 pub use manager::{Manager, ManagerContext};
-pub use operator::{BGCommands, BGOperator, OpInfluence, OpStatus, OpStep, OperatorBuilder, OperatorKind};
+pub use operator::{
+    BGCommands, BGOperator, OpInfluence, OpPriority, OpStatus, OpStep, OperatorBuilder,
+    OperatorKind,
+};
 pub use operator_controller::OperatorController;
 pub use scheduler::Scheduler;
 pub use scheduler_controller::SchedulerController;

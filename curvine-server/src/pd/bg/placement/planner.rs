@@ -15,7 +15,7 @@
 use super::context::PlacementContext;
 use super::policy::{PlacementPolicy, PolicyState, RebuildOptions, ReplicaDecision};
 use super::rule::{best_isolation_candidates, filter_min_isolation, PlacementRule};
-use crate::pd::bg::BGTable;
+use crate::pd::bg::{BGTable, BGTableStats};
 use curvine_common::state::{BGLease, BGState, BlockGroupInfo};
 use curvine_common::FsError;
 use orpc::common::LocalTime;
@@ -177,6 +177,7 @@ pub fn build_table(
         epoch: 1,
         create_time_ms: now,
         last_rebuild_ms: now,
+        stats: BGTableStats::default(),
     };
 
     Ok(BuildTableResult { table, bgs })
@@ -361,8 +362,7 @@ fn find_replacement(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pd::bg::placement::context::WorkerLoadSnapshot;
-    use crate::pd::bg::placement::quota_policy::QuotaPolicy;
+    use crate::pd::bg::placement::{QuotaPolicy, WorkerLoadSnapshot};
     use curvine_common::state::BGOpState;
     use std::collections::HashMap;
 
@@ -499,6 +499,7 @@ mod tests {
             epoch: 1,
             create_time_ms: 0,
             last_rebuild_ms: 0,
+            stats: BGTableStats::default(),
         };
 
         let options = RebuildOptions::default();
@@ -548,6 +549,7 @@ mod tests {
             epoch: 1,
             create_time_ms: 0,
             last_rebuild_ms: 0,
+            stats: BGTableStats::default(),
         };
 
         let options = RebuildOptions::default();
@@ -601,6 +603,7 @@ mod tests {
             epoch: 1,
             create_time_ms: 0,
             last_rebuild_ms: 0,
+            stats: BGTableStats::default(),
         };
 
         let options = RebuildOptions::default(); // max 50% = 1 per BG

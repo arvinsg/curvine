@@ -231,7 +231,7 @@ impl PlacementPolicy for CapacityPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pd::bg::placement::context::WorkerLoadSnapshot;
+    use crate::pd::bg::placement::WorkerLoadSnapshot;
 
     fn make_snapshot(worker_id: u32, actual_bg: u32, capacity_bytes: u64) -> WorkerLoadSnapshot {
         WorkerLoadSnapshot {
