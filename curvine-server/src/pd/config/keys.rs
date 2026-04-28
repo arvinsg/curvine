@@ -83,7 +83,7 @@ pub const PD_SCHEDULE_LEASE_CHECK_INTERVAL_MS_DEFAULT: u64 = 10_000;
 
 /// Max waiting operators in queue.
 pub const PD_SCHEDULE_MAX_WAITING_OPERATORS: &str = "pd.schedule.max_waiting_operators";
-pub const PD_SCHEDULE_MAX_WAITING_OPERATORS_DEFAULT: u32 = 100;
+pub const PD_SCHEDULE_MAX_WAITING_OPERATORS_DEFAULT: u32 = 1024;
 
 /// Max concurrent operators per worker.
 pub const PD_SCHEDULE_MAX_OPERATORS_PER_WORKER: &str = "pd.schedule.max_operators_per_worker";

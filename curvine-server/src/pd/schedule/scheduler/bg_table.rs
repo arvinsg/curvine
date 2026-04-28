@@ -4,7 +4,9 @@ use crate::pd::node::{NodeEvent, NodeEventType};
 use crate::pd::schedule::{BGOperator, ManagerContext, OpPriority, OperatorBuilder, OperatorKind};
 use curvine_common::state::{BGOpState, NodeType, ReplicaState};
 use dashmap::DashMap;
+use std::cmp::{max, min};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +27,7 @@ pub struct RebuildTask {
     pub pool_id: u16,
     pub reason: RebuildReason,
     pub scheduled_time_ms: u64,
+    pub generation: u64,
 }
 
 /// BGTable scheduler: handles initial table creation and event-driven rebuild
@@ -37,6 +40,7 @@ pub struct RebuildTask {
 pub struct BGTableScheduler {
     ctx: Arc<ManagerContext>,
     pending_rebuilds: DashMap<u16, RebuildTask>,
+    next_generation: AtomicU64,
 }
 
 impl BGTableScheduler {
@@ -44,6 +48,7 @@ impl BGTableScheduler {
         Self {
             ctx,
             pending_rebuilds: DashMap::new(),
+            next_generation: AtomicU64::new(1),
         }
     }
 
@@ -73,11 +78,13 @@ impl BGTableScheduler {
                 .and_modify(|task| {
                     task.reason = merge_reasons(&task.reason, &reason);
                     task.scheduled_time_ms = task.scheduled_time_ms.max(scheduled_time);
+                    task.generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
                 })
-                .or_insert(RebuildTask {
+                .or_insert_with(|| RebuildTask {
                     pool_id,
                     reason: reason.clone(),
                     scheduled_time_ms: scheduled_time,
+                    generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
                 });
         }
     }
@@ -164,11 +171,11 @@ impl BGTableScheduler {
                 }
 
                 // Safety: limit single-round replacements to preserve Active replica count.
-                let max_replace = std::cmp::max(1, old_replicas.len() / 2);
-                let replace_count = std::cmp::min(added.len(), max_replace).min(removed.len());
-                let added = &added
-                    [..std::cmp::min(added.len(), replace_count.max(added.len().min(max_replace)))];
-                let removed = &removed[..std::cmp::min(removed.len(), replace_count.max(1))];
+                let max_replace = max(1, old_replicas.len() / 2);
+                let replace_count = min(added.len(), max_replace).min(removed.len());
+                let added =
+                    &added[..min(added.len(), replace_count.max(added.len().min(max_replace)))];
+                let removed = &removed[..min(removed.len(), replace_count.max(1))];
 
                 let mut builder = OperatorBuilder::new(
                     OperatorKind::Rebuild,
@@ -210,20 +217,29 @@ impl BGTableScheduler {
 
     fn check_and_execute_rebuilds(&self) -> Vec<BGOperator> {
         let now = orpc::common::LocalTime::mills();
-        let ready: Vec<(u16, RebuildTask)> = self
+        let ready: Vec<(u16, u64, RebuildReason)> = self
             .pending_rebuilds
             .iter()
             .filter(|e| e.value().scheduled_time_ms <= now)
-            .map(|e| (*e.key(), e.value().clone()))
+            .map(|e| (*e.key(), e.value().generation, e.value().reason.clone()))
             .collect();
 
         let mut all_ops = Vec::new();
-        for (pool_id, task) in ready {
-            self.pending_rebuilds.remove(&pool_id);
+        for (pool_id, gen, reason) in ready {
+            let removed = self
+                .pending_rebuilds
+                .remove_if(&pool_id, |_, v| v.generation == gen);
+            if removed.is_none() {
+                log::debug!(
+                    "pool {}: rebuild task updated concurrently (gen mismatch), deferring",
+                    pool_id
+                );
+                continue;
+            }
             log::info!(
                 "Rebuilding BGTable for pool {} (reason: {:?})",
                 pool_id,
-                task.reason
+                reason
             );
             all_ops.extend(self.compute_rebuild_operators(pool_id));
         }
@@ -621,6 +637,7 @@ mod tests {
                 pool_id: POOL_ID_SSD,
                 reason: RebuildReason::Manual,
                 scheduled_time_ms: 0, // already past
+                generation: 1,
             },
         );
 
@@ -628,6 +645,60 @@ mod tests {
         assert!(
             s.pending_rebuilds.is_empty(),
             "ready task must be removed from pending"
+        );
+    }
+
+    #[test]
+    fn check_and_execute_defers_when_generation_changed() {
+        // Simulates the race: snapshot captures gen=G, but before remove_if runs a
+        // concurrent on_event bumps the entry's generation. The snapshot should be
+        // skipped and the entry retained for the next cycle.
+        let f = Fixture::new();
+        let s = scheduler_for(&f);
+
+        // Seed a "ready" task at gen=5.
+        s.pending_rebuilds.insert(
+            POOL_ID_SSD,
+            RebuildTask {
+                pool_id: POOL_ID_SSD,
+                reason: RebuildReason::NodeJoined {
+                    node_ids: vec![100],
+                },
+                scheduled_time_ms: 0,
+                generation: 5,
+            },
+        );
+        // Prime the counter past gen=5 so the next write produces gen>5.
+        s.next_generation.store(6, Ordering::Relaxed);
+
+        // Manually mimic the ordering we're guarding: perform the iter-snapshot now,
+        // then race in a `schedule_rebuild` that bumps generation, then run the remove.
+        let snapshot_gen = s
+            .pending_rebuilds
+            .get(&POOL_ID_SSD)
+            .map(|e| e.value().generation)
+            .unwrap();
+        assert_eq!(snapshot_gen, 5);
+
+        // Concurrent write: bumps generation to 6.
+        s.schedule_rebuild(
+            vec![POOL_ID_SSD],
+            RebuildReason::NodeRemoved {
+                node_ids: vec![999],
+            },
+        );
+        assert!(s.pending_rebuilds.get(&POOL_ID_SSD).unwrap().generation > snapshot_gen);
+
+        // Now invoke check_and_execute: since the entry's gen != snapshot gen, the
+        // remove_if predicate fails → entry stays in pending.
+        let ops = s.check_and_execute_rebuilds();
+        assert!(
+            ops.is_empty(),
+            "no op dispatched when generation mismatched"
+        );
+        assert!(
+            s.pending_rebuilds.contains_key(&POOL_ID_SSD),
+            "mismatched-generation entry must survive for next cycle"
         );
     }
 }
