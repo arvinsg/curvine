@@ -16,11 +16,16 @@ use super::{build_pending_influence, BaseScheduler, Scheduler};
 use crate::pd::bg::placement::context::build_table_snapshot;
 use crate::pd::bg::placement::{create_policy, is_lease_gap_sufficient, PlacementContext};
 use crate::pd::config::keys;
+use crate::pd::node::{NodeEvent, NodeEventType};
 use crate::pd::schedule::{BGOperator, ManagerContext, OpPriority, OperatorBuilder, OperatorKind};
 use curvine_common::state::BGOpState;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-pub struct LeaseBalanceScheduler;
+#[derive(Default)]
+pub struct LeaseBalanceScheduler {
+    last_register_ms: AtomicU64,
+}
 
 impl Scheduler for LeaseBalanceScheduler {
     fn name(&self) -> &str {
@@ -30,21 +35,16 @@ impl Scheduler for LeaseBalanceScheduler {
     fn schedule(&self, ctx: &ManagerContext) -> Vec<BGOperator> {
         let mut result = Vec::new();
 
-        let max_ops_per_table = ctx.config_manager.get_u32(
-            keys::PD_SCHEDULE_BALANCE_MAX_OPS_PER_CYCLE,
-            keys::PD_SCHEDULE_BALANCE_MAX_OPS_PER_CYCLE_DEFAULT,
-        ) as usize;
+        let max_ops_per_table =
+            ctx.config_manager
+                .get_u32(keys::PD_SCHEDULE_BALANCE_MAX_OPS_PER_CYCLE) as usize;
 
-        let tolerant_ratio = ctx.config_manager.get_u32(
-            keys::PD_SCHEDULE_BALANCE_TOLERANT_RATIO_BPS,
-            keys::PD_SCHEDULE_BALANCE_TOLERANT_RATIO_BPS_DEFAULT,
-        ) as f64
-            / 10000.0;
+        let tolerant_ratio =
+            ctx.config_manager
+                .get_u32(keys::PD_SCHEDULE_BALANCE_TOLERANT_RATIO_BPS) as f64
+                / 10000.0;
 
-        let policy_strategy = ctx.config_manager.get_string(
-            keys::PD_BG_BALANCE_POLICY,
-            keys::PD_BG_BALANCE_POLICY_DEFAULT,
-        );
+        let policy_strategy = ctx.config_manager.get_string(keys::PD_BG_BALANCE_POLICY);
 
         let tables = ctx.bg_manager.list_tables();
 
@@ -155,10 +155,17 @@ impl Scheduler for LeaseBalanceScheduler {
     }
 
     fn is_schedule_allowed(&self, ctx: &ManagerContext) -> bool {
-        ctx.config_manager.get_bool(
-            keys::PD_SCHEDULE_BALANCE_LEADER_ENABLED,
-            keys::PD_SCHEDULE_BALANCE_LEADER_ENABLED_DEFAULT,
-        )
+        if !ctx
+            .config_manager
+            .get_bool(keys::PD_SCHEDULE_BALANCE_LEADER_ENABLED)
+        {
+            return false;
+        }
+        let delay_ms = ctx
+            .config_manager
+            .get_u64(keys::PD_SCHEDULE_BALANCE_POST_REGISTER_DELAY_MS);
+        let last = self.last_register_ms.load(Ordering::Relaxed);
+        last == 0 || orpc::common::LocalTime::mills().saturating_sub(last) >= delay_ms
     }
 
     fn min_interval(&self) -> Duration {
@@ -167,6 +174,13 @@ impl Scheduler for LeaseBalanceScheduler {
 
     fn next_interval(&self, current: Duration) -> Duration {
         BaseScheduler::default_next_interval(current)
+    }
+
+    fn on_event(&self, event: &NodeEvent) {
+        if matches!(event.event_type, NodeEventType::Registered) {
+            self.last_register_ms
+                .store(event.event_time_ms, Ordering::Relaxed);
+        }
     }
 }
 
@@ -180,7 +194,7 @@ mod tests {
 
     #[test]
     fn name_and_type() {
-        let s = LeaseBalanceScheduler;
+        let s = LeaseBalanceScheduler::default();
         assert_eq!(s.name(), "lease-balance-scheduler");
     }
 
@@ -215,13 +229,13 @@ mod tests {
             keys::PD_SCHEDULE_BALANCE_LEADER_ENABLED,
             "false",
         )]));
-        assert!(!LeaseBalanceScheduler.is_schedule_allowed(&f.ctx));
+        assert!(!LeaseBalanceScheduler::default().is_schedule_allowed(&f.ctx));
     }
 
     #[test]
     fn enabled_by_default() {
         let f = Fixture::new();
-        assert!(LeaseBalanceScheduler.is_schedule_allowed(&f.ctx));
+        assert!(LeaseBalanceScheduler::default().is_schedule_allowed(&f.ctx));
     }
 
     #[test]
@@ -229,7 +243,7 @@ mod tests {
         let f = Fixture::new();
         f.add_worker(100, POOL_ID_SSD, &[]);
         f.insert_table(POOL_ID_SSD, 3);
-        assert!(LeaseBalanceScheduler.schedule(&f.ctx).is_empty());
+        assert!(LeaseBalanceScheduler::default().schedule(&f.ctx).is_empty());
     }
 
     #[test]
@@ -258,7 +272,7 @@ mod tests {
         }
         f.set_table_buckets(table_id, &bg_ids);
 
-        let ops = LeaseBalanceScheduler.schedule(&f.ctx);
+        let ops = LeaseBalanceScheduler::default().schedule(&f.ctx);
         assert!(
             ops.is_empty(),
             "balanced leases should yield no ops, got {:?}",
@@ -274,7 +288,7 @@ mod tests {
         let table_id = f.insert_table(POOL_ID_SSD, 3);
         seed_bgs_with_owner(&f, table_id, vec![100, 101, 102], 100, 8);
 
-        let ops = LeaseBalanceScheduler.schedule(&f.ctx);
+        let ops = LeaseBalanceScheduler::default().schedule(&f.ctx);
         assert!(
             !ops.is_empty(),
             "overloaded lease owner should yield at least one transfer"
@@ -308,7 +322,7 @@ mod tests {
         let table_id = f.insert_table(POOL_ID_SSD, 3);
         seed_bgs_with_owner(&f, table_id, vec![100, 101, 102], 100, 8);
 
-        let ops = LeaseBalanceScheduler.schedule(&f.ctx);
+        let ops = LeaseBalanceScheduler::default().schedule(&f.ctx);
         assert_eq!(ops.len(), 1, "max_ops=1 enforces single op per cycle");
     }
 
@@ -319,7 +333,7 @@ mod tests {
         let table_id = f.insert_table(POOL_ID_SSD, 3);
         seed_bgs_with_owner(&f, table_id, vec![100, 101, 103], 103, 8);
 
-        let ops = LeaseBalanceScheduler.schedule(&f.ctx);
+        let ops = LeaseBalanceScheduler::default().schedule(&f.ctx);
         for op in &ops {
             let (_, _, transfer) = decompose(op);
             assert_eq!(
@@ -341,7 +355,7 @@ mod tests {
                 .set_op_state(bg_id, curvine_common::state::BGOpState::Recovering);
         }
 
-        let ops = LeaseBalanceScheduler.schedule(&f.ctx);
+        let ops = LeaseBalanceScheduler::default().schedule(&f.ctx);
         assert!(ops.is_empty(), "all BGs non-Idle → no lease balance ops");
     }
 }

@@ -23,8 +23,8 @@ use crate::pd::journal::entry::{BGDeleteEntry, BGEntry, BGUpdateEntry, BatchBGEn
 use crate::pd::journal::{self, PdEntry};
 use crate::pd::pool::PoolManager;
 use curvine_common::state::{
-    BGOpState, BGStats, BGTableSummary, BlockGroupInfo, BlockGroupInfoView, ReplicaInfo,
-    ReplicaState, WorkerBGReport,
+    gen_table_id, BGLease, BGOpState, BGState, BGStats, BGTableSummary, BlockGroupInfo,
+    BlockGroupInfoView, ReplicaInfo, ReplicaState, StorageType, WorkerBGReport,
 };
 use curvine_common::{FsError, FsResult};
 use std::collections::{HashMap, HashSet};
@@ -77,17 +77,12 @@ impl BGManager {
     }
 
     fn balance_policy_strategy(&self) -> String {
-        self.config_manager.get_string(
-            keys::PD_BG_BALANCE_POLICY,
-            keys::PD_BG_BALANCE_POLICY_DEFAULT,
-        )
+        self.config_manager.get_string(keys::PD_BG_BALANCE_POLICY)
     }
 
     fn rebuild_tolerant_ratio(&self) -> f64 {
-        self.config_manager.get_u32(
-            keys::PD_BG_REBUILD_TOLERANT_RATIO_BPS,
-            keys::PD_BG_REBUILD_TOLERANT_RATIO_BPS_DEFAULT,
-        ) as f64
+        self.config_manager
+            .get_u32(keys::PD_BG_REBUILD_TOLERANT_RATIO_BPS) as f64
             / 10_000.0
     }
 
@@ -132,60 +127,67 @@ impl BGManager {
             .insert(worker_id, state);
     }
 
-    /// Update replica states from worker heartbeat bg_reports.
-    pub fn update_replica_states_from_reports(&self, worker_id: u32, reports: &[WorkerBGReport]) {
+    /// Apply detailed replica reports from a worker heartbeat. Each report
+    /// carries the worker's authoritative `ReplicaState`
+    pub fn apply_replica_reports(&self, worker_id: u32, reports: &[WorkerBGReport]) {
         let mut rs = self.replica_states.write().unwrap();
         for report in reports {
-            let old = rs
-                .get(&report.bg_id)
-                .and_then(|m| m.get(&worker_id))
-                .copied()
+            let bg_states = rs.entry(report.bg_id).or_default();
+            let old = bg_states
+                .insert(worker_id, report.state)
                 .unwrap_or(ReplicaState::Pending);
-            rs.entry(report.bg_id)
-                .or_default()
-                .insert(worker_id, report.state);
-            // Detect Active set change
-            if (old == ReplicaState::Active) != (report.state == ReplicaState::Active) {
+            if old.shifts_client_view(report.state) {
                 self.epoch_dirty.store(true, Ordering::Relaxed);
             }
         }
     }
 
-    pub fn update_replica_states_from_bg_ids(&self, worker_id: u32, bg_ids: &[u32]) {
+    pub fn promote_pending_replicas(&self, worker_id: u32, bg_ids: &[u32]) {
         let mut rs = self.replica_states.write().unwrap();
         for &bg_id in bg_ids {
-            let old = rs
-                .get(&bg_id)
-                .and_then(|m| m.get(&worker_id))
+            let bg_states = rs.entry(bg_id).or_default();
+            let old = bg_states
+                .get(&worker_id)
                 .copied()
                 .unwrap_or(ReplicaState::Pending);
-            rs.entry(bg_id)
-                .or_default()
-                .entry(worker_id)
-                .and_modify(|s| {
-                    if *s == ReplicaState::Pending {
-                        *s = ReplicaState::Active;
-                    }
-                })
-                .or_insert(ReplicaState::Active);
-            if old != ReplicaState::Active {
-                let new = rs.get(&bg_id).and_then(|m| m.get(&worker_id)).copied();
-                if new == Some(ReplicaState::Active) {
+            let new = if old == ReplicaState::Pending {
+                ReplicaState::Active
+            } else {
+                old
+            };
+            bg_states.insert(worker_id, new);
+            if old.shifts_client_view(new) {
+                self.epoch_dirty.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Mark all `Active` replicas on a worker as `Lost`.
+    pub fn mark_replicas_lost(&self, worker_id: u32) {
+        let mut rs = self.replica_states.write().unwrap();
+        for states in rs.values_mut() {
+            if let Some(s) = states.get_mut(&worker_id) {
+                if *s == ReplicaState::Active {
+                    *s = ReplicaState::Lost;
                     self.epoch_dirty.store(true, Ordering::Relaxed);
                 }
             }
         }
     }
 
-    /// Mark all replicas on a worker as Offline.
-    pub fn mark_worker_offline(&self, worker_id: u32) {
+    /// Mark all replicas on a worker as `Offline`. Called when the node
+    /// transitions to `NodeState::Offline`.
+    pub fn mark_replicas_offline(&self, worker_id: u32) {
         let mut rs = self.replica_states.write().unwrap();
         for states in rs.values_mut() {
             if let Some(s) = states.get_mut(&worker_id) {
-                if *s == ReplicaState::Active {
-                    self.epoch_dirty.store(true, Ordering::Relaxed);
+                let old = *s;
+                if old != ReplicaState::Offline {
+                    *s = ReplicaState::Offline;
+                    if old.shifts_client_view(ReplicaState::Offline) {
+                        self.epoch_dirty.store(true, Ordering::Relaxed);
+                    }
                 }
-                *s = ReplicaState::Offline;
             }
         }
     }
@@ -245,7 +247,7 @@ impl BGManager {
             .filter(|&&w| w != worker_id)
             .copied()
             .collect();
-        let entry = crate::pd::journal::entry::BGUpdateEntry {
+        let entry = BGUpdateEntry {
             op_ms: orpc::common::LocalTime::mills(),
             bg_id,
             state: None,
@@ -254,8 +256,7 @@ impl BGManager {
             new_bg_epoch: bg.bg_epoch.saturating_add(1),
             new_table_epoch: None,
         };
-        self.journal_client
-            .propose(crate::pd::journal::PdEntry::UpdateBG(entry))
+        self.journal_client.propose(PdEntry::UpdateBG(entry))
     }
 
     /// Propose Raft addition of a worker to a BG's replica_set.
@@ -268,7 +269,7 @@ impl BGManager {
         }
         let mut new_rs = bg.replica_set.clone();
         new_rs.push(worker_id);
-        let entry = crate::pd::journal::entry::BGUpdateEntry {
+        let entry = BGUpdateEntry {
             op_ms: orpc::common::LocalTime::mills(),
             bg_id,
             state: None,
@@ -277,8 +278,7 @@ impl BGManager {
             new_bg_epoch: bg.bg_epoch.saturating_add(1),
             new_table_epoch: None,
         };
-        self.journal_client
-            .propose(crate::pd::journal::PdEntry::UpdateBG(entry))
+        self.journal_client.propose(PdEntry::UpdateBG(entry))
     }
 
     /// Propose Raft transfer of lease owner.
@@ -300,12 +300,12 @@ impl BGManager {
             .as_ref()
             .map(|l| l.epoch.saturating_add(1))
             .unwrap_or(1);
-        let lease = curvine_common::state::BGLease {
+        let lease = BGLease {
             node_id: to_worker,
             epoch: new_epoch,
             grant_time_ms: orpc::common::LocalTime::mills(),
         };
-        let entry = crate::pd::journal::entry::BGUpdateEntry {
+        let entry = BGUpdateEntry {
             op_ms: orpc::common::LocalTime::mills(),
             bg_id,
             state: None,
@@ -314,8 +314,7 @@ impl BGManager {
             new_bg_epoch: bg.bg_epoch.saturating_add(1),
             new_table_epoch: None,
         };
-        self.journal_client
-            .propose(crate::pd::journal::PdEntry::UpdateBG(entry))
+        self.journal_client.propose(PdEntry::UpdateBG(entry))
     }
 
     /// Flush table_epoch bump if Active set has changed (coalesce window).
@@ -601,7 +600,7 @@ impl BGManager {
         replica_count: u16,
         workers: &[u32],
     ) -> FsResult<()> {
-        let table_id = (pool_id as u32) << 16 | (replica_count as u32);
+        let table_id = gen_table_id(pool_id, replica_count);
 
         if self.tables.read().unwrap().contains_key(&table_id) {
             return Err(FsError::common(format!(
@@ -788,7 +787,7 @@ impl BGManager {
     }
 
     /// BGs in the given state.
-    pub fn get_bgs_by_state(&self, state: curvine_common::state::BGState) -> Vec<BlockGroupInfo> {
+    pub fn get_bgs_by_state(&self, state: BGState) -> Vec<BlockGroupInfo> {
         self.bgs
             .read()
             .unwrap()
@@ -837,21 +836,25 @@ impl BGManager {
             .iter()
             .filter_map(|&bg_id| bgs.get(&bg_id).cloned())
             .map(|bg| {
-                // Route filtering: only Active replicas visible to Client
-                let serving: Vec<u32> = bg
+                let states = rs.get(&bg.bg_id);
+                let mut visible: Vec<(u32, u8)> = bg
                     .replica_set
                     .iter()
-                    .filter(|&&wid| {
-                        rs.get(&bg.bg_id)
+                    .filter_map(|&wid| {
+                        let state = states
                             .and_then(|m| m.get(&wid))
                             .copied()
-                            .unwrap_or(ReplicaState::Pending)
-                            == ReplicaState::Active
+                            .unwrap_or(ReplicaState::Pending);
+                        match state {
+                            ReplicaState::Active => Some((wid, 0u8)),
+                            ReplicaState::Lost => Some((wid, 1u8)),
+                            _ => None, // Pending/Syncing/Offline hidden
+                        }
                     })
-                    .copied()
                     .collect();
+                visible.sort_by_key(|&(_, prio)| prio);
                 let mut filtered_bg = bg.clone();
-                filtered_bg.replica_set = serving;
+                filtered_bg.replica_set = visible.into_iter().map(|(w, _)| w).collect();
                 Self::block_group_info_to_view(&filtered_bg, &self.pool_manager)
             })
             .collect();
@@ -876,7 +879,7 @@ impl BGManager {
     fn build_worker_snapshots(
         &self,
         table: &BGTable,
-        media: curvine_common::state::StorageType,
+        media: StorageType,
         init: bool,
     ) -> HashMap<u32, WorkerLoadSnapshot> {
         let pool_id = table.pool_id();
@@ -1229,14 +1232,10 @@ impl BGManager {
 
     /// Build placement rule from global config + static location labels.
     pub fn placement_rule(&self) -> PlacementRule {
-        let policy_name = self.config_manager.get_string(
-            keys::PD_BG_PLACEMENT_POLICY,
-            keys::PD_BG_PLACEMENT_POLICY_DEFAULT,
-        );
-        let min_iso = self.config_manager.get_string(
-            keys::PD_BG_MIN_ISOLATION_LEVEL,
-            keys::PD_BG_MIN_ISOLATION_LEVEL_DEFAULT,
-        );
+        let policy_name = self.config_manager.get_string(keys::PD_BG_PLACEMENT_POLICY);
+        let min_iso = self
+            .config_manager
+            .get_string(keys::PD_BG_MIN_ISOLATION_LEVEL);
         let min_isolation_level = if min_iso.is_empty() {
             None
         } else {
@@ -1284,35 +1283,49 @@ impl BGManager {
     pub fn test_insert_table(&self, table: super::BGTable) {
         self.tables.write().unwrap().insert(table.table_id, table);
     }
+
+    /// Read `epoch_dirty` without clearing it (unlike `flush_table_epoch_if_dirty`).
+    pub fn test_epoch_dirty(&self) -> bool {
+        self.epoch_dirty.load(Ordering::Relaxed)
+    }
+
+    /// Reset `epoch_dirty` to false (used by tests to isolate transitions).
+    pub fn test_clear_epoch_dirty(&self) {
+        self.epoch_dirty.store(false, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pd::config::ConfigManager;
+    use crate::pd::node::{NodeManager, NodeStore};
+    use crate::pd::pool::PoolStore;
+    use crate::pd::store::memory_kv_engine::MemoryKvEngine;
+    use crate::pd::store::KvStore;
+    use curvine_common::conf::JournalConf;
+    use curvine_common::raft::RaftClient;
     use curvine_common::state::{BGLease, BGState};
 
     fn test_manager() -> BGManager {
-        let store: Arc<dyn crate::pd::store::KvStore> =
-            Arc::new(crate::pd::store::memory_kv_engine::MemoryKvEngine::new());
+        let store: Arc<dyn KvStore> = Arc::new(MemoryKvEngine::new());
         let bg_store = Arc::new(BGStore::new(store));
-        let pool_store = Arc::new(crate::pd::pool::PoolStore::new(Arc::new(
-            crate::pd::store::memory_kv_engine::MemoryKvEngine::new(),
-        )));
-        let node_store = Arc::new(crate::pd::node::NodeStore::new(Arc::new(
-            crate::pd::store::memory_kv_engine::MemoryKvEngine::new(),
-        )));
-        let journal_conf = curvine_common::conf::JournalConf::default();
+        let pool_store = Arc::new(PoolStore::new(Arc::new(MemoryKvEngine::new())));
+        let node_store = Arc::new(NodeStore::new(Arc::new(MemoryKvEngine::new())));
+        let journal_conf = JournalConf::default();
         let rt = journal_conf.create_runtime();
-        let raft = curvine_common::raft::RaftClient::from_conf(rt, &journal_conf);
-        let jc = Arc::new(crate::pd::journal::Client::new(raft));
-        let config_manager = Arc::new(crate::pd::config::ConfigManager::new(
-            Arc::new(crate::pd::store::memory_kv_engine::MemoryKvEngine::new()),
+        let raft = RaftClient::from_conf(rt, &journal_conf);
+        let jc = Arc::new(journal::Client::new(raft));
+        let config_manager = Arc::new(ConfigManager::new(
+            Arc::new(MemoryKvEngine::new()),
             jc.clone(),
-            std::collections::HashMap::new(),
+            HashMap::new(),
         ));
-        let node_manager: Arc<crate::pd::node::NodeManager> = Arc::new(
-            crate::pd::node::NodeManager::new(node_store, config_manager.clone(), jc.clone()),
-        );
+        let node_manager: Arc<NodeManager> = Arc::new(NodeManager::new(
+            node_store,
+            config_manager.clone(),
+            jc.clone(),
+        ));
         let pool_manager = Arc::new(PoolManager::new(pool_store, node_manager, jc.clone()));
         BGManager::new(
             bg_store,
@@ -1636,5 +1649,99 @@ mod tests {
         let mgr = test_manager();
         // Should not panic
         mgr.set_op_state(999, BGOpState::Recovering);
+    }
+
+    fn seed_active_replica(mgr: &BGManager, bg_id: u32, worker_id: u32) {
+        mgr.apply_create_bg(&BGEntry {
+            op_ms: 0,
+            info: make_bg(bg_id, 0x0001_0003, vec![worker_id]),
+        })
+        .unwrap();
+        mgr.set_replica_state(bg_id, worker_id, ReplicaState::Active);
+        mgr.test_clear_epoch_dirty();
+    }
+
+    #[test]
+    fn mark_replicas_lost_bumps_epoch_dirty_once() {
+        let mgr = test_manager();
+        seed_active_replica(&mgr, 1, 100);
+
+        mgr.mark_replicas_lost(100);
+        assert!(
+            mgr.test_epoch_dirty(),
+            "Active→Lost reorders client view → bump"
+        );
+
+        mgr.test_clear_epoch_dirty();
+        mgr.mark_replicas_lost(100);
+        assert!(
+            !mgr.test_epoch_dirty(),
+            "Lost→Lost (idempotent) should not bump"
+        );
+    }
+
+    #[test]
+    fn mark_replicas_offline_from_active_bumps() {
+        let mgr = test_manager();
+        seed_active_replica(&mgr, 1, 100);
+
+        mgr.mark_replicas_offline(100);
+        assert!(mgr.test_epoch_dirty(), "Active→Offline removes from view");
+    }
+
+    #[test]
+    fn mark_replicas_offline_from_lost_bumps() {
+        let mgr = test_manager();
+        seed_active_replica(&mgr, 1, 100);
+        mgr.mark_replicas_lost(100);
+        mgr.test_clear_epoch_dirty();
+
+        mgr.mark_replicas_offline(100);
+        assert!(mgr.test_epoch_dirty(), "Lost→Offline removes from view");
+    }
+
+    #[test]
+    fn pending_to_syncing_does_not_bump() {
+        let mgr = test_manager();
+        mgr.apply_create_bg(&BGEntry {
+            op_ms: 0,
+            info: make_bg(1, 0x0001_0003, vec![100]),
+        })
+        .unwrap();
+        mgr.test_clear_epoch_dirty();
+
+        mgr.apply_replica_reports(
+            100,
+            &[WorkerBGReport {
+                bg_id: 1,
+                state: ReplicaState::Syncing,
+                stats: BGStats::default(),
+            }],
+        );
+        assert!(
+            !mgr.test_epoch_dirty(),
+            "Pending→Syncing (both hidden) should not bump"
+        );
+    }
+
+    #[test]
+    fn report_transition_to_active_bumps() {
+        let mgr = test_manager();
+        mgr.apply_create_bg(&BGEntry {
+            op_ms: 0,
+            info: make_bg(1, 0x0001_0003, vec![100]),
+        })
+        .unwrap();
+        mgr.test_clear_epoch_dirty();
+
+        mgr.apply_replica_reports(
+            100,
+            &[WorkerBGReport {
+                bg_id: 1,
+                state: ReplicaState::Active,
+                stats: BGStats::default(),
+            }],
+        );
+        assert!(mgr.test_epoch_dirty(), "Pending→Active enters view");
     }
 }

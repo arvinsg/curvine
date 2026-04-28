@@ -17,23 +17,39 @@ use crate::pd::schedule::{BGOperator, ManagerContext, OpPriority, OperatorBuilde
 use curvine_common::state::{BGOpState, BlockGroupInfo, NodeState, ReplicaState};
 use std::time::Duration;
 
+/// Scheduler responsible for evacuating BGs off nodes that are leaving the
+/// cluster, both gracefully (NodeState::Decommission) and unexpectedly
+/// (NodeState::Offline).
 pub struct DecommissionScheduler;
 
 impl DecommissionScheduler {
+    pub fn new() -> Self {
+        Self
+    }
+
     fn build_migration_op(
         bg: &BlockGroupInfo,
-        decom_worker: u32,
+        leaving_worker: u32,
         ctx: &ManagerContext,
     ) -> Option<BGOperator> {
         let new_workers = ctx.bg_manager.select_replacement_workers(bg, 1).ok()?;
         let new_worker = *new_workers.first()?;
 
+        if new_worker == leaving_worker {
+            log::error!(
+                "select_replacement_workers returned the leaving worker {} for bg {}",
+                leaving_worker,
+                bg.bg_id
+            );
+            return None;
+        }
+
         let mut builder = OperatorBuilder::new(
             OperatorKind::DecommissionRepair,
             bg.bg_id,
             format!(
-                "Decommission migration: replace {} with {}",
-                decom_worker, new_worker
+                "Migrate BG off leaving worker {}: replace with {}",
+                leaving_worker, new_worker
             ),
         )
         .bg_epoch(bg.bg_epoch)
@@ -44,14 +60,34 @@ impl DecommissionScheduler {
         if bg
             .lease_owner
             .as_ref()
-            .map(|l| l.node_id == decom_worker)
+            .map(|l| l.node_id == leaving_worker)
             .unwrap_or(false)
         {
-            let to_worker = ctx.pick_lease_fallback(bg, decom_worker, new_worker);
-            builder = builder.transfer_lease(decom_worker, to_worker);
+            let to_worker = ctx.pick_lease_fallback(bg, leaving_worker, new_worker);
+            builder = builder.transfer_lease(leaving_worker, to_worker);
         }
 
-        Some(builder.remove_replica(decom_worker).build())
+        Some(builder.remove_replica(leaving_worker).build())
+    }
+
+    /// Build per-BG migration operators for one leaving worker.
+    fn migration_ops_for_worker(node_id: u32, ctx: &ManagerContext) -> Vec<BGOperator> {
+        let mut ops = Vec::new();
+        for bg in ctx.bg_manager.get_bgs_on_worker(node_id) {
+            if bg.op_state != BGOpState::Idle {
+                continue;
+            }
+            if let Some(op) = Self::build_migration_op(&bg, node_id, ctx) {
+                ops.push(op);
+            }
+        }
+        ops
+    }
+}
+
+impl Default for DecommissionScheduler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -62,23 +98,19 @@ impl Scheduler for DecommissionScheduler {
 
     fn schedule(&self, ctx: &ManagerContext) -> Vec<BGOperator> {
         let mut ops = Vec::new();
-        let decommission_nodes = ctx
-            .node_manager
-            .get_nodes_by_state(NodeState::Decommission);
 
-        for node in decommission_nodes {
+        // Offline nodes: migrate BGs but never call finish_decommission.
+        for node in ctx.node_manager.get_nodes_by_state(NodeState::Offline) {
+            ops.extend(Self::migration_ops_for_worker(node.base.node_id, ctx));
+        }
+
+        // Decommission nodes: same migration, plus terminal finish_decommission
+        // when all BGs are drained and no operators remain.
+        for node in ctx.node_manager.get_nodes_by_state(NodeState::Decommission) {
             let node_id = node.base.node_id;
             let bgs = ctx.bg_manager.get_bgs_on_worker(node_id);
-
             if !bgs.is_empty() {
-                for bg in bgs {
-                    if bg.op_state != BGOpState::Idle {
-                        continue;
-                    }
-                    if let Some(op) = Self::build_migration_op(&bg, node_id, ctx) {
-                        ops.push(op);
-                    }
-                }
+                ops.extend(Self::migration_ops_for_worker(node_id, ctx));
             } else if !ctx
                 .operator_controller
                 .has_running_operators_for_node(node_id)
@@ -101,7 +133,7 @@ impl Scheduler for DecommissionScheduler {
     }
 
     fn min_interval(&self) -> Duration {
-        Duration::from_secs(5)
+        Duration::from_secs(1)
     }
 
     fn next_interval(&self, current: Duration) -> Duration {
@@ -118,27 +150,28 @@ mod tests {
 
     #[test]
     fn name_and_type() {
-        let s = DecommissionScheduler;
+        let s = DecommissionScheduler::new();
         assert_eq!(s.name(), "decommission-scheduler");
     }
 
     #[test]
     fn is_schedule_allowed_is_true() {
         let f = Fixture::new();
-        assert!(DecommissionScheduler.is_schedule_allowed(&f.ctx));
+        assert!(DecommissionScheduler::new().is_schedule_allowed(&f.ctx));
     }
 
     #[test]
-    fn no_ops_when_no_decommission_nodes() {
+    fn no_ops_when_no_leaving_nodes() {
         let f = Fixture::new();
         f.add_workers(&[100, 101, 102], POOL_ID_SSD);
-        assert!(DecommissionScheduler.schedule(&f.ctx).is_empty());
+        assert!(DecommissionScheduler::new().schedule(&f.ctx).is_empty());
     }
 
-    /// Seed a 3-replica table, 4 live workers, put BGs on the first 2, then mark worker 100
-    /// as Decommission. Returns (table_id, bg_ids).
-    fn seed_decommission_fixture(
+    /// Seed a 3-replica table, 4 live workers, put BGs on the first 3, then mark worker 100
+    /// as the given state. Returns (table_id, bg_ids).
+    fn seed_leaving_node(
         f: &Fixture,
+        node_state: NodeState,
         bg_count: u32,
         lease_owner: u32,
     ) -> (u32, Vec<u32>) {
@@ -146,70 +179,102 @@ mod tests {
         let table_id = f.insert_table(POOL_ID_SSD, 3);
         let bg_ids: Vec<u32> = (0..bg_count).map(|i| 3_000 + i).collect();
         for &bg_id in &bg_ids {
-            // Worker 100 is in replica_set; this is the one being decommissioned.
             f.insert_bg(bg_id, table_id, vec![100, 101, 102], Some(lease_owner));
             f.activate_all_replicas(bg_id);
         }
         f.set_table_buckets(table_id, &bg_ids);
-        f.set_worker_state(100, NodeState::Decommission);
+        f.set_worker_state(100, node_state);
         (table_id, bg_ids)
     }
 
     #[test]
-    fn produces_one_migration_op_per_bg() {
+    fn decommission_node_produces_one_migration_op_per_bg() {
         let f = Fixture::new();
-        let (_, bg_ids) = seed_decommission_fixture(&f, 3, 101);
+        let (_, bg_ids) = seed_leaving_node(&f, NodeState::Decommission, 3, 101);
 
-        let ops = DecommissionScheduler.schedule(&f.ctx);
-        assert_eq!(
-            ops.len(),
-            bg_ids.len(),
-            "one migration op per BG on decommission node"
-        );
+        let ops = DecommissionScheduler::new().schedule(&f.ctx);
+        assert_eq!(ops.len(), bg_ids.len());
         for op in &ops {
             assert_eq!(op.priority, OpPriority::DECOMMISSION_REPAIR);
             let (add, remove, _) = decompose(op);
-            assert_eq!(add.len(), 1, "one AddReplica");
-            assert_eq!(remove, vec![100], "removes the decommissioning worker");
-            // Target must be a live worker that isn't already in replica_set.
-            assert_eq!(add[0], 103, "target is the only worker not in replica_set");
+            assert_eq!(add.len(), 1);
+            assert_eq!(remove, vec![100]);
+            assert_eq!(add[0], 103);
         }
     }
 
     #[test]
-    fn lease_owner_on_decommission_node_triggers_lease_transfer() {
-        // lease_owner = 100 (the decommissioning worker) → op must include TransferLease.
+    fn offline_node_produces_one_migration_op_per_bg() {
         let f = Fixture::new();
-        seed_decommission_fixture(&f, 1, 100);
+        let (_, bg_ids) = seed_leaving_node(&f, NodeState::Offline, 3, 101);
 
-        let ops = DecommissionScheduler.schedule(&f.ctx);
-        assert_eq!(ops.len(), 1);
-        let (_, _, transfer) = decompose(&ops[0]);
-        assert_eq!(transfer.len(), 1, "lease owner on decom node → TransferLease");
-        assert_eq!(transfer[0].0, 100, "transfer from the decommissioning worker");
+        let ops = DecommissionScheduler::new().schedule(&f.ctx);
+        assert_eq!(
+            ops.len(),
+            bg_ids.len(),
+            "Offline nodes should be evacuated like Decommission"
+        );
+        for op in &ops {
+            let (add, remove, _) = decompose(op);
+            assert_eq!(add.len(), 1);
+            assert_eq!(remove, vec![100]);
+        }
+    }
+
+    #[test]
+    fn lease_owner_on_leaving_node_triggers_lease_transfer() {
+        for state in [NodeState::Decommission, NodeState::Offline] {
+            let f = Fixture::new();
+            seed_leaving_node(&f, state, 1, 100); // lease_owner = 100 = leaving
+
+            let ops = DecommissionScheduler::new().schedule(&f.ctx);
+            assert_eq!(ops.len(), 1, "{:?}", state);
+            let (_, _, transfer) = decompose(&ops[0]);
+            assert_eq!(transfer.len(), 1, "{:?}: lease transfer expected", state);
+            assert_eq!(transfer[0].0, 100);
+        }
     }
 
     #[test]
     fn lease_owner_elsewhere_has_no_lease_transfer() {
-        // lease_owner = 101 (not the decommission target) → no TransferLease step.
         let f = Fixture::new();
-        seed_decommission_fixture(&f, 1, 101);
+        seed_leaving_node(&f, NodeState::Decommission, 1, 101);
 
-        let ops = DecommissionScheduler.schedule(&f.ctx);
+        let ops = DecommissionScheduler::new().schedule(&f.ctx);
         assert_eq!(ops.len(), 1);
         let (_, _, transfer) = decompose(&ops[0]);
-        assert!(transfer.is_empty(), "lease owner not on decom node → no TransferLease");
+        assert!(transfer.is_empty());
     }
 
     #[test]
     fn non_idle_bgs_are_skipped() {
         let f = Fixture::new();
-        let (_, bg_ids) = seed_decommission_fixture(&f, 3, 101);
+        let (_, bg_ids) = seed_leaving_node(&f, NodeState::Decommission, 3, 101);
         for &bg_id in &bg_ids {
             f.ctx.bg_manager.set_op_state(bg_id, BGOpState::Recovering);
         }
 
-        let ops = DecommissionScheduler.schedule(&f.ctx);
-        assert!(ops.is_empty(), "all BGs non-Idle → no migration ops");
+        let ops = DecommissionScheduler::new().schedule(&f.ctx);
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn no_replacement_worker_available_means_no_op() {
+        // 3 workers, replica_count=3, all BGs on [100,101,102] — the only live
+        // candidate that's not in replica_set is... none. select_replacement_workers
+        // returns empty, build_migration_op returns None.
+        let f = Fixture::new();
+        f.add_workers(&[100, 101, 102], POOL_ID_SSD);
+        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.insert_bg(3_000, table_id, vec![100, 101, 102], Some(101));
+        f.activate_all_replicas(3_000);
+        f.set_table_buckets(table_id, &[3_000]);
+        f.set_worker_state(100, NodeState::Offline);
+
+        let ops = DecommissionScheduler::new().schedule(&f.ctx);
+        // Without a replacement candidate we skip this BG rather than producing
+        // a degenerate op. The self-migration guard defends further: even if
+        // the planner ever returned 100 itself, build_migration_op would reject.
+        assert!(ops.is_empty());
     }
 }

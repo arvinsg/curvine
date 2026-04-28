@@ -14,7 +14,7 @@
 
 use crate::pd::bg::placement::{isolation_score, Labels, PlacementRule};
 use crate::pd::schedule::{BGOperator, ManagerContext, OpPriority, OperatorBuilder, OperatorKind};
-use curvine_common::state::BlockGroupInfo;
+use curvine_common::state::{BlockGroupInfo, NodeState};
 use std::collections::HashMap;
 
 pub struct ReplicaChecker;
@@ -75,11 +75,42 @@ impl ReplicaChecker {
         if resident_replicas.len() <= desired {
             return None;
         }
-        let excess = resident_replicas.len() - desired;
 
-        let to_remove = Self::select_replicas_to_remove(bg, resident_replicas, excess, ctx);
+        let excess = resident_replicas.len() - desired;
+        let lease_owner = bg.lease_owner.as_ref().map(|l| l.node_id);
+        let mut to_remove =
+            Self::select_replicas_to_remove(ctx, resident_replicas, excess, lease_owner);
         if to_remove.is_empty() {
             return None;
+        }
+
+        let mut transfer: Option<(u32, u32)> = None;
+        if let Some(lease) = &bg.lease_owner {
+            if to_remove.contains(&lease.node_id) {
+                let survivor = bg
+                    .replica_set
+                    .iter()
+                    .copied()
+                    .find(|w| !to_remove.contains(w));
+                match survivor {
+                    Some(default_target) => {
+                        let new_owner =
+                            ctx.pick_lease_fallback_excluding(bg, &to_remove, default_target);
+                        transfer = Some((lease.node_id, new_owner));
+                    }
+                    None => {
+                        log::warn!(
+                            "BG {} over-replicated: keeping lease owner {} — no survivor for lease transfer",
+                            bg.bg_id,
+                            lease.node_id,
+                        );
+                        to_remove.retain(|&w| w != lease.node_id);
+                        if to_remove.is_empty() {
+                            return None;
+                        }
+                    }
+                }
+            }
         }
 
         let mut builder = OperatorBuilder::new(
@@ -90,6 +121,10 @@ impl ReplicaChecker {
         .bg_epoch(bg.bg_epoch)
         .priority(OpPriority::OVER_REPLICA_REPAIR);
 
+        if let Some((from, to)) = transfer {
+            builder = builder.transfer_lease(from, to);
+        }
+
         for &w in &to_remove {
             builder = builder.remove_replica(w);
         }
@@ -97,13 +132,54 @@ impl ReplicaChecker {
         Some(builder.build())
     }
 
+    /// Choose which replicas to remove when a BG is over-replicated.
+    ///
+    /// Cascade:
+    ///   1. replicas on Decommission nodes (prefer first)
+    ///   2. replicas on Offline nodes
+    ///   3. healthy replicas, ranked by topology+load policy
     fn select_replicas_to_remove(
-        bg: &BlockGroupInfo,
+        ctx: &ManagerContext,
         resident_replicas: &[u32],
         count: usize,
-        ctx: &ManagerContext,
+        lease_owner: Option<u32>,
     ) -> Vec<u32> {
-        let lease_owner_id = bg.lease_owner.as_ref().map(|l| l.node_id).unwrap_or(0);
+        let candidates: Vec<u32> = resident_replicas.iter().copied().collect();
+        let on_decommission = filter_by_node_state(&candidates, NodeState::Decommission, ctx);
+        let on_offline = filter_by_node_state(&candidates, NodeState::Offline, ctx);
+        let healthy: Vec<u32> = candidates
+            .iter()
+            .copied()
+            .filter(|w| !on_decommission.contains(w) && !on_offline.contains(w))
+            .collect();
+        let healthy_ranked =
+            Self::rank_healthy_by_policy(ctx, resident_replicas, &healthy, lease_owner);
+
+        let mut chosen: Vec<u32> = Vec::with_capacity(count);
+        for w in on_decommission
+            .into_iter()
+            .chain(on_offline)
+            .chain(healthy_ranked)
+        {
+            if chosen.len() == count {
+                break;
+            }
+            if !chosen.contains(&w) {
+                chosen.push(w);
+            }
+        }
+
+        chosen
+    }
+
+    /// Rank healthy candidates: better isolation (after removal) and higher
+    /// load come first.
+    fn rank_healthy_by_policy(
+        ctx: &ManagerContext,
+        resident_replicas: &[u32],
+        healthy: &[u32],
+        lease_owner: Option<u32>,
+    ) -> Vec<u32> {
         let rule = ctx.bg_manager.placement_rule();
         let has_placement = !rule.is_empty() && !rule.location_labels.is_empty();
         let worker_labels = if has_placement {
@@ -112,38 +188,31 @@ impl ReplicaChecker {
             HashMap::new()
         };
 
-        let mut candidates: Vec<u32> = resident_replicas
-            .iter()
-            .filter(|&&w| w != lease_owner_id)
-            .copied()
-            .collect();
-
-        let sort_keys: HashMap<u32, (f64, usize)> = candidates
+        let mut sorted: Vec<u32> = healthy.to_vec();
+        let sort_keys: HashMap<u32, (bool, f64, usize)> = sorted
             .iter()
             .map(|&w| {
+                let is_owner = Some(w) == lease_owner;
                 let iso = Self::isolation_without(w, resident_replicas, &rule, &worker_labels);
                 let load = ctx.bg_manager.get_bgs_on_worker(w).len();
-                (w, (iso, load))
+                (w, (is_owner, iso, load))
             })
             .collect();
-
-        candidates.sort_by(|a, b| {
-            let (iso_a, load_a) = sort_keys[a];
-            let (iso_b, load_b) = sort_keys[b];
-            iso_b
-                .partial_cmp(&iso_a)
-                .unwrap_or(std::cmp::Ordering::Equal)
+        sorted.sort_by(|a, b| {
+            let (owner_a, iso_a, load_a) = sort_keys[a];
+            let (owner_b, iso_b, load_b) = sort_keys[b];
+            // Non-owners first (false < true), then higher isolation,
+            // then higher load.
+            owner_a
+                .cmp(&owner_b)
+                .then_with(|| {
+                    iso_b
+                        .partial_cmp(&iso_a)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .then_with(|| load_b.cmp(&load_a))
         });
-
-        candidates.truncate(count);
-
-        if candidates.len() < count {
-            if resident_replicas.contains(&lease_owner_id) {
-                candidates.push(lease_owner_id);
-            }
-        }
-        candidates
+        sorted
     }
 
     fn isolation_without(
@@ -160,12 +229,25 @@ impl ReplicaChecker {
     }
 }
 
+/// Workers in `candidates` whose node currently sits in `state`.
+fn filter_by_node_state(candidates: &[u32], state: NodeState, ctx: &ManagerContext) -> Vec<u32> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|&w| ctx.node_manager.get_node(w).map(|n| n.state) == Some(state))
+        .collect()
+}
+
 impl super::Checker for ReplicaChecker {
     fn name(&self) -> &str {
         "replica-checker"
     }
 
     fn check_bg(&self, bg: &BlockGroupInfo, ctx: &ManagerContext) -> Option<BGOperator> {
+        if super::bg_in_leaving_grace(bg, ctx) {
+            return None;
+        }
+
         let table = ctx.bg_manager.get_table(bg.table_id)?;
         let desired = table.replica_count() as usize;
         let resident_replicas = ctx.bg_manager.get_resident_replicas(bg.bg_id);
@@ -190,6 +272,7 @@ impl super::Checker for ReplicaChecker {
 mod tests {
     use super::super::CheckerPriority;
     use super::*;
+    use crate::pd::config::keys;
     use crate::pd::pool::POOL_ID_SSD;
     use crate::pd::schedule::checker::tests_common::{decompose, Fixture};
     use crate::pd::schedule::checker::Checker;
@@ -369,5 +452,201 @@ mod tests {
         let op = ReplicaChecker.check_bg(&bg, &f.ctx).expect("op");
         let (_, removed, _) = decompose(&op);
         assert_eq!(removed, vec![101]);
+    }
+
+    #[test]
+    fn over_replica_lost_replicas_treated_as_healthy() {
+        // 4 replicas, desired=3 → remove 1. Replica 102 is Lost. Lost nodes /
+        // replicas are NOT in the leaving cascade — they may recover. The
+        // checker falls through to topology+load policy without preferring 102.
+        let f = Fixture::new();
+        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
+        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        let bg = f.insert_bg(1, table_id, vec![100, 101, 102, 103], Some(100));
+        f.set_replica_states(1, &[(102, ReplicaState::Lost)]);
+
+        let op = ReplicaChecker.check_bg(&bg, &f.ctx).expect("op");
+        let (_, removed, _) = decompose(&op);
+        assert_eq!(removed.len(), 1);
+        // Whichever non-lease replica policy picks is fine; lease owner 100 must
+        // not be removed.
+        assert!(removed[0] != 100);
+    }
+
+    #[test]
+    fn skips_bg_with_replica_on_leaving_node() {
+        // Within the grace window (default 15min), checker defers to scheduler
+        // on Decommission/Offline replicas.
+        for leaving_state in [
+            curvine_common::state::NodeState::Offline,
+            curvine_common::state::NodeState::Decommission,
+        ] {
+            let f = Fixture::new();
+            f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
+            let table_id = f.insert_table(POOL_ID_SSD, 3);
+            let bg = f.insert_bg(1, table_id, vec![100, 101, 102], Some(100));
+            f.set_worker_state(102, leaving_state);
+
+            assert!(
+                ReplicaChecker.check_bg(&bg, &f.ctx).is_none(),
+                "BG with replica on {:?} node must be skipped within grace",
+                leaving_state
+            );
+        }
+    }
+
+    #[test]
+    fn takes_over_after_grace_window_expires() {
+        // After grace_ms = 0 (i.e. instantly past grace), checker falls back
+        // to its repair logic. Use over-replication so the checker has clear
+        // work to do regardless of replica states.
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            keys::PD_CHECKER_LEAVING_GRACE_MS.to_string(),
+            "0".to_string(),
+        );
+        let f = Fixture::with_overrides(overrides);
+        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
+        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        let bg = f.insert_bg(1, table_id, vec![100, 101, 102, 103], Some(100));
+        f.set_worker_state(102, curvine_common::state::NodeState::Decommission);
+
+        // Without grace, checker takes over: resident=4, desired=3 → remove 1.
+        // Cascade picks 102 (decommission node) first.
+        let op = ReplicaChecker.check_bg(&bg, &f.ctx).expect("op");
+        let (_, removed, _) = decompose(&op);
+        assert_eq!(removed, vec![102]);
+    }
+
+    #[test]
+    fn over_replica_prefers_decommission_over_healthy() {
+        // 5 replicas, desired=3 → remove 2. Worker 102 on Decommission node.
+        // Cascade: pick 102 first (decommission), then one healthy by policy.
+        // grace=0 so the leaving check doesn't skip the BG.
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            keys::PD_CHECKER_LEAVING_GRACE_MS.to_string(),
+            "0".to_string(),
+        );
+        let f = Fixture::with_overrides(overrides);
+        f.add_workers(&[100, 101, 102, 103, 104], POOL_ID_SSD);
+        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        let bg = f.insert_bg(1, table_id, vec![100, 101, 102, 103, 104], Some(100));
+        f.set_worker_state(102, curvine_common::state::NodeState::Decommission);
+
+        let op = ReplicaChecker.check_bg(&bg, &f.ctx).expect("op");
+        let (_, removed, _) = decompose(&op);
+        assert_eq!(removed.len(), 2);
+        assert!(removed.contains(&102), "decommission replica must be first");
+    }
+
+    #[test]
+    fn over_replica_prefers_offline_node_in_cascade() {
+        // 5 replicas, desired=3 → remove 2. Worker 102 on Offline node, 103 on
+        // Decommission node. Cascade: 103 (decommission) first, then 102 (offline).
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            keys::PD_CHECKER_LEAVING_GRACE_MS.to_string(),
+            "0".to_string(),
+        );
+        let f = Fixture::with_overrides(overrides);
+        f.add_workers(&[100, 101, 102, 103, 104], POOL_ID_SSD);
+        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        let bg = f.insert_bg(1, table_id, vec![100, 101, 102, 103, 104], Some(100));
+        f.set_worker_state(102, curvine_common::state::NodeState::Offline);
+        f.set_worker_state(103, curvine_common::state::NodeState::Decommission);
+
+        let op = ReplicaChecker.check_bg(&bg, &f.ctx).expect("op");
+        let (_, removed, _) = decompose(&op);
+        assert_eq!(removed.len(), 2);
+        assert!(removed.contains(&102), "offline-node replica removed");
+        assert!(removed.contains(&103), "decommission-node replica removed");
+    }
+
+    #[test]
+    fn over_replica_transfers_lease_when_owner_is_removed() {
+        // 5 replicas, desired=3 → remove 2. Lease owner = 102 (which is on a
+        // Decommission node, so cascade picks it for removal). Operator must
+        // include a TransferLease step to a survivor before the removes.
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            keys::PD_CHECKER_LEAVING_GRACE_MS.to_string(),
+            "0".to_string(),
+        );
+        let f = Fixture::with_overrides(overrides);
+        f.add_workers(&[100, 101, 102, 103, 104], POOL_ID_SSD);
+        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        // lease_owner = 102 (will be removed)
+        let bg = f.insert_bg(1, table_id, vec![100, 101, 102, 103, 104], Some(102));
+        f.set_worker_state(102, curvine_common::state::NodeState::Decommission);
+        f.set_worker_state(103, curvine_common::state::NodeState::Offline);
+
+        let op = ReplicaChecker.check_bg(&bg, &f.ctx).expect("op");
+        let (_, removed, transfers) = decompose(&op);
+        assert_eq!(removed.len(), 2);
+        assert!(removed.contains(&102) && removed.contains(&103));
+
+        assert_eq!(
+            transfers.len(),
+            1,
+            "lease owner removed → transfer expected"
+        );
+        let (from, to) = transfers[0];
+        assert_eq!(
+            from, 102,
+            "transfer must originate from removed lease owner"
+        );
+        assert!(!removed.contains(&to), "transfer target must be a survivor");
+    }
+
+    #[test]
+    fn over_replica_no_transfer_when_owner_survives() {
+        // Sanity: lease owner stays in the surviving set → no TransferLease.
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            keys::PD_CHECKER_LEAVING_GRACE_MS.to_string(),
+            "0".to_string(),
+        );
+        let f = Fixture::with_overrides(overrides);
+        f.add_workers(&[100, 101, 102, 103, 104], POOL_ID_SSD);
+        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        // lease_owner = 100 (survives)
+        let bg = f.insert_bg(1, table_id, vec![100, 101, 102, 103, 104], Some(100));
+        f.set_worker_state(103, curvine_common::state::NodeState::Decommission);
+        f.set_worker_state(104, curvine_common::state::NodeState::Offline);
+
+        let op = ReplicaChecker.check_bg(&bg, &f.ctx).expect("op");
+        let (_, removed, transfers) = decompose(&op);
+        assert_eq!(removed.len(), 2);
+        assert!(!removed.contains(&100));
+        assert!(transfers.is_empty(), "no transfer when owner survives");
+    }
+
+    #[test]
+    fn over_replica_keeps_lease_owner_when_no_survivor_available() {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            keys::PD_CHECKER_LEAVING_GRACE_MS.to_string(),
+            "0".to_string(),
+        );
+        let f = Fixture::with_overrides(overrides);
+        f.add_workers(&[100, 101], POOL_ID_SSD);
+        let table_id = f.insert_table(POOL_ID_SSD, 0);
+        let bg = f.insert_bg(1, table_id, vec![100, 101], Some(100));
+        f.set_worker_state(100, curvine_common::state::NodeState::Decommission);
+        f.set_worker_state(101, curvine_common::state::NodeState::Decommission);
+
+        let op = ReplicaChecker.check_bg(&bg, &f.ctx).expect("op");
+        let (_, removed, transfers) = decompose(&op);
+        assert!(
+            !removed.contains(&100),
+            "lease owner must be kept when no survivor exists; got removed={:?}",
+            removed,
+        );
+        assert!(
+            transfers.is_empty(),
+            "no transfer can be emitted when survivor is absent; got {:?}",
+            transfers,
+        );
     }
 }

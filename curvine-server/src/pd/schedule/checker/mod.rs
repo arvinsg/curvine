@@ -14,13 +14,34 @@
 
 use self::lease_validity::LeaseValidityChecker;
 use self::placement_rule::PlacementRuleChecker;
+use self::pool_membership::PoolMembershipChecker;
 use self::replica::ReplicaChecker;
+use crate::pd::config::keys;
 use crate::pd::schedule::{BGOperator, ManagerContext};
-use curvine_common::state::{BlockGroupInfo, NodeInfo};
+use curvine_common::state::{BlockGroupInfo, NodeInfo, NodeState};
 
 pub mod lease_validity;
 pub mod placement_rule;
+pub mod pool_membership;
 pub mod replica;
+
+/// True iff a BG has a replica on a Decommission/Offline node AND the grace
+/// window since the node entered that state has not yet elapsed.
+pub(crate) fn bg_in_leaving_grace(bg: &BlockGroupInfo, ctx: &ManagerContext) -> bool {
+    let grace_ms = ctx
+        .config_manager
+        .get_u64(keys::PD_CHECKER_LEAVING_GRACE_MS);
+    let now_ms = orpc::common::LocalTime::mills();
+    bg.replica_set.iter().any(|&wid| {
+        let Some(node) = ctx.node_manager.get_node(wid) else {
+            return false;
+        };
+        if !matches!(node.state, NodeState::Offline | NodeState::Decommission) {
+            return false;
+        }
+        node.state_since_ms == 0 || now_ms.saturating_sub(node.state_since_ms) < grace_ms
+    })
+}
 
 /// Priority levels for `Checker::priority()`.
 pub struct CheckerPriority;
@@ -31,6 +52,8 @@ impl CheckerPriority {
     pub const LEASE_VALIDITY: u32 = 20;
     /// Placement rule violated — affects fault isolation but not data safety.
     pub const PLACEMENT_RULE: u32 = 30;
+    /// Pool membership missing — diagnostic, runs after the BG-centric checkers.
+    pub const POOL_MEMBERSHIP: u32 = 100;
 }
 
 /// Checker trait: ensures correctness via patrol.
@@ -56,6 +79,7 @@ pub fn default_checkers() -> Vec<Box<dyn Checker>> {
         Box::new(ReplicaChecker),
         Box::new(LeaseValidityChecker),
         Box::new(PlacementRuleChecker),
+        Box::new(PoolMembershipChecker),
     ];
     checkers.sort_by_key(|c| c.priority());
     checkers
@@ -69,9 +93,9 @@ pub mod tests_common {
     use crate::pd::pool::{POOL_ID_HDD, POOL_ID_MEM, POOL_ID_SSD};
     use crate::pd::schedule::ManagerContext;
     use curvine_common::state::{
-        table_id_replica_count, BGLease, BGOpState, BGState, BlockGroupInfo, NodeAddress, NodeBase,
-        NodeInfo, NodePayload, NodeState, NodeType, PoolInfo, ReplicaState, StorageType,
-        WorkerNodePayload,
+        gen_table_id, table_id_replica_count, BGLease, BGOpState, BGState, BlockGroupInfo,
+        NodeAddress, NodeBase, NodeInfo, NodePayload, NodeState, NodeType, PoolInfo, ReplicaState,
+        StorageType, WorkerNodePayload,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -233,12 +257,13 @@ pub mod tests_common {
         pub fn set_worker_state(&self, worker_id: u32, state: NodeState) {
             let mut node = self.ctx.node_manager.get_node(worker_id).expect("worker");
             node.state = state;
+            node.state_since_ms = orpc::common::LocalTime::mills();
             self.ctx.node_manager.test_insert_node(node);
         }
 
         /// Insert a BGTable for (pool_id, replica_count). Returns the composed table_id.
         pub fn insert_table(&self, pool_id: u16, replica_count: u16) -> u32 {
-            let table_id = ((pool_id as u32) << 16) | (replica_count as u32);
+            let table_id = gen_table_id(pool_id, replica_count);
             debug_assert_eq!(table_id_replica_count(table_id), replica_count);
             self.ctx.bg_manager.test_insert_table(BGTable {
                 table_id,

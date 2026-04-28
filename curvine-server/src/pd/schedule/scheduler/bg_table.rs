@@ -1,233 +1,282 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use super::Scheduler;
 use crate::pd::config::keys;
 use crate::pd::node::{NodeEvent, NodeEventType};
 use crate::pd::schedule::{BGOperator, ManagerContext, OpPriority, OperatorBuilder, OperatorKind};
-use curvine_common::state::{BGOpState, NodeType, ReplicaState};
-use dashmap::DashMap;
-use std::collections::HashSet;
-use std::sync::Arc;
+use curvine_common::state::{gen_table_id, BGOpState, NodeType, ReplicaState};
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const BGTABLE_MIN_INTERVAL: Duration = Duration::from_secs(5);
 const BGTABLE_MAX_INTERVAL: Duration = Duration::from_secs(60);
 const BGTABLE_BACKOFF_FACTOR: f64 = 1.5;
 
-/// Reason for BGTable rebuild.
 #[derive(Clone, Debug)]
-pub enum RebuildReason {
-    NodeJoined { node_ids: Vec<u32> },
-    NodeRemoved { node_ids: Vec<u32> },
-    Manual,
-}
-
-#[derive(Clone)]
-pub struct RebuildTask {
-    pub pool_id: u16,
-    pub reason: RebuildReason,
+pub struct PendingPoolRebuild {
     pub scheduled_time_ms: u64,
 }
 
-/// BGTable scheduler: handles initial table creation and event-driven rebuild
-/// with cooldown and reason merging.
+/// BGTable scheduler: two responsibilities keyed by `pool_id`:
 ///
-/// `check_table_initialization` proposes new tables directly via Raft (no concurrent
-/// state to conflict with — new table). Rebuild produces `Rebuild` operators that
-/// flow through the operator pipeline (with Burst-class rate limiting for fast
-/// post-expansion rebalance).
+/// 1. **Initialize** — when a pool has no BGTable for some configured `replica_count`,
+///    wait for `cooldown` of quiescence (no further node joins) before creating it.
+///
+/// 2. **Rebuild** — when a new worker joins a pool that already has a table, wait
+///    `cooldown` of quiescence and then re-plan placement via the rebuild diff.
 pub struct BGTableScheduler {
     ctx: Arc<ManagerContext>,
-    pending_rebuilds: DashMap<u16, RebuildTask>,
+    pending: Mutex<HashMap<u16, PendingPoolRebuild>>,
 }
 
 impl BGTableScheduler {
     pub fn new(ctx: Arc<ManagerContext>) -> Self {
         Self {
             ctx,
-            pending_rebuilds: DashMap::new(),
+            pending: Mutex::new(HashMap::new()),
         }
     }
 
-    pub fn schedule_rebuild(&self, pool_ids: Vec<u16>, reason: RebuildReason) {
-        let auto_enabled = self.ctx.config_manager.get_bool(
-            keys::PD_BG_REBUILD_AUTO_ENABLED,
-            keys::PD_BG_REBUILD_AUTO_ENABLED_DEFAULT,
-        );
+    fn cooldown_ms(&self) -> u64 {
+        self.ctx
+            .config_manager
+            .get_u64(keys::PD_BG_REBUILD_COOLDOWN_MS)
+    }
 
-        if !auto_enabled {
-            log::info!(
-                "Auto rebuild disabled, skipping rebuild for pools {:?}",
-                pool_ids
-            );
-            return;
-        }
+    fn enqueue(&self, pool_id: u16) {
+        let deadline = orpc::common::LocalTime::mills() + self.cooldown_ms();
+        let mut guard = self.pending.lock().unwrap();
+        let entry = guard.entry(pool_id).or_insert(PendingPoolRebuild {
+            scheduled_time_ms: deadline,
+        });
+        entry.scheduled_time_ms = entry.scheduled_time_ms.max(deadline);
+    }
 
-        let cooldown = self.ctx.config_manager.get_u64(
-            keys::PD_BG_REBUILD_COOLDOWN_MS,
-            keys::PD_BG_REBUILD_COOLDOWN_MS_DEFAULT,
-        );
-        let scheduled_time = orpc::common::LocalTime::mills() + cooldown;
-
+    /// Manual trigger.
+    pub fn request_rebuild(&self, pool_ids: Vec<u16>) {
         for pool_id in pool_ids {
-            self.pending_rebuilds
-                .entry(pool_id)
-                .and_modify(|task| {
-                    task.reason = merge_reasons(&task.reason, &reason);
-                    task.scheduled_time_ms = task.scheduled_time_ms.max(scheduled_time);
-                })
-                .or_insert(RebuildTask {
-                    pool_id,
-                    reason: reason.clone(),
-                    scheduled_time_ms: scheduled_time,
-                });
+            self.enqueue(pool_id);
         }
     }
 
-    /// Check if any active pool lacks a BGTable and create one.
-    pub fn check_table_initialization(&self) {
-        let active_pools = self.ctx.pool_manager.list_active_pools();
-        let bucket_count = self.ctx.bg_manager.bucket_count();
-        let replica_counts = self.ctx.bg_manager.replica_counts().to_vec();
+    fn has_table(&self, pool_id: u16, replica_count: u16) -> bool {
+        self.ctx
+            .bg_manager
+            .get_table(gen_table_id(pool_id, replica_count))
+            .is_some()
+    }
 
-        for pool in active_pools {
-            for &replica_count in &replica_counts {
-                let table_id = ((pool.pool_id as u32) << 16) | (replica_count as u32);
-                if self.ctx.bg_manager.get_table(table_id).is_some() {
-                    continue;
-                }
-                let workers: Vec<u32> = pool
-                    .workers
-                    .iter()
-                    .copied()
-                    .filter(|w| self.ctx.pool_manager.is_worker_available(*w))
-                    .collect();
-                if workers.len() < replica_count as usize {
-                    log::warn!(
-                        "No enough workers for pool {} with {} buckets, {} replicas, {} workers",
-                        pool.pool_id,
-                        bucket_count,
-                        replica_count,
-                        workers.len()
-                    );
-                    continue;
-                }
-                log::info!(
-                    "Initializing BGTable for pool {} with {} buckets, {} replicas, {} workers",
-                    pool.pool_id,
-                    bucket_count,
-                    replica_count,
-                    workers.len()
-                );
-                if let Err(e) = self.ctx.bg_manager.create_table(
-                    pool.pool_id,
-                    bucket_count,
-                    replica_count,
-                    &workers,
-                ) {
-                    log::error!("Failed to create BGTable for pool {}: {}", pool.pool_id, e);
-                }
+    /// Has any table for any configured replica_count on this pool?
+    fn has_any_table(&self, pool_id: u16) -> bool {
+        self.ctx
+            .bg_manager
+            .replica_counts()
+            .iter()
+            .any(|&rc| self.has_table(pool_id, rc))
+    }
+
+    fn bootstrap_missing_tables(&self) {
+        let deadline = orpc::common::LocalTime::mills() + self.cooldown_ms();
+        let pools_needing_init: Vec<u16> = self
+            .ctx
+            .pool_manager
+            .list_active_pools()
+            .into_iter()
+            .filter(|p| !self.has_any_table(p.pool_id))
+            .map(|p| p.pool_id)
+            .collect();
+
+        let mut guard = self.pending.lock().unwrap();
+        for pool_id in pools_needing_init {
+            if let Entry::Vacant(v) = guard.entry(pool_id) {
+                log::debug!("bootstrap: seeding Init for pool {}", pool_id);
+                v.insert(PendingPoolRebuild {
+                    scheduled_time_ms: deadline,
+                });
             }
         }
     }
 
-    /// Compute rebuild diff for the pool's tables and produce Rebuild operators.
-    fn compute_rebuild_operators(&self, pool_id: u16) -> Vec<BGOperator> {
-        let mut ops = Vec::new();
-        let table_ids: Vec<u32> = self
-            .ctx
-            .bg_manager
-            .list_tables()
+    fn check_and_execute(&self) -> Vec<BGOperator> {
+        let now = orpc::common::LocalTime::mills();
+        let auto_enabled = self.auto_rebuild_enabled();
+
+        let pure_init_pools = self.pools_needing_only_init();
+        let drained = self.drain_ready_pools(now, auto_enabled, &pure_init_pools);
+        self.dispatch_drained_pools(drained, auto_enabled)
+    }
+
+    fn auto_rebuild_enabled(&self) -> bool {
+        self.ctx
+            .config_manager
+            .get_bool(keys::PD_BG_REBUILD_AUTO_ENABLED)
+    }
+
+    fn pools_needing_only_init(&self) -> HashSet<u16> {
+        let pending_pool_ids: Vec<u16> = {
+            let guard = self.pending.lock().unwrap();
+            guard.keys().copied().collect()
+        };
+        pending_pool_ids
             .into_iter()
-            .filter(|t| t.pool_id() == pool_id)
-            .map(|t| t.table_id)
+            .filter(|&pid| !self.has_any_table(pid))
+            .collect()
+    }
+
+    fn drain_ready_pools(
+        &self,
+        now: u64,
+        auto_enabled: bool,
+        pure_init_pools: &HashSet<u16>,
+    ) -> Vec<u16> {
+        let mut guard = self.pending.lock().unwrap();
+        let ready: Vec<u16> = guard
+            .iter()
+            .filter(|(pid, v)| {
+                v.scheduled_time_ms <= now && (auto_enabled || pure_init_pools.contains(pid))
+            })
+            .map(|(k, _)| *k)
             .collect();
+        for k in &ready {
+            guard.remove(k);
+        }
+        ready
+    }
 
-        for table_id in table_ids {
-            let diff = match self.ctx.bg_manager.compute_rebuild_diff(table_id) {
-                Ok(d) => d,
-                Err(e) => {
-                    log::error!("compute_rebuild_diff for table {} failed: {}", table_id, e);
-                    continue;
-                }
-            };
-
-            for (new_bg, old_replicas) in diff {
-                // Skip BGs already under operation.
-                if new_bg.op_state != BGOpState::Idle {
-                    continue;
-                }
-                let old_set: HashSet<u32> = old_replicas.iter().copied().collect();
-                let new_set: HashSet<u32> = new_bg.replica_set.iter().copied().collect();
-                let added: Vec<u32> = new_set.difference(&old_set).copied().collect();
-                let removed: Vec<u32> = old_set.difference(&new_set).copied().collect();
-                if added.is_empty() && removed.is_empty() {
-                    continue;
-                }
-
-                // Safety: limit single-round replacements to preserve Active replica count.
-                let max_replace = std::cmp::max(1, old_replicas.len() / 2);
-                let replace_count = std::cmp::min(added.len(), max_replace).min(removed.len());
-                let added = &added
-                    [..std::cmp::min(added.len(), replace_count.max(added.len().min(max_replace)))];
-                let removed = &removed[..std::cmp::min(removed.len(), replace_count.max(1))];
-
-                let mut builder = OperatorBuilder::new(
-                    OperatorKind::Rebuild,
-                    new_bg.bg_id,
-                    format!(
-                        "Rebuild bg {}: add {:?}, remove {:?}",
-                        new_bg.bg_id, added, removed
-                    ),
-                )
-                .bg_epoch(new_bg.bg_epoch.saturating_sub(1))
-                .priority(OpPriority::REBUILD);
-
-                for w in added {
-                    builder = builder.add_replica(*w);
-                    builder = builder.wait_replica_ready(*w, ReplicaState::Active);
-                }
-
-                // Lease transfer if owner changed.
-                if let Some(new_lease) = &new_bg.lease_owner {
-                    let old_owner = old_replicas
-                        .iter()
-                        .find(|w| !new_set.contains(w))
-                        .copied()
-                        .unwrap_or(0);
-                    if old_owner != 0 && old_owner != new_lease.node_id {
-                        builder = builder.transfer_lease(old_owner, new_lease.node_id);
+    fn dispatch_drained_pools(&self, pool_ids: Vec<u16>, auto_enabled: bool) -> Vec<BGOperator> {
+        let mut ops = Vec::new();
+        for pool_id in pool_ids {
+            for &rc in self.ctx.bg_manager.replica_counts() {
+                if self.has_table(pool_id, rc) {
+                    if auto_enabled {
+                        ops.extend(self.build_rebuild_ops(gen_table_id(pool_id, rc)));
                     }
+                } else {
+                    self.try_initialize_table(pool_id, rc);
                 }
-
-                for w in removed {
-                    builder = builder.remove_replica(*w);
-                }
-
-                ops.push(builder.build());
             }
         }
         ops
     }
 
-    fn check_and_execute_rebuilds(&self) -> Vec<BGOperator> {
-        let now = orpc::common::LocalTime::mills();
-        let ready: Vec<(u16, RebuildTask)> = self
-            .pending_rebuilds
-            .iter()
-            .filter(|e| e.value().scheduled_time_ms <= now)
-            .map(|e| (*e.key(), e.value().clone()))
-            .collect();
-
-        let mut all_ops = Vec::new();
-        for (pool_id, task) in ready {
-            self.pending_rebuilds.remove(&pool_id);
-            log::info!(
-                "Rebuilding BGTable for pool {} (reason: {:?})",
-                pool_id,
-                task.reason
-            );
-            all_ops.extend(self.compute_rebuild_operators(pool_id));
+    fn try_initialize_table(&self, pool_id: u16, replica_count: u16) {
+        if self.has_table(pool_id, replica_count) {
+            return;
         }
-        all_ops
+        let pool = match self.ctx.pool_manager.get_pool(pool_id) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("init pool={}: get_pool failed: {}", pool_id, e);
+                return;
+            }
+        };
+        let workers: Vec<u32> = pool
+            .workers
+            .iter()
+            .copied()
+            .filter(|w| self.ctx.pool_manager.is_worker_available(*w))
+            .collect();
+        if workers.len() < replica_count as usize {
+            log::warn!(
+                "init pool={} replica_count={}: only {} available workers; will retry on next event/scan",
+                pool_id,
+                replica_count,
+                workers.len()
+            );
+            return;
+        }
+        let bucket_count = self.ctx.bg_manager.bucket_count();
+        log::info!(
+            "Initializing BGTable pool={} buckets={} replica_count={} workers={}",
+            pool_id,
+            bucket_count,
+            replica_count,
+            workers.len()
+        );
+        if let Err(e) =
+            self.ctx
+                .bg_manager
+                .create_table(pool_id, bucket_count, replica_count, &workers)
+        {
+            log::error!(
+                "create_table pool={} replica_count={} failed: {}",
+                pool_id,
+                replica_count,
+                e
+            );
+        }
+    }
+
+    fn build_rebuild_ops(&self, table_id: u32) -> Vec<BGOperator> {
+        let mut ops = Vec::new();
+        let diff = match self.ctx.bg_manager.compute_rebuild_diff(table_id) {
+            Ok(d) => d,
+            Err(e) => {
+                log::error!("compute_rebuild_diff table={} failed: {}", table_id, e);
+                return ops;
+            }
+        };
+
+        for (new_bg, old_replicas) in diff {
+            if new_bg.op_state != BGOpState::Idle {
+                continue;
+            }
+            let old_set: HashSet<u32> = old_replicas.iter().copied().collect();
+            let new_set: HashSet<u32> = new_bg.replica_set.iter().copied().collect();
+            let added: Vec<u32> = new_set.difference(&old_set).copied().collect();
+            let removed: Vec<u32> = old_set.difference(&new_set).copied().collect();
+            if added.is_empty() && removed.is_empty() {
+                continue;
+            }
+
+            let mut builder = OperatorBuilder::new(
+                OperatorKind::Rebuild,
+                new_bg.bg_id,
+                format!(
+                    "Rebuild bg {}: add {:?}, remove {:?}",
+                    new_bg.bg_id, added, removed
+                ),
+            )
+            .bg_epoch(new_bg.bg_epoch.saturating_sub(1))
+            .priority(OpPriority::REBUILD);
+
+            for w in &added {
+                builder = builder.add_replica(*w);
+                builder = builder.wait_replica_ready(*w, ReplicaState::Active);
+            }
+
+            if let Some(new_lease) = &new_bg.lease_owner {
+                let old_owner = old_replicas
+                    .iter()
+                    .find(|w| !new_set.contains(w))
+                    .copied()
+                    .unwrap_or(0);
+                if old_owner != 0 && old_owner != new_lease.node_id {
+                    builder = builder.transfer_lease(old_owner, new_lease.node_id);
+                }
+            }
+
+            for w in &removed {
+                builder = builder.remove_replica(*w);
+            }
+
+            ops.push(builder.build());
+        }
+        ops
     }
 }
 
@@ -237,8 +286,8 @@ impl Scheduler for BGTableScheduler {
     }
 
     fn schedule(&self, _ctx: &ManagerContext) -> Vec<BGOperator> {
-        self.check_table_initialization();
-        self.check_and_execute_rebuilds()
+        self.bootstrap_missing_tables();
+        self.check_and_execute()
     }
 
     fn is_schedule_allowed(&self, _ctx: &ManagerContext) -> bool {
@@ -255,64 +304,15 @@ impl Scheduler for BGTableScheduler {
     }
 
     fn on_event(&self, event: &NodeEvent) {
-        match event.event_type {
-            NodeEventType::Registered if event.node_type == NodeType::Worker => {
-                let pool_ids = self.ctx.pool_manager.get_pools_by_worker(event.node_id);
-                if !pool_ids.is_empty() {
-                    self.schedule_rebuild(
-                        pool_ids,
-                        RebuildReason::NodeJoined {
-                            node_ids: vec![event.node_id],
-                        },
-                    );
-                }
-            }
-            NodeEventType::Offline if event.node_type == NodeType::Worker => {
-                let pool_ids = self.ctx.pool_manager.get_pools_by_worker(event.node_id);
-                if !pool_ids.is_empty() {
-                    self.schedule_rebuild(
-                        pool_ids,
-                        RebuildReason::NodeRemoved {
-                            node_ids: vec![event.node_id],
-                        },
-                    );
-                }
-            }
-            NodeEventType::DecommissionFinished if event.node_type == NodeType::Worker => {
-                let pool_ids = self.ctx.pool_manager.get_pools_by_worker(event.node_id);
-                if !pool_ids.is_empty() {
-                    self.schedule_rebuild(
-                        pool_ids,
-                        RebuildReason::NodeRemoved {
-                            node_ids: vec![event.node_id],
-                        },
-                    );
-                }
-            }
-            _ => {}
+        if event.node_type != NodeType::Worker {
+            return;
         }
-    }
-}
-
-fn merge_reasons(existing: &RebuildReason, new: &RebuildReason) -> RebuildReason {
-    match (existing, new) {
-        (
-            RebuildReason::NodeJoined { node_ids: ids1 },
-            RebuildReason::NodeJoined { node_ids: ids2 },
-        ) => {
-            let mut merged = ids1.clone();
-            merged.extend(ids2.iter().copied());
-            RebuildReason::NodeJoined { node_ids: merged }
+        if event.event_type != NodeEventType::Registered {
+            return;
         }
-        (
-            RebuildReason::NodeRemoved { node_ids: ids1 },
-            RebuildReason::NodeRemoved { node_ids: ids2 },
-        ) => {
-            let mut merged = ids1.clone();
-            merged.extend(ids2.iter().copied());
-            RebuildReason::NodeRemoved { node_ids: merged }
+        for pool_id in self.ctx.pool_manager.get_pools_by_worker(event.node_id) {
+            self.enqueue(pool_id);
         }
-        _ => new.clone(),
     }
 }
 
@@ -321,7 +321,6 @@ mod tests {
     use super::*;
     use crate::pd::pool::POOL_ID_SSD;
     use crate::pd::schedule::checker::tests_common::{test_context, Fixture};
-    use std::collections::HashMap;
 
     #[test]
     fn name_and_type() {
@@ -334,11 +333,9 @@ mod tests {
     fn interval_backoff() {
         let ctx = test_context(HashMap::new());
         let s = BGTableScheduler::new(ctx);
-        // min_interval = 5s; next_interval grows by 1.5x up to 60s.
         assert_eq!(s.min_interval(), Duration::from_secs(5));
         let i1 = s.next_interval(s.min_interval());
         assert!(i1 > Duration::from_secs(5) && i1 <= Duration::from_secs(60));
-        // Converges to the cap.
         let mut cur = s.min_interval();
         for _ in 0..20 {
             cur = s.next_interval(cur);
@@ -346,158 +343,197 @@ mod tests {
         assert_eq!(cur, Duration::from_secs(60));
     }
 
-    #[test]
-    fn merge_same_type_joined() {
-        let a = RebuildReason::NodeJoined { node_ids: vec![1] };
-        let b = RebuildReason::NodeJoined { node_ids: vec![2] };
-        match merge_reasons(&a, &b) {
-            RebuildReason::NodeJoined { node_ids } => assert_eq!(node_ids, vec![1, 2]),
-            _ => panic!("expected NodeJoined"),
-        }
-    }
-
-    #[test]
-    fn merge_same_type_removed() {
-        let a = RebuildReason::NodeRemoved { node_ids: vec![3] };
-        let b = RebuildReason::NodeRemoved {
-            node_ids: vec![4, 5],
-        };
-        match merge_reasons(&a, &b) {
-            RebuildReason::NodeRemoved { node_ids } => assert_eq!(node_ids, vec![3, 4, 5]),
-            _ => panic!("expected NodeRemoved"),
-        }
-    }
-
-    #[test]
-    fn merge_different_types_uses_new() {
-        let a = RebuildReason::NodeJoined { node_ids: vec![1] };
-        let b = RebuildReason::Manual;
-        match merge_reasons(&a, &b) {
-            RebuildReason::Manual => {}
-            _ => panic!("expected Manual"),
-        }
-    }
-
     fn scheduler_for(f: &Fixture) -> BGTableScheduler {
         BGTableScheduler::new(f.ctx.clone())
     }
 
-    #[test]
-    fn table_init_skips_when_not_enough_workers() {
-        // Only 2 workers but replica_count=3 → skip; no Raft propose attempted.
-        let f = Fixture::new();
-        f.add_workers(&[100, 101], POOL_ID_SSD);
-        let s = scheduler_for(&f);
-
-        s.check_table_initialization();
-
-        let table_id = ((POOL_ID_SSD as u32) << 16) | 3;
-        assert!(
-            f.ctx.bg_manager.get_table(table_id).is_none(),
-            "table must not be initialized with only 2 workers for replica_count=3"
-        );
+    fn pending_deadline(s: &BGTableScheduler, pool_id: u16) -> Option<u64> {
+        s.pending
+            .lock()
+            .unwrap()
+            .get(&pool_id)
+            .map(|v| v.scheduled_time_ms)
     }
 
     #[test]
-    fn table_init_skips_when_table_already_exists() {
-        let f = Fixture::new();
-        f.add_workers(&[100, 101, 102], POOL_ID_SSD);
-        let existing_id = f.insert_table(POOL_ID_SSD, 3);
-        let s = scheduler_for(&f);
-
-        // Should see the existing table and short-circuit without touching Raft.
-        s.check_table_initialization();
-
-        assert!(f.ctx.bg_manager.get_table(existing_id).is_some());
-    }
-
-    #[test]
-    fn schedule_rebuild_stores_task_with_cooldown() {
+    fn enqueue_inserts_with_now_plus_cooldown() {
         let f = Fixture::new();
         let s = scheduler_for(&f);
         let before = orpc::common::LocalTime::mills();
 
-        s.schedule_rebuild(
-            vec![POOL_ID_SSD],
-            RebuildReason::NodeJoined {
-                node_ids: vec![100],
-            },
-        );
+        s.enqueue(POOL_ID_SSD);
 
-        let task = s.pending_rebuilds.get(&POOL_ID_SSD).expect("pending task");
-        // Default cooldown is 60_000 ms.
-        assert!(
-            task.scheduled_time_ms >= before + 60_000,
-            "task.scheduled_time_ms should be at least now+cooldown"
-        );
-        matches!(task.reason, RebuildReason::NodeJoined { .. });
+        let deadline = pending_deadline(&s, POOL_ID_SSD).unwrap();
+        assert!(deadline >= before + 60_000, "default cooldown is 60s");
     }
 
     #[test]
-    fn schedule_rebuild_merges_same_pool() {
+    fn enqueue_pushes_deadline_forward() {
         let f = Fixture::new();
         let s = scheduler_for(&f);
 
-        s.schedule_rebuild(
-            vec![POOL_ID_SSD],
-            RebuildReason::NodeJoined {
-                node_ids: vec![100],
-            },
-        );
-        s.schedule_rebuild(
-            vec![POOL_ID_SSD],
-            RebuildReason::NodeJoined {
-                node_ids: vec![101],
-            },
-        );
+        s.enqueue(POOL_ID_SSD);
+        let t1 = pending_deadline(&s, POOL_ID_SSD).unwrap();
 
-        let task = s.pending_rebuilds.get(&POOL_ID_SSD).unwrap();
-        match &task.reason {
-            RebuildReason::NodeJoined { node_ids } => assert_eq!(node_ids, &vec![100, 101]),
-            _ => panic!("expected merged NodeJoined"),
-        }
-    }
-
-    #[test]
-    fn schedule_rebuild_takes_later_scheduled_time() {
-        let f = Fixture::new();
-        let s = scheduler_for(&f);
-
-        s.schedule_rebuild(vec![POOL_ID_SSD], RebuildReason::Manual);
-        let first = s
-            .pending_rebuilds
-            .get(&POOL_ID_SSD)
-            .unwrap()
-            .scheduled_time_ms;
-
-        // Call again — should not decrease scheduled_time_ms.
         std::thread::sleep(std::time::Duration::from_millis(5));
-        s.schedule_rebuild(vec![POOL_ID_SSD], RebuildReason::Manual);
-        let second = s
-            .pending_rebuilds
-            .get(&POOL_ID_SSD)
-            .unwrap()
-            .scheduled_time_ms;
+        s.enqueue(POOL_ID_SSD);
+        let t2 = pending_deadline(&s, POOL_ID_SSD).unwrap();
 
-        assert!(second >= first, "scheduled_time_ms must be monotonic (max)");
+        assert!(t2 > t1, "subsequent event must push deadline forward");
     }
 
     #[test]
-    fn schedule_rebuild_disabled_by_config() {
+    fn bootstrap_seeds_pools_without_tables() {
+        let f = Fixture::new();
+        f.add_worker(100, POOL_ID_SSD, &[]);
+        let s = scheduler_for(&f);
+
+        s.bootstrap_missing_tables();
+
+        assert!(pending_deadline(&s, POOL_ID_SSD).is_some());
+    }
+
+    #[test]
+    fn bootstrap_does_not_bump_existing_deadline() {
+        let f = Fixture::new();
+        f.add_worker(100, POOL_ID_SSD, &[]);
+        let s = scheduler_for(&f);
+
+        s.bootstrap_missing_tables();
+        let t1 = pending_deadline(&s, POOL_ID_SSD).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        s.bootstrap_missing_tables();
+        let t2 = pending_deadline(&s, POOL_ID_SSD).unwrap();
+
+        assert_eq!(t1, t2, "bootstrap must be idempotent w.r.t. deadline");
+    }
+
+    #[test]
+    fn bootstrap_skips_pools_with_any_table() {
+        let f = Fixture::new();
+        f.add_workers(&[100, 101, 102], POOL_ID_SSD);
+        f.insert_table(POOL_ID_SSD, 3);
+        let s = scheduler_for(&f);
+
+        s.bootstrap_missing_tables();
+
+        assert!(s.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn check_and_execute_skips_future_deadlines() {
+        let f = Fixture::new();
+        let s = scheduler_for(&f);
+        s.enqueue(POOL_ID_SSD);
+        let before = pending_deadline(&s, POOL_ID_SSD);
+
+        let ops = s.check_and_execute();
+
+        assert!(ops.is_empty());
+        assert_eq!(
+            pending_deadline(&s, POOL_ID_SSD),
+            before,
+            "future deadline must stay in pending"
+        );
+    }
+
+    #[test]
+    fn check_and_execute_drains_ready_entry() {
+        // 1 worker (< replica_count=3) so try_initialize drops early → no Raft call.
+        let f = Fixture::new();
+        f.add_worker(100, POOL_ID_SSD, &[]);
+        let s = scheduler_for(&f);
+        s.pending.lock().unwrap().insert(
+            POOL_ID_SSD,
+            PendingPoolRebuild {
+                scheduled_time_ms: 0,
+            },
+        );
+
+        s.check_and_execute();
+
+        assert!(
+            !s.pending.lock().unwrap().contains_key(&POOL_ID_SSD),
+            "ready entry must be drained"
+        );
+    }
+
+    #[test]
+    fn check_and_execute_preserves_rebuild_when_auto_disabled() {
         let f = Fixture::with_overrides(
             [(keys::PD_BG_REBUILD_AUTO_ENABLED, "false")]
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         );
+        f.add_workers(&[100, 101, 102], POOL_ID_SSD);
+        f.insert_table(POOL_ID_SSD, 3); // pool has a table → rebuild, not init
         let s = scheduler_for(&f);
+        s.pending.lock().unwrap().insert(
+            POOL_ID_SSD,
+            PendingPoolRebuild {
+                scheduled_time_ms: 0,
+            },
+        );
 
-        s.schedule_rebuild(vec![POOL_ID_SSD], RebuildReason::Manual);
+        let ops = s.check_and_execute();
 
         assert!(
-            s.pending_rebuilds.is_empty(),
-            "auto_enabled=false must skip pending insertion"
+            ops.is_empty(),
+            "rebuild suppressed under auto_enabled=false"
         );
+        assert!(
+            s.pending.lock().unwrap().contains_key(&POOL_ID_SSD),
+            "entry preserved so it fires once auto_enabled flips back on"
+        );
+    }
+
+    #[test]
+    fn check_and_execute_dispatches_pure_init_even_when_auto_disabled() {
+        // auto_enabled=false but no table exists → pure init → still dispatched.
+        // 1 worker (< replica_count=3) so try_initialize drops without Raft.
+        let f = Fixture::with_overrides(
+            [(keys::PD_BG_REBUILD_AUTO_ENABLED, "false")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        f.add_worker(100, POOL_ID_SSD, &[]);
+        let s = scheduler_for(&f);
+        s.pending.lock().unwrap().insert(
+            POOL_ID_SSD,
+            PendingPoolRebuild {
+                scheduled_time_ms: 0,
+            },
+        );
+
+        s.check_and_execute();
+
+        assert!(
+            !s.pending.lock().unwrap().contains_key(&POOL_ID_SSD),
+            "pure init must dispatch even under auto_enabled=false"
+        );
+    }
+
+    #[test]
+    fn fresh_event_after_drain_creates_new_entry() {
+        // Atomic drain + new event = fresh entry for next cycle; no lost update.
+        let f = Fixture::new();
+        f.insert_table(POOL_ID_SSD, 3);
+        let s = scheduler_for(&f);
+
+        s.pending.lock().unwrap().insert(
+            POOL_ID_SSD,
+            PendingPoolRebuild {
+                scheduled_time_ms: 0,
+            },
+        );
+        let _ = s.check_and_execute();
+        assert!(s.pending.lock().unwrap().is_empty());
+
+        s.enqueue(POOL_ID_SSD);
+        assert!(pending_deadline(&s, POOL_ID_SSD).is_some());
     }
 
     fn make_event(event_type: NodeEventType, node_type: NodeType, node_id: u32) -> NodeEvent {
@@ -512,122 +548,77 @@ mod tests {
         }
     }
 
-    struct EventCase {
-        name: &'static str,
-        event_type: NodeEventType,
-        node_type: NodeType,
-        expect_pending: bool,
-        expect_reason_matches_removed: bool,
-    }
+    #[test]
+    fn worker_registered_enqueues_pool() {
+        let f = Fixture::new();
+        f.add_worker(100, POOL_ID_SSD, &[]);
+        let s = scheduler_for(&f);
 
-    fn event_cases() -> Vec<EventCase> {
-        vec![
-            EventCase {
-                name: "Worker Registered → NodeJoined",
-                event_type: NodeEventType::Registered,
-                node_type: NodeType::Worker,
-                expect_pending: true,
-                expect_reason_matches_removed: false,
-            },
-            EventCase {
-                name: "Worker Offline → NodeRemoved",
-                event_type: NodeEventType::Offline,
-                node_type: NodeType::Worker,
-                expect_pending: true,
-                expect_reason_matches_removed: true,
-            },
-            EventCase {
-                name: "Worker DecommissionFinished → NodeRemoved",
-                event_type: NodeEventType::DecommissionFinished,
-                node_type: NodeType::Worker,
-                expect_pending: true,
-                expect_reason_matches_removed: true,
-            },
-            EventCase {
-                name: "Worker Lost → no-op",
-                event_type: NodeEventType::Lost,
-                node_type: NodeType::Worker,
-                expect_pending: false,
-                expect_reason_matches_removed: false,
-            },
-            EventCase {
-                name: "Meta Registered → no-op",
-                event_type: NodeEventType::Registered,
-                node_type: NodeType::Meta,
-                expect_pending: false,
-                expect_reason_matches_removed: false,
-            },
-        ]
+        s.on_event(&make_event(
+            NodeEventType::Registered,
+            NodeType::Worker,
+            100,
+        ));
+
+        assert!(pending_deadline(&s, POOL_ID_SSD).is_some());
     }
 
     #[test]
-    fn on_event_dispatch_table_driven() {
-        for case in event_cases() {
-            let f = Fixture::new();
-            // Register worker 100 and add to pool so get_pools_by_worker returns SSD.
-            f.add_worker(100, POOL_ID_SSD, &[]);
-            let s = scheduler_for(&f);
+    fn worker_offline_is_ignored_by_bg_table() {
+        // Offline / DecommissionFinished belong to DecommissionScheduler.
+        let f = Fixture::new();
+        f.add_worker(100, POOL_ID_SSD, &[]);
+        let s = scheduler_for(&f);
 
-            let event = make_event(case.event_type, case.node_type, 100);
-            s.on_event(&event);
+        s.on_event(&make_event(NodeEventType::Offline, NodeType::Worker, 100));
+        s.on_event(&make_event(
+            NodeEventType::DecommissionFinished,
+            NodeType::Worker,
+            100,
+        ));
 
-            if case.expect_pending {
-                let task = s.pending_rebuilds.get(&POOL_ID_SSD);
-                assert!(task.is_some(), "{}: expected a pending task", case.name);
-                if case.expect_reason_matches_removed {
-                    matches!(task.unwrap().reason, RebuildReason::NodeRemoved { .. });
-                }
-            } else {
-                assert!(
-                    s.pending_rebuilds.is_empty(),
-                    "{}: expected no pending task, got {:?}",
-                    case.name,
-                    s.pending_rebuilds
-                        .iter()
-                        .map(|e| *e.key())
-                        .collect::<Vec<_>>(),
-                );
-            }
-        }
+        assert!(s.pending.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn check_and_execute_skips_future_tasks() {
+    fn meta_events_are_ignored() {
+        let f = Fixture::new();
+        f.add_worker(100, POOL_ID_SSD, &[]);
+        let s = scheduler_for(&f);
+
+        s.on_event(&make_event(NodeEventType::Registered, NodeType::Meta, 100));
+
+        assert!(s.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn multiple_registrations_collapse_to_one_entry() {
+        let f = Fixture::new();
+        f.add_worker(100, POOL_ID_SSD, &[]);
+        let s = scheduler_for(&f);
+
+        s.on_event(&make_event(
+            NodeEventType::Registered,
+            NodeType::Worker,
+            100,
+        ));
+        f.add_worker(101, POOL_ID_SSD, &[]);
+        s.on_event(&make_event(
+            NodeEventType::Registered,
+            NodeType::Worker,
+            101,
+        ));
+
+        assert_eq!(s.pending.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn request_rebuild_enqueues_given_pools() {
         let f = Fixture::new();
         let s = scheduler_for(&f);
 
-        // Default cooldown is 60s → scheduled_time > now, task should stay pending.
-        s.schedule_rebuild(vec![POOL_ID_SSD], RebuildReason::Manual);
-        let before = s.pending_rebuilds.len();
+        s.request_rebuild(vec![POOL_ID_SSD]);
 
-        let ops = s.check_and_execute_rebuilds();
-        assert!(ops.is_empty(), "future-scheduled tasks produce no ops");
-        assert_eq!(
-            s.pending_rebuilds.len(),
-            before,
-            "task must remain in pending until its scheduled_time"
-        );
-    }
-
-    #[test]
-    fn check_and_execute_releases_ready_tasks() {
-        let f = Fixture::new();
-        let s = scheduler_for(&f);
-
-        // Manually insert a task whose scheduled_time is in the past.
-        s.pending_rebuilds.insert(
-            POOL_ID_SSD,
-            RebuildTask {
-                pool_id: POOL_ID_SSD,
-                reason: RebuildReason::Manual,
-                scheduled_time_ms: 0, // already past
-            },
-        );
-
-        let _ops = s.check_and_execute_rebuilds();
-        assert!(
-            s.pending_rebuilds.is_empty(),
-            "ready task must be removed from pending"
-        );
+        assert!(pending_deadline(&s, POOL_ID_SSD).is_some());
     }
 }

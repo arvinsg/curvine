@@ -39,18 +39,29 @@ pub struct ManagerContext {
 
 impl ManagerContext {
     /// Pick a lease transfer target from `bg.replica_set`, excluding `leaving` and
-    /// preferring the available worker with the fewest current leases (load balance).
+    /// preferring the available worker with the fewest current leases.
     pub fn pick_lease_fallback(
         &self,
         bg: &BlockGroupInfo,
         leaving: u32,
         default_target: u32,
     ) -> u32 {
+        self.pick_lease_fallback_excluding(bg, &[leaving], default_target)
+    }
+
+    /// Pick a lease transfer target from `bg.replica_set`, excluding every
+    /// worker in `excluded`.
+    pub fn pick_lease_fallback_excluding(
+        &self,
+        bg: &BlockGroupInfo,
+        excluded: &[u32],
+        default_target: u32,
+    ) -> u32 {
         let lease_counts = self.bg_manager.get_worker_lease_counts();
         bg.replica_set
             .iter()
             .copied()
-            .filter(|&w| w != leaving && self.pool_manager.is_worker_available(w))
+            .filter(|w| !excluded.contains(w) && self.pool_manager.is_worker_available(*w))
             .min_by_key(|w| lease_counts.get(w).copied().unwrap_or(0))
             .unwrap_or(default_target)
     }
@@ -117,10 +128,10 @@ impl Manager {
     async fn patrol_loop(&self, token: CancellationToken) {
         self.checker_controller.patrol();
         loop {
-            let interval_ms = self.ctx.config_manager.get_u64(
-                crate::pd::config::keys::PD_SCHEDULE_PATROL_INTERVAL_MS,
-                crate::pd::config::keys::PD_SCHEDULE_PATROL_INTERVAL_MS_DEFAULT,
-            );
+            let interval_ms = self
+                .ctx
+                .config_manager
+                .get_u64(crate::pd::config::keys::PD_SCHEDULE_PATROL_INTERVAL_MS);
             tokio::select! {
                 _ = token.cancelled() => break,
                 _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
@@ -132,10 +143,10 @@ impl Manager {
 
     async fn operator_loop(&self, token: CancellationToken) {
         loop {
-            let interval_ms = self.ctx.config_manager.get_u64(
-                crate::pd::config::keys::PD_SCHEDULE_OPERATOR_TICK_INTERVAL_MS,
-                crate::pd::config::keys::PD_SCHEDULE_OPERATOR_TICK_INTERVAL_MS_DEFAULT,
-            );
+            let interval_ms = self
+                .ctx
+                .config_manager
+                .get_u64(crate::pd::config::keys::PD_SCHEDULE_OPERATOR_TICK_INTERVAL_MS);
             tokio::select! {
                 _ = token.cancelled() => break,
                 _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
@@ -183,13 +194,21 @@ impl Manager {
             }
             NodeEventType::Lost => {
                 log::info!("Worker {} lost", event.node_id);
-                self.ctx.bg_manager.mark_worker_offline(event.node_id);
+                self.ctx.bg_manager.mark_replicas_lost(event.node_id);
             }
             NodeEventType::DecommissionStarted => {
                 log::info!("Worker {} decommission started", event.node_id);
+                if let Err(e) = self
+                    .ctx
+                    .pool_manager
+                    .remove_worker_from_pools(event.node_id)
+                {
+                    log::error!("remove_worker_from_pools {} failed: {}", event.node_id, e);
+                }
             }
             NodeEventType::Offline => {
                 log::info!("Worker {} offline", event.node_id);
+                self.ctx.bg_manager.mark_replicas_offline(event.node_id);
                 if let Err(e) = self
                     .ctx
                     .pool_manager

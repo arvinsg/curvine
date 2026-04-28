@@ -64,6 +64,7 @@ pub enum ReplicaState {
     Pending,
     Syncing,
     Active,
+    Lost,
     Offline,
 }
 
@@ -73,9 +74,34 @@ impl ReplicaState {
             ReplicaState::Pending => "pending",
             ReplicaState::Syncing => "syncing",
             ReplicaState::Active => "active",
+            ReplicaState::Lost => "lost",
             ReplicaState::Offline => "offline",
         }
     }
+
+    /// Classify a state by how clients see it.
+    pub fn client_view(self) -> ReplicaClientView {
+        match self {
+            ReplicaState::Active => ReplicaClientView::Active,
+            ReplicaState::Lost => ReplicaClientView::Lost,
+            ReplicaState::Pending | ReplicaState::Syncing | ReplicaState::Offline => {
+                ReplicaClientView::Hidden
+            }
+        }
+    }
+
+    pub fn shifts_client_view(self, next: ReplicaState) -> bool {
+        self.client_view() != next.client_view()
+    }
+}
+
+/// How a `ReplicaState` is exposed to clients.
+/// Active = preferred read target; Lost = fallback; Hidden = not advertised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReplicaClientView {
+    Active,
+    Lost,
+    Hidden,
 }
 
 /// Lease info

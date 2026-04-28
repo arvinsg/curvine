@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use curvine_common::state::{NodeInfo, NodeState, NodeType};
+use orpc::common::LocalTime;
 use std::collections::{HashMap, HashSet};
 
 /// In-memory index for nodes by id, type, and state.
@@ -104,6 +105,7 @@ impl NodeIndex {
             .or_default()
             .insert(node_id);
         node.state = new_state;
+        node.state_since_ms = LocalTime::mills();
         true
     }
 

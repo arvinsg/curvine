@@ -48,6 +48,7 @@ impl HeartbeatHandler for MetaHeartbeatHandler {
             epoch: 0,
             state: NodeState::Starting,
             last_heartbeat_ms: 0,
+            state_since_ms: orpc::common::LocalTime::mills(),
             last_persist_ms: 0,
             sys_stats: Default::default(),
             payload: NodePayload::Meta(payload),

@@ -26,6 +26,11 @@ pub fn table_id_pool_id(table_id: u32) -> u16 {
     (table_id >> 16) as u16
 }
 
+#[inline]
+pub fn gen_table_id(pool_id: u16, replica_count: u16) -> u32 {
+    ((pool_id as u32) << 16) | (replica_count as u32)
+}
+
 /// Built by PD from BGTable.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BGTableSummary {

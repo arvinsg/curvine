@@ -27,6 +27,10 @@ impl super::Checker for PlacementRuleChecker {
     }
 
     fn check_bg(&self, bg: &BlockGroupInfo, ctx: &ManagerContext) -> Option<BGOperator> {
+        if super::bg_in_leaving_grace(bg, ctx) {
+            return None;
+        }
+
         let rule = ctx.bg_manager.placement_rule();
         let min_level = rule.min_isolation_level.as_ref()?;
 

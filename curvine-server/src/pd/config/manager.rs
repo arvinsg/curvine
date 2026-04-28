@@ -92,7 +92,6 @@ impl DynamicConfigCache {
             .unwrap()
             .insert(item.key.clone(), item.clone());
     }
-
 }
 
 pub struct ConfigManager {
@@ -142,33 +141,40 @@ impl ConfigManager {
         Ok(())
     }
 
-    pub fn get_u32(&self, key: &str, default: u32) -> u32 {
+    pub fn get_u32(&self, key: &str) -> u32 {
         self.config_value_str(key)
             .and_then(|s| s.parse().ok())
-            .unwrap_or(default)
+            .unwrap_or_default()
     }
 
-    pub fn get_u64(&self, key: &str, default: u64) -> u64 {
+    pub fn get_u64(&self, key: &str) -> u64 {
         self.config_value_str(key)
             .and_then(|s| s.parse().ok())
-            .unwrap_or(default)
+            .unwrap_or_default()
     }
 
-    pub fn get_bool(&self, key: &str, default: bool) -> bool {
+    pub fn get_bool(&self, key: &str) -> bool {
         self.config_value_str(key)
             .map(|s| s == "true" || s == "1")
-            .unwrap_or(default)
+            .unwrap_or_default()
     }
 
-    pub fn get_string(&self, key: &str, default: &str) -> String {
-        self.config_value_str(key)
-            .unwrap_or_else(|| default.to_string())
+    pub fn get_string(&self, key: &str) -> String {
+        self.config_value_str(key).unwrap_or_default()
     }
 
     fn config_value_str(&self, key: &str) -> Option<String> {
-        self.dynamic_cache
+        let value = self
+            .dynamic_cache
             .get(key)
-            .and_then(|info| String::from_utf8(info.value).ok())
+            .and_then(|info| String::from_utf8(info.value).ok());
+        if value.is_none() {
+            log::error!(
+                "config key {} is not registered in DYNAMIC_CONFIG_ITEMS",
+                key
+            );
+        }
+        value
     }
 
     pub fn get_config(&self, req: GetConfigRequest) -> FsResult<GetConfigResponse> {

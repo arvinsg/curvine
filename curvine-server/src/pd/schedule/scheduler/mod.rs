@@ -68,10 +68,10 @@ pub fn build_pending_influence(oc: &OperatorController) -> PendingInfluence {
 /// Build the default set of schedulers.
 pub fn default_schedulers(ctx: std::sync::Arc<ManagerContext>) -> Vec<Box<dyn Scheduler>> {
     vec![
-        Box::new(bg_balance::BGBalanceScheduler),
-        Box::new(lease_balance::LeaseBalanceScheduler),
+        Box::new(bg_balance::BGBalanceScheduler::default()),
+        Box::new(lease_balance::LeaseBalanceScheduler::default()),
         Box::new(bg_table::BGTableScheduler::new(ctx.clone())),
-        Box::new(decommission::DecommissionScheduler),
+        Box::new(decommission::DecommissionScheduler::new()),
         Box::new(stats::StatsScheduler::new()),
     ]
 }

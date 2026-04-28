@@ -109,47 +109,47 @@ impl StoreLimiter {
     fn get_config(&self, limit_type: StoreLimitType) -> (f64, f64) {
         match limit_type {
             StoreLimitType::AddReplica => {
-                let rate = self.config_manager.get_u32(
-                    keys::PD_SCHEDULE_STORE_LIMIT_ADD_REPLICA_RATE,
-                    keys::PD_SCHEDULE_STORE_LIMIT_ADD_REPLICA_RATE_DEFAULT,
-                ) as f64;
-                let capacity = self.config_manager.get_u32(
-                    keys::PD_SCHEDULE_STORE_LIMIT_ADD_REPLICA_CAPACITY,
-                    keys::PD_SCHEDULE_STORE_LIMIT_ADD_REPLICA_CAPACITY_DEFAULT,
-                ) as f64;
+                let rate = self
+                    .config_manager
+                    .get_u32(keys::PD_SCHEDULE_STORE_LIMIT_ADD_REPLICA_RATE)
+                    as f64;
+                let capacity = self
+                    .config_manager
+                    .get_u32(keys::PD_SCHEDULE_STORE_LIMIT_ADD_REPLICA_CAPACITY)
+                    as f64;
                 (rate, capacity)
             }
             StoreLimitType::RemoveReplica => {
-                let rate = self.config_manager.get_u32(
-                    keys::PD_SCHEDULE_STORE_LIMIT_REMOVE_REPLICA_RATE,
-                    keys::PD_SCHEDULE_STORE_LIMIT_REMOVE_REPLICA_RATE_DEFAULT,
-                ) as f64;
-                let capacity = self.config_manager.get_u32(
-                    keys::PD_SCHEDULE_STORE_LIMIT_REMOVE_REPLICA_CAPACITY,
-                    keys::PD_SCHEDULE_STORE_LIMIT_REMOVE_REPLICA_CAPACITY_DEFAULT,
-                ) as f64;
+                let rate = self
+                    .config_manager
+                    .get_u32(keys::PD_SCHEDULE_STORE_LIMIT_REMOVE_REPLICA_RATE)
+                    as f64;
+                let capacity = self
+                    .config_manager
+                    .get_u32(keys::PD_SCHEDULE_STORE_LIMIT_REMOVE_REPLICA_CAPACITY)
+                    as f64;
                 (rate, capacity)
             }
             StoreLimitType::TransferLease => {
-                let rate = self.config_manager.get_u32(
-                    keys::PD_SCHEDULE_STORE_LIMIT_TRANSFER_LEASE_RATE,
-                    keys::PD_SCHEDULE_STORE_LIMIT_TRANSFER_LEASE_RATE_DEFAULT,
-                ) as f64;
-                let capacity = self.config_manager.get_u32(
-                    keys::PD_SCHEDULE_STORE_LIMIT_TRANSFER_LEASE_CAPACITY,
-                    keys::PD_SCHEDULE_STORE_LIMIT_TRANSFER_LEASE_CAPACITY_DEFAULT,
-                ) as f64;
+                let rate = self
+                    .config_manager
+                    .get_u32(keys::PD_SCHEDULE_STORE_LIMIT_TRANSFER_LEASE_RATE)
+                    as f64;
+                let capacity = self
+                    .config_manager
+                    .get_u32(keys::PD_SCHEDULE_STORE_LIMIT_TRANSFER_LEASE_CAPACITY)
+                    as f64;
                 (rate, capacity)
             }
             StoreLimitType::RebuildAddReplica | StoreLimitType::RebuildRemoveReplica => {
-                let rate = self.config_manager.get_u32(
-                    keys::PD_SCHEDULE_STORE_LIMIT_REBUILD_RATE,
-                    keys::PD_SCHEDULE_STORE_LIMIT_REBUILD_RATE_DEFAULT,
-                ) as f64;
-                let capacity = self.config_manager.get_u32(
-                    keys::PD_SCHEDULE_STORE_LIMIT_REBUILD_CAPACITY,
-                    keys::PD_SCHEDULE_STORE_LIMIT_REBUILD_CAPACITY_DEFAULT,
-                ) as f64;
+                let rate = self
+                    .config_manager
+                    .get_u32(keys::PD_SCHEDULE_STORE_LIMIT_REBUILD_RATE)
+                    as f64;
+                let capacity = self
+                    .config_manager
+                    .get_u32(keys::PD_SCHEDULE_STORE_LIMIT_REBUILD_CAPACITY)
+                    as f64;
                 (rate, capacity)
             }
         }
@@ -225,8 +225,8 @@ impl Ord for PriorityOperator {
 /// Mutable state protected by a single Mutex inside OperatorController.
 struct OperatorState {
     waiting: BinaryHeap<PriorityOperator>,
-    /// bg_id of every operator currently in `waiting`. Used for O(1) dedup.
-    waiting_bg_ids: HashSet<u32>,
+    /// bg_id → operator id of the most recent waiting entry per BG.
+    waiting_bg_ops: HashMap<u32, u64>,
     /// Active operators keyed by bg_id. At most one running operator per BG.
     running: HashMap<u32, BGOperator>,
     /// Per-worker running operator count for concurrency limiting.
@@ -237,7 +237,7 @@ impl OperatorState {
     fn new() -> Self {
         Self {
             waiting: BinaryHeap::new(),
-            waiting_bg_ids: HashSet::new(),
+            waiting_bg_ops: HashMap::new(),
             running: HashMap::new(),
             worker_op_count: HashMap::new(),
         }
@@ -279,18 +279,29 @@ impl OperatorController {
     }
 
     /// Add an operator. Returns true if accepted into the waiting queue.
-    /// Deduplicates by bg_id (both waiting and running) and replaces lower-priority running ops.
     pub fn add_operator(&self, op: BGOperator) -> bool {
-        let max_waiting = self.config_manager.get_u32(
-            keys::PD_SCHEDULE_MAX_WAITING_OPERATORS,
-            keys::PD_SCHEDULE_MAX_WAITING_OPERATORS_DEFAULT,
-        );
+        let max_waiting = self
+            .config_manager
+            .get_u32(keys::PD_SCHEDULE_MAX_WAITING_OPERATORS);
 
         let mut state = self.inner.write().unwrap();
 
-        // Already in waiting queue for this BG → reject (dedup).
-        if state.waiting_bg_ids.contains(&op.bg_id) {
+        if state.waiting.len() >= max_waiting as usize {
             return false;
+        }
+
+        // Already in waiting queue for this BG → priority replacement (lazy).
+        if let Some(&existing_id) = state.waiting_bg_ops.get(&op.bg_id) {
+            // Look up the existing op's priority via the heap (rare slow path).
+            let existing_priority = state
+                .waiting
+                .iter()
+                .find(|po| po.0.id == existing_id)
+                .map(|po| po.0.priority)
+                .unwrap_or(0);
+            if op.priority <= existing_priority {
+                return false;
+            }
         }
 
         // Already running for this BG → priority replacement.
@@ -306,11 +317,7 @@ impl OperatorController {
             }
         }
 
-        if state.waiting.len() >= max_waiting as usize {
-            return false;
-        }
-
-        state.waiting_bg_ids.insert(op.bg_id);
+        state.waiting_bg_ops.insert(op.bg_id, op.id);
         state.waiting.push(PriorityOperator(op));
         true
     }
@@ -321,12 +328,29 @@ impl OperatorController {
         self.check_progress(now_ms);
     }
 
+    fn get_step_timeout(&self, step: Option<&OpStep>) -> u64 {
+        match step {
+            Some(OpStep::TransferLease { .. }) => self
+                .config_manager
+                .get_u64(keys::PD_SCHEDULE_STEP_TIMEOUT_TRANSFER_LEASE_MS),
+            Some(OpStep::AddReplica { .. }) => self
+                .config_manager
+                .get_u64(keys::PD_SCHEDULE_STEP_TIMEOUT_ADD_REPLICA_MS),
+            Some(OpStep::RemoveReplica { .. }) => self
+                .config_manager
+                .get_u64(keys::PD_SCHEDULE_STEP_TIMEOUT_REMOVE_REPLICA_MS),
+            Some(OpStep::WaitReplicaReady { .. }) => self
+                .config_manager
+                .get_u64(keys::PD_SCHEDULE_STEP_TIMEOUT_WAIT_REPLICA_READY_MS),
+            None => 180_000,
+        }
+    }
+
     fn check_progress(&self, now_ms: u64) {
         let mut state = self.inner.write().unwrap();
-        let max_lifetime = self.config_manager.get_u64(
-            keys::PD_SCHEDULE_OPERATOR_MAX_LIFETIME_MS,
-            keys::PD_SCHEDULE_OPERATOR_MAX_LIFETIME_MS_DEFAULT,
-        );
+        let max_lifetime = self
+            .config_manager
+            .get_u64(keys::PD_SCHEDULE_OPERATOR_MAX_LIFETIME_MS);
 
         let mut to_remove = Vec::new();
         for (&bg_id, op) in state.running.iter_mut() {
@@ -344,25 +368,7 @@ impl OperatorController {
             }
 
             // Per-step timeout
-            let step_timeout = match op.steps.get(op.current_step) {
-                Some(OpStep::TransferLease { .. }) => self.config_manager.get_u64(
-                    keys::PD_SCHEDULE_STEP_TIMEOUT_TRANSFER_LEASE_MS,
-                    keys::PD_SCHEDULE_STEP_TIMEOUT_TRANSFER_LEASE_MS_DEFAULT,
-                ),
-                Some(OpStep::AddReplica { .. }) => self.config_manager.get_u64(
-                    keys::PD_SCHEDULE_STEP_TIMEOUT_ADD_REPLICA_MS,
-                    keys::PD_SCHEDULE_STEP_TIMEOUT_ADD_REPLICA_MS_DEFAULT,
-                ),
-                Some(OpStep::RemoveReplica { .. }) => self.config_manager.get_u64(
-                    keys::PD_SCHEDULE_STEP_TIMEOUT_REMOVE_REPLICA_MS,
-                    keys::PD_SCHEDULE_STEP_TIMEOUT_REMOVE_REPLICA_MS_DEFAULT,
-                ),
-                Some(OpStep::WaitReplicaReady { .. }) => self.config_manager.get_u64(
-                    keys::PD_SCHEDULE_STEP_TIMEOUT_WAIT_REPLICA_READY_MS,
-                    keys::PD_SCHEDULE_STEP_TIMEOUT_WAIT_REPLICA_READY_MS_DEFAULT,
-                ),
-                None => 10_000,
-            };
+            let step_timeout = self.get_step_timeout(op.steps.get(op.current_step));
             if now_ms.saturating_sub(op.step_start_time_ms) > step_timeout {
                 op.status = OpStatus::Timeout;
                 to_remove.push(bg_id);
@@ -449,7 +455,6 @@ impl OperatorController {
                 }
             }
             OpStep::RemoveReplica { worker_id } => {
-                // Safety: check serving count before propose
                 let serving = self.bg_manager.get_serving_replicas(bg_id);
                 let serving_after = serving.iter().filter(|&&s| s != *worker_id).count();
                 let desired = self
@@ -491,16 +496,23 @@ impl OperatorController {
 
     fn dispatch_operator(&self, now_ms: u64) {
         let mut state = self.inner.write().unwrap();
-        let max_per_worker = self.config_manager.get_u32(
-            keys::PD_SCHEDULE_MAX_OPERATORS_PER_WORKER,
-            keys::PD_SCHEDULE_MAX_OPERATORS_PER_WORKER_DEFAULT,
-        );
+        let max_per_worker = self
+            .config_manager
+            .get_u32(keys::PD_SCHEDULE_MAX_OPERATORS_PER_WORKER);
 
         let mut deferred = Vec::new();
 
         while let Some(PriorityOperator(op)) = state.waiting.pop() {
+            // Lazy delete: if waiting_bg_ops no longer points at this op id,
+            // it was superseded by a higher-priority op for the same BG.
+            // Discard this stale entry without touching the bg_id mapping.
+            match state.waiting_bg_ops.get(&op.bg_id).copied() {
+                Some(current_id) if current_id == op.id => {}
+                _ => continue,
+            }
+
             if state.running.contains_key(&op.bg_id) {
-                state.waiting_bg_ids.remove(&op.bg_id);
+                state.waiting_bg_ops.remove(&op.bg_id);
                 continue;
             }
 
@@ -528,7 +540,7 @@ impl OperatorController {
 
             self.bg_manager.set_op_state(op.bg_id, op.bg_op_state());
             state.increment_worker_counts(&op);
-            state.waiting_bg_ids.remove(&op.bg_id);
+            state.waiting_bg_ops.remove(&op.bg_id);
             state.running.insert(op.bg_id, op);
         }
 
@@ -877,6 +889,43 @@ mod tests {
         // Adding another operator for the same bg_id should be rejected
         let op2 = make_op(2, 10, vec![OpStep::AddReplica { worker_id: 2 }], 1);
         assert!(!ctrl.add_operator(op2));
+    }
+
+    #[test]
+    fn waiting_priority_replacement_accepts_higher() {
+        let (ctrl, _config, _bg_mgr) = test_controller();
+        let low = make_op(1, 10, vec![OpStep::AddReplica { worker_id: 1 }], 50);
+        assert!(ctrl.add_operator(low));
+
+        // Same bg_id, higher priority → accepted, replaces previous waiting entry.
+        let high = make_op(2, 10, vec![OpStep::AddReplica { worker_id: 2 }], 100);
+        assert!(ctrl.add_operator(high));
+
+        // Dispatch: only the high-priority op should reach running; the low one
+        // is dropped via lazy delete (its id no longer matches waiting_bg_ops).
+        let dispatched = ctrl.dispatch_next();
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].id, 2);
+        assert_eq!(dispatched[0].priority, 100);
+    }
+
+    #[test]
+    fn waiting_priority_replacement_rejects_equal_or_lower() {
+        let (ctrl, _config, _bg_mgr) = test_controller();
+        let high = make_op(1, 10, vec![OpStep::AddReplica { worker_id: 1 }], 100);
+        assert!(ctrl.add_operator(high));
+
+        // Same bg_id, equal priority → rejected.
+        let same = make_op(2, 10, vec![OpStep::AddReplica { worker_id: 2 }], 100);
+        assert!(!ctrl.add_operator(same));
+
+        // Same bg_id, lower priority → rejected.
+        let low = make_op(3, 10, vec![OpStep::AddReplica { worker_id: 3 }], 50);
+        assert!(!ctrl.add_operator(low));
+
+        let dispatched = ctrl.dispatch_next();
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].id, 1);
     }
 
     #[test]

@@ -43,6 +43,7 @@ pub struct NodeInfo {
     pub epoch: u64,
     pub state: NodeState,
     pub last_heartbeat_ms: u64,
+    pub state_since_ms: u64,
 
     #[serde(skip)]
     pub last_persist_ms: u64,

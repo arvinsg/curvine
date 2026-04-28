@@ -19,12 +19,17 @@ use crate::pd::bg::placement::{
     isolation_score, PlacementContext,
 };
 use crate::pd::config::keys;
+use crate::pd::node::{NodeEvent, NodeEventType};
 use crate::pd::schedule::{BGOperator, ManagerContext, OpPriority, OperatorBuilder, OperatorKind};
 use curvine_common::state::{BGOpState, ReplicaState};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-pub struct BGBalanceScheduler;
+#[derive(Default)]
+pub struct BGBalanceScheduler {
+    last_register_ms: AtomicU64,
+}
 
 impl Scheduler for BGBalanceScheduler {
     fn name(&self) -> &str {
@@ -34,21 +39,16 @@ impl Scheduler for BGBalanceScheduler {
     fn schedule(&self, ctx: &ManagerContext) -> Vec<BGOperator> {
         let mut result = Vec::new();
 
-        let max_ops_per_table = ctx.config_manager.get_u32(
-            keys::PD_SCHEDULE_BALANCE_MAX_OPS_PER_CYCLE,
-            keys::PD_SCHEDULE_BALANCE_MAX_OPS_PER_CYCLE_DEFAULT,
-        ) as usize;
+        let max_ops_per_table =
+            ctx.config_manager
+                .get_u32(keys::PD_SCHEDULE_BALANCE_MAX_OPS_PER_CYCLE) as usize;
 
-        let tolerant_ratio = ctx.config_manager.get_u32(
-            keys::PD_SCHEDULE_BALANCE_TOLERANT_RATIO_BPS,
-            keys::PD_SCHEDULE_BALANCE_TOLERANT_RATIO_BPS_DEFAULT,
-        ) as f64
-            / 10000.0;
+        let tolerant_ratio =
+            ctx.config_manager
+                .get_u32(keys::PD_SCHEDULE_BALANCE_TOLERANT_RATIO_BPS) as f64
+                / 10000.0;
 
-        let policy_strategy = ctx.config_manager.get_string(
-            keys::PD_BG_BALANCE_POLICY,
-            keys::PD_BG_BALANCE_POLICY_DEFAULT,
-        );
+        let policy_strategy = ctx.config_manager.get_string(keys::PD_BG_BALANCE_POLICY);
 
         let tables = ctx.bg_manager.list_tables();
 
@@ -217,10 +217,17 @@ impl Scheduler for BGBalanceScheduler {
     }
 
     fn is_schedule_allowed(&self, ctx: &ManagerContext) -> bool {
-        ctx.config_manager.get_bool(
-            keys::PD_SCHEDULE_BALANCE_BG_ENABLED,
-            keys::PD_SCHEDULE_BALANCE_BG_ENABLED_DEFAULT,
-        )
+        if !ctx
+            .config_manager
+            .get_bool(keys::PD_SCHEDULE_BALANCE_BG_ENABLED)
+        {
+            return false;
+        }
+        let delay_ms = ctx
+            .config_manager
+            .get_u64(keys::PD_SCHEDULE_BALANCE_POST_REGISTER_DELAY_MS);
+        let last = self.last_register_ms.load(Ordering::Relaxed);
+        last == 0 || orpc::common::LocalTime::mills().saturating_sub(last) >= delay_ms
     }
 
     fn min_interval(&self) -> Duration {
@@ -229,6 +236,13 @@ impl Scheduler for BGBalanceScheduler {
 
     fn next_interval(&self, current: Duration) -> Duration {
         BaseScheduler::default_next_interval(current)
+    }
+
+    fn on_event(&self, event: &NodeEvent) {
+        if matches!(event.event_type, NodeEventType::Registered) {
+            self.last_register_ms
+                .store(event.event_time_ms, Ordering::Relaxed);
+        }
     }
 }
 
@@ -242,7 +256,7 @@ mod tests {
 
     #[test]
     fn name_and_type() {
-        let s = BGBalanceScheduler;
+        let s = BGBalanceScheduler::default();
         assert_eq!(s.name(), "bg-balance-scheduler");
     }
 
@@ -276,13 +290,13 @@ mod tests {
             crate::pd::config::keys::PD_SCHEDULE_BALANCE_BG_ENABLED,
             "false",
         )]));
-        assert!(!BGBalanceScheduler.is_schedule_allowed(&f.ctx));
+        assert!(!BGBalanceScheduler::default().is_schedule_allowed(&f.ctx));
     }
 
     #[test]
     fn enabled_by_default() {
         let f = Fixture::new();
-        assert!(BGBalanceScheduler.is_schedule_allowed(&f.ctx));
+        assert!(BGBalanceScheduler::default().is_schedule_allowed(&f.ctx));
     }
 
     #[test]
@@ -290,7 +304,7 @@ mod tests {
         let f = Fixture::new();
         f.add_worker(100, POOL_ID_SSD, &[]);
         f.insert_table(POOL_ID_SSD, 3);
-        assert!(BGBalanceScheduler.schedule(&f.ctx).is_empty());
+        assert!(BGBalanceScheduler::default().schedule(&f.ctx).is_empty());
     }
 
     #[test]
@@ -311,7 +325,7 @@ mod tests {
         }
         f.set_table_buckets(table_id, &bg_ids);
 
-        let ops = BGBalanceScheduler.schedule(&f.ctx);
+        let ops = BGBalanceScheduler::default().schedule(&f.ctx);
         assert!(
             ops.is_empty(),
             "balanced cluster should produce no ops, got {:?}",
@@ -328,7 +342,7 @@ mod tests {
         let table_id = f.insert_table(POOL_ID_SSD, 3);
         seed_imbalanced_bgs(&f, table_id, &[100, 101, 102, 103], 3, 8);
 
-        let ops = BGBalanceScheduler.schedule(&f.ctx);
+        let ops = BGBalanceScheduler::default().schedule(&f.ctx);
         assert!(
             !ops.is_empty(),
             "imbalanced cluster should produce at least one op"
@@ -356,7 +370,7 @@ mod tests {
         let table_id = f.insert_table(POOL_ID_SSD, 3);
         seed_imbalanced_bgs(&f, table_id, &[100, 101, 102, 103], 3, 8);
 
-        let ops = BGBalanceScheduler.schedule(&f.ctx);
+        let ops = BGBalanceScheduler::default().schedule(&f.ctx);
         assert_eq!(ops.len(), 1, "max_ops=1 enforces single op per cycle");
     }
 
@@ -370,7 +384,7 @@ mod tests {
             f.ctx.bg_manager.set_op_state(bg_id, BGOpState::Recovering);
         }
 
-        let ops = BGBalanceScheduler.schedule(&f.ctx);
+        let ops = BGBalanceScheduler::default().schedule(&f.ctx);
         assert!(ops.is_empty(), "all BGs non-Idle → no balance ops");
     }
 
@@ -386,7 +400,7 @@ mod tests {
         }
         f.set_table_buckets(table_id, &bg_ids);
 
-        let ops = BGBalanceScheduler.schedule(&f.ctx);
+        let ops = BGBalanceScheduler::default().schedule(&f.ctx);
         let op = ops.iter().find(|o| {
             let (_, remove, _) = decompose(o);
             remove.first() == Some(&100)
@@ -420,7 +434,7 @@ mod tests {
         }
         f.set_table_buckets(table_id, &bg_ids);
 
-        let ops = BGBalanceScheduler.schedule(&f.ctx);
+        let ops = BGBalanceScheduler::default().schedule(&f.ctx);
         // For each op, the presence of TransferLease must match (source == lease owner).
         for op in &ops {
             let (_, remove, transfer) = decompose(op);

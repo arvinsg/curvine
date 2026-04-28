@@ -42,14 +42,16 @@ impl CheckerController {
 
     /// Run one patrol cycle. Returns operators added during this cycle.
     pub fn patrol(&self) -> Vec<BGOperator> {
-        if !self.ctx.config_manager.get_bool(
-            crate::pd::config::keys::PD_SCHEDULE_CHECKER_ENABLED,
-            crate::pd::config::keys::PD_SCHEDULE_CHECKER_ENABLED_DEFAULT,
-        ) {
+        if !self
+            .ctx
+            .config_manager
+            .get_bool(crate::pd::config::keys::PD_SCHEDULE_CHECKER_ENABLED)
+        {
             return vec![];
         }
 
         let mut added_ops = Vec::new();
+        let mut rejected = 0u32;
 
         // Phase 1: Per-BG scan
         let all_bgs = self.ctx.bg_manager.list_bgs();
@@ -62,6 +64,13 @@ impl CheckerController {
                     op.id = self.operator_controller.next_operator_id();
                     if self.operator_controller.add_operator(op.clone()) {
                         added_ops.push(op);
+                    } else {
+                        rejected += 1;
+                        log::warn!(
+                            "checker '{}': operator for bg {} rejected by operator_controller",
+                            checker.name(),
+                            bg.bg_id
+                        );
                     }
                     break;
                 }
@@ -83,10 +92,24 @@ impl CheckerController {
                     op.id = self.operator_controller.next_operator_id();
                     if self.operator_controller.add_operator(op.clone()) {
                         added_ops.push(op);
+                    } else {
+                        rejected += 1;
+                        log::warn!(
+                            "checker '{}': operator for worker {} rejected by operator_controller",
+                            checker.name(),
+                            worker.base.node_id
+                        );
                     }
                     break;
                 }
             }
+        }
+
+        if rejected > 0 {
+            log::warn!(
+                "checker patrol: {} operator(s) rejected by operator_controller",
+                rejected
+            );
         }
 
         added_ops

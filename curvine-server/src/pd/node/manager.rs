@@ -22,7 +22,7 @@ use curvine_common::state::{
     HeartbeatRequest, HeartbeatResponse, NodeInfo, NodeState, NodeType, RegisterRequest,
 };
 use curvine_common::{FsError, FsResult};
-use dashmap::DashMap;
+
 use log::info;
 use orpc::common::LocalTime;
 use orpc::runtime::RpcRuntime;
@@ -42,8 +42,6 @@ pub struct NodeManager {
     config_manager: Arc<ConfigManager>,
     journal_client: Arc<journal::Client>,
     event_tx: broadcast::Sender<NodeEvent>,
-    /// Tracks when each node entered Lost state (node_id -> lost_time_ms)
-    lost_since: Arc<DashMap<u32, u64>>,
 }
 
 impl NodeManager {
@@ -63,7 +61,6 @@ impl NodeManager {
             config_manager,
             journal_client,
             event_tx,
-            lost_since: Arc::new(DashMap::new()),
         }
     }
 
@@ -406,31 +403,23 @@ impl NodeManager {
     }
 
     fn heartbeat_timeout_ms(&self) -> u64 {
-        self.config_manager.get_u64(
-            crate::pd::config::keys::PD_NODE_HEARTBEAT_TIMEOUT_MS,
-            crate::pd::config::keys::PD_NODE_HEARTBEAT_TIMEOUT_MS_DEFAULT,
-        )
+        self.config_manager
+            .get_u64(crate::pd::config::keys::PD_NODE_HEARTBEAT_TIMEOUT_MS)
     }
 
     fn persist_interval_ms(&self) -> u64 {
-        self.config_manager.get_u64(
-            crate::pd::config::keys::PD_NODE_PERSIST_INTERVAL_MS,
-            crate::pd::config::keys::PD_NODE_PERSIST_INTERVAL_MS_DEFAULT,
-        )
+        self.config_manager
+            .get_u64(crate::pd::config::keys::PD_NODE_PERSIST_INTERVAL_MS)
     }
 
     fn liveness_check_interval_ms(&self) -> u64 {
-        self.config_manager.get_u64(
-            crate::pd::config::keys::PD_NODE_LIVENESS_CHECK_INTERVAL_MS,
-            crate::pd::config::keys::PD_NODE_LIVENESS_CHECK_INTERVAL_MS_DEFAULT,
-        )
+        self.config_manager
+            .get_u64(crate::pd::config::keys::PD_NODE_LIVENESS_CHECK_INTERVAL_MS)
     }
 
     fn recovery_window_ms(&self) -> u64 {
-        self.config_manager.get_u64(
-            crate::pd::config::keys::PD_NODE_LOST_RECOVERY_WINDOW_MS,
-            crate::pd::config::keys::PD_NODE_LOST_RECOVERY_WINDOW_MS_DEFAULT,
-        )
+        self.config_manager
+            .get_u64(crate::pd::config::keys::PD_NODE_LOST_RECOVERY_WINDOW_MS)
     }
 
     /// Start the internal liveness detection loop.
@@ -457,19 +446,17 @@ impl NodeManager {
 
             // 1. Detect heartbeat timeouts: Live→Lost
             let timeout = self.heartbeat_timeout_ms();
-            let newly_lost = self.detect_heartbeat_timeout(now, timeout);
-            for &node_id in &newly_lost {
-                self.lost_since.insert(node_id, now);
+            for &node_id in &self.detect_heartbeat_timeout(now, timeout) {
                 log::warn!("Node {} marked Lost (heartbeat timeout)", node_id);
             }
 
             // 2. Promote Lost→Offline after recovery window
             let recovery_window = self.recovery_window_ms();
             let to_offline: Vec<u32> = self
-                .lost_since
-                .iter()
-                .filter(|entry| now.saturating_sub(*entry.value()) > recovery_window)
-                .map(|entry| *entry.key())
+                .get_nodes_by_state(NodeState::Lost)
+                .into_iter()
+                .filter(|n| now.saturating_sub(n.state_since_ms) > recovery_window)
+                .map(|n| n.base.node_id)
                 .collect();
 
             for node_id in to_offline {
@@ -479,24 +466,6 @@ impl NodeManager {
                     recovery_window
                 );
                 self.update_state(node_id, NodeState::Offline);
-                self.lost_since.remove(&node_id);
-            }
-
-            // 3. Cleanup recovered nodes (no longer Lost)
-            let recovered: Vec<u32> = self
-                .lost_since
-                .iter()
-                .filter(|entry| {
-                    self.get_node(*entry.key())
-                        .map(|n| n.state != NodeState::Lost)
-                        .unwrap_or(true)
-                })
-                .map(|entry| *entry.key())
-                .collect();
-
-            for node_id in recovered {
-                self.lost_since.remove(&node_id);
-                log::info!("Node {} recovered from Lost state", node_id);
             }
         }
         log::info!("Liveness loop stopped");
@@ -604,6 +573,7 @@ mod tests {
             state,
             epoch: 1,
             last_heartbeat_ms: orpc::common::LocalTime::mills(),
+            state_since_ms: orpc::common::LocalTime::mills(),
             last_persist_ms: 0,
             sys_stats: Default::default(),
             payload,

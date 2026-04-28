@@ -68,9 +68,20 @@ impl SchedulerController {
             if ops.is_empty() {
                 interval = scheduler.next_interval(interval);
             } else {
+                let name = scheduler.name();
+                let mut rejected = 0u32;
                 for mut op in ops {
                     op.id = ctx.operator_controller.next_operator_id();
-                    ctx.operator_controller.add_operator(op);
+                    if !ctx.operator_controller.add_operator(op) {
+                        rejected += 1;
+                    }
+                }
+                if rejected > 0 {
+                    log::warn!(
+                        "scheduler '{}': {} operator(s) rejected by operator_controller",
+                        name,
+                        rejected
+                    );
                 }
                 interval = scheduler.min_interval();
             }

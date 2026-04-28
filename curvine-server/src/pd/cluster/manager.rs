@@ -197,11 +197,11 @@ impl ClusterManager {
             if let curvine_common::state::HeartbeatPayload::Worker(ref w) = req.payload {
                 if !w.bg_reports.is_empty() {
                     self.bg_manager
-                        .update_replica_states_from_reports(req.node_id, &w.bg_reports);
+                        .apply_replica_reports(req.node_id, &w.bg_reports);
                 } else if !w.bg_epochs.is_empty() {
                     let bg_ids: Vec<u32> = w.bg_epochs.keys().copied().collect();
                     self.bg_manager
-                        .update_replica_states_from_bg_ids(req.node_id, &bg_ids);
+                        .promote_pending_replicas(req.node_id, &bg_ids);
                 }
                 w.bg_epochs.clone()
             } else {
