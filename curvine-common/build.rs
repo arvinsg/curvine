@@ -24,6 +24,7 @@ fn main() {
         "mount.proto",
         "replication.proto",
         "config.proto",
+        "pd.proto",
     ];
 
     let base = env::var("OUT_DIR").unwrap_or_else(|_| ".".to_string());

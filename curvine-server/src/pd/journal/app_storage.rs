@@ -12,9 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::pd::bg::BGManager;
 use crate::pd::config::ConfigManager;
 use crate::pd::journal::entry::PdEntry;
+use crate::pd::meta::MetaManager;
 use crate::pd::mount::MountManager;
+use crate::pd::node::NodeManager;
+use crate::pd::pd_server::Pd;
+use crate::pd::pool::PoolManager;
 use crate::pd::store::RocksKvEngine;
 use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::AppStorage;
@@ -30,6 +35,10 @@ pub struct PdAppStorage {
     snapshot_dir: String,
     config_manager: Arc<ConfigManager>,
     mount_manager: Arc<MountManager>,
+    node_manager: Arc<NodeManager>,
+    pool_manager: Arc<PoolManager>,
+    bg_manager: Arc<BGManager>,
+    meta_manager: Arc<MetaManager>,
 }
 
 impl PdAppStorage {
@@ -38,12 +47,20 @@ impl PdAppStorage {
         snapshot_dir: String,
         config_manager: Arc<ConfigManager>,
         mount_manager: Arc<MountManager>,
+        node_manager: Arc<NodeManager>,
+        pool_manager: Arc<PoolManager>,
+        bg_manager: Arc<BGManager>,
+        meta_manager: Arc<MetaManager>,
     ) -> Self {
         Self {
             engine,
             snapshot_dir,
             config_manager,
             mount_manager,
+            node_manager,
+            pool_manager,
+            bg_manager,
+            meta_manager,
         }
     }
 
@@ -53,6 +70,11 @@ impl PdAppStorage {
         }
 
         let pd_entry: PdEntry = Serde::deserialize(message)?;
+        Pd::get_metrics()
+            .raft_apply_total
+            .with_label_values(&[pd_entry.entry_type_str()])
+            .inc();
+
         match pd_entry {
             PdEntry::Noop => {
                 info!("Apply noop entry");
@@ -60,6 +82,61 @@ impl PdAppStorage {
             PdEntry::SetConfig(entry) => self.config_manager.apply_set_config(&entry.info)?,
             PdEntry::Mount(entry) => self.mount_manager.apply_mount(entry.info)?,
             PdEntry::Unmount(mount_id) => self.mount_manager.apply_unmount(mount_id)?,
+            PdEntry::RegisterNode(entry) => {
+                info!(
+                    "Apply RegisterNode node_id:{}, address:{:?}",
+                    entry.info.base.node_id, entry.info.base.address
+                );
+                self.node_manager.apply_register_node(&entry)?;
+            }
+            PdEntry::SaveNode(entry) => {
+                info!(
+                    "Apply SaveNode node_id:{}, state:{:?}",
+                    entry.info.base.node_id, entry.info.state
+                );
+                self.node_manager.apply_save_node(&entry)?;
+            }
+            PdEntry::DeleteNode(node_id) => {
+                info!("Apply DeleteNode node_id:{}", node_id);
+                self.node_manager.apply_delete_node(node_id)?;
+            }
+            PdEntry::SavePool(entry) => {
+                info!(
+                    "Apply SavePool pool_id:{}, workers:{}",
+                    entry.info.pool_id,
+                    entry.info.workers.len()
+                );
+                self.pool_manager.apply_save_pool(&entry)?;
+            }
+            PdEntry::CreateBG(entry) => {
+                info!("Apply CreateBG bg_id={}", entry.info.bg_id);
+                self.bg_manager.apply_create_bg(&entry)?;
+            }
+            PdEntry::UpdateBG(entry) => {
+                info!("Apply UpdateBG bg_id={}", entry.bg_id);
+                self.bg_manager.apply_update_bg(&entry)?;
+            }
+            PdEntry::DeleteBG(ref entry) => {
+                info!("Apply DeleteBG bg_id={}", entry.bg_id);
+                self.bg_manager.apply_delete_bg(entry)?;
+            }
+            PdEntry::BatchBG(entry) => {
+                info!(
+                    "Apply BatchBG table={}, creates={}, updates={}",
+                    entry.table.is_some(),
+                    entry.creates.len(),
+                    entry.updates.len()
+                );
+                self.bg_manager.apply_batch_bg(&entry)?;
+            }
+            PdEntry::AddPathRoute(ref entry) => {
+                info!("Apply AddPathRoute path={}", entry.path);
+                self.meta_manager.apply_add_route(entry)?;
+            }
+            PdEntry::RemovePathRoute(ref path) => {
+                info!("Apply RemovePathRoute path={}", path);
+                self.meta_manager.apply_remove_route(path)?;
+            }
         }
 
         Ok(())
@@ -97,9 +174,12 @@ impl AppStorage for PdAppStorage {
         self.engine.restore(&files.dir)?;
         info!("Restored store from snapshot checkpoint {}", files.dir);
 
-        self.mount_manager
-            .restore()
-            .map_err(|e| RaftError::from(e.to_string()))?;
+        self.mount_manager.restore()?;
+        self.node_manager.restore()?;
+        self.pool_manager.restore()?;
+        self.bg_manager.restore()?;
+        self.bg_manager.restore_active_snapshot();
+        self.meta_manager.restore()?;
         Ok(())
     }
 

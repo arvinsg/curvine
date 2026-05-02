@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::{ConfigInfo, MountInfo};
+use curvine_common::state::BGLease;
+use curvine_common::state::{
+    BlockGroupInfo, ConfigInfo, MountInfo, NodeInfo, PathRouteEntry, PoolInfo,
+};
 use serde::{Deserialize, Serialize};
 
 // mount
@@ -36,10 +39,105 @@ pub struct ConfigEntry {
     pub(crate) info: ConfigInfo,
 }
 
+/// Node entry (Raft log) — used for both registration and periodic save
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct NodeEntry {
+    pub op_ms: u64,
+    pub info: NodeInfo,
+}
+
+/// Pool entry (Raft log) — used for worker add/remove persistence
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct PoolEntry {
+    pub op_ms: u64,
+    pub info: PoolInfo,
+}
+
+/// BG create entry (Raft log)
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct BGEntry {
+    pub op_ms: u64,
+    pub info: BlockGroupInfo,
+}
+
+/// BG update entry (Raft log).
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct BGUpdateEntry {
+    pub op_ms: u64,
+    pub bg_id: u32,
+    pub state: Option<curvine_common::state::BGState>,
+    pub replica_set: Option<Vec<u32>>,
+    pub lease_owner: Option<BGLease>,
+    pub new_bg_epoch: u64,
+    pub new_table_epoch: Option<u64>,
+}
+
+/// Batch BG entry (Raft log) — atomically applies table + multiple BG creates/updates.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct BatchBGEntry {
+    pub op_ms: u64,
+    pub table: Option<super::super::bg::BGTable>,
+    pub creates: Vec<BlockGroupInfo>,
+    pub updates: Vec<BGUpdateEntry>,
+    /// If present, updates the next BG ID counter atomically with other changes.
+    #[serde(default)]
+    pub next_bg_id: Option<u32>,
+    #[serde(default)]
+    pub new_table_epoch: Option<(u32, u64)>,
+}
+
+/// BG delete entry (Raft log).
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct BGDeleteEntry {
+    pub op_ms: u64,
+    pub bg_id: u32,
+    pub table_id: u32,
+    pub new_table_epoch: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum PdEntry {
     Noop,
     SetConfig(ConfigEntry),
     Mount(MountEntry),
     Unmount(u32),
+
+    // Node management
+    RegisterNode(NodeEntry),
+    SaveNode(NodeEntry),
+    DeleteNode(u32),
+
+    // Pool management
+    SavePool(PoolEntry),
+
+    // BG management
+    CreateBG(BGEntry),
+    UpdateBG(BGUpdateEntry),
+    DeleteBG(BGDeleteEntry),
+    BatchBG(BatchBGEntry),
+
+    // Path route (MetaNode Federation static mode)
+    AddPathRoute(PathRouteEntry),
+    RemovePathRoute(String),
+}
+
+impl PdEntry {
+    pub fn entry_type_str(&self) -> &'static str {
+        match self {
+            PdEntry::Noop => "noop",
+            PdEntry::SetConfig(_) => "set_config",
+            PdEntry::Mount(_) => "mount",
+            PdEntry::Unmount(_) => "unmount",
+            PdEntry::RegisterNode(_) => "register_node",
+            PdEntry::SaveNode(_) => "save_node",
+            PdEntry::DeleteNode(_) => "delete_node",
+            PdEntry::SavePool(_) => "save_pool",
+            PdEntry::CreateBG(_) => "create_bg",
+            PdEntry::UpdateBG(_) => "update_bg",
+            PdEntry::DeleteBG(_) => "delete_bg",
+            PdEntry::BatchBG(_) => "batch_bg",
+            PdEntry::AddPathRoute(_) => "add_path_route",
+            PdEntry::RemovePathRoute(_) => "remove_path_route",
+        }
+    }
 }

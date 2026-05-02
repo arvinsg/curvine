@@ -12,17 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::pd::bg::{BGManager, BGStore};
+use crate::pd::cluster::ClusterManager;
 use crate::pd::config::ConfigManager;
 use crate::pd::http_handler::PdHttpHandler;
-use crate::pd::journal::PdAppStorage;
+use crate::pd::journal::{self, PdAppStorage};
+use crate::pd::meta::{MetaManager, RouteStore};
 use crate::pd::mount::MountManager;
-use crate::pd::store::{KvStore, RocksKvEngine};
+use crate::pd::node::NodeManager;
+use crate::pd::node::NodeStore;
+use crate::pd::pd_metrics::PdMetrics;
+use crate::pd::pool::{PoolManager, PoolStore};
+use crate::pd::store::{KvStore, RocksKvEngine, CF_DATA, CF_META};
 use curvine_common::conf::PdConf;
 use curvine_common::raft::storage::{LogStorage, RocksLogStorage};
 use curvine_common::raft::{RaftClient, RaftJournal, RoleMonitor};
 use curvine_common::rocksdb::DBEngine;
+use curvine_common::state::{FederationRouteMode, MetaNodeMode};
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::info;
+use once_cell::sync::OnceCell;
 use orpc::common::FileUtils;
 use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
@@ -32,7 +41,26 @@ use orpc::server::{RpcServer, ServerStateListener};
 use orpc::CommonResult;
 use std::sync::Arc;
 
+use crate::pd::cluster::manager::{LeaderChecker, RaftLeaderChecker};
+
 use crate::pd::rpc_handler::PdRpcHandler;
+
+static PD_METRICS: OnceCell<PdMetrics> = OnceCell::new();
+
+fn parse_metanode_mode(s: &str) -> MetaNodeMode {
+    match s.to_lowercase().as_str() {
+        "proxy" => MetaNodeMode::Proxy,
+        "shard" => MetaNodeMode::Shard,
+        _ => MetaNodeMode::Federation,
+    }
+}
+
+fn parse_federation_route_mode(s: &str) -> FederationRouteMode {
+    match s.to_lowercase().as_str() {
+        "static" => FederationRouteMode::Static,
+        _ => FederationRouteMode::Hash,
+    }
+}
 
 type PdRaftJournal = RaftJournal<RocksLogStorage, PdAppStorage>;
 
@@ -41,13 +69,18 @@ struct PdService {
     conf: PdConf,
     config_manager: Arc<ConfigManager>,
     mount_manager: Arc<MountManager>,
+    cluster_manager: Arc<ClusterManager>,
 }
 
 impl HandlerService for PdService {
     type Item = PdRpcHandler;
 
     fn get_message_handler(&self, _: Option<ConnState>) -> Self::Item {
-        PdRpcHandler::new(self.config_manager.clone(), self.mount_manager.clone())
+        PdRpcHandler::new(
+            self.config_manager.clone(),
+            self.mount_manager.clone(),
+            self.cluster_manager.clone(),
+        )
     }
 }
 
@@ -55,7 +88,11 @@ impl WebHandlerService for PdService {
     type Item = PdHttpHandler;
 
     fn get_handler(&self) -> Self::Item {
-        PdHttpHandler::new(self.config_manager.clone(), self.mount_manager.clone())
+        PdHttpHandler::new(
+            self.config_manager.clone(),
+            self.mount_manager.clone(),
+            self.cluster_manager.clone(),
+        )
     }
 }
 
@@ -81,7 +118,7 @@ impl Pd {
             FileUtils::delete_path(&db_conf.data_dir, true)?;
         }
 
-        db_conf = db_conf.add_cf("config").add_cf("mount");
+        db_conf = db_conf.add_cf(CF_META).add_cf(CF_DATA);
         let db = DBEngine::new(db_conf, false)?;
         let engine = Arc::new(RocksKvEngine::new(db));
         let store: Arc<dyn KvStore> = engine.clone();
@@ -92,22 +129,102 @@ impl Pd {
         let journal_rt: Arc<Runtime> = conf.journal.create_runtime();
         let raft_client = RaftClient::from_conf(journal_rt.clone(), &conf.journal);
 
+        // Unified journal client for all Raft propose operations.
+        let journal_client = Arc::new(journal::Client::new(raft_client));
+
         let config_manager = Arc::new(ConfigManager::new(
             store.clone(),
-            raft_client.clone(),
+            journal_client.clone(),
             conf.dynamic_config.clone(),
         ));
-        let mount_manager = Arc::new(MountManager::new(store, raft_client));
+        let mount_manager = Arc::new(MountManager::new(store.clone(), journal_client.clone()));
         mount_manager.restore()?;
+
+        let node_store = Arc::new(NodeStore::new(store.clone()));
+        let node_manager = Arc::new(NodeManager::new(
+            node_store,
+            config_manager.clone(),
+            journal_client.clone(),
+        ));
+        node_manager.restore()?;
+
+        let pool_store = Arc::new(PoolStore::new(store.clone()));
+        let pool_manager = Arc::new(PoolManager::new(
+            pool_store,
+            node_manager.clone(),
+            journal_client.clone(),
+        ));
+        pool_manager.restore()?;
+
+        let bg_store = Arc::new(BGStore::new(store.clone()));
+        let bg_manager = Arc::new(BGManager::new(
+            bg_store,
+            pool_manager.clone(),
+            journal_client.clone(),
+            config_manager.clone(),
+            conf.bucket_count,
+            conf.replica_counts.clone(),
+            conf.location_labels.clone(),
+        ));
+        bg_manager.restore()?;
+        bg_manager.restore_active_snapshot();
+
+        PD_METRICS.get_or_init(|| {
+            PdMetrics::new(
+                node_manager.clone(),
+                pool_manager.clone(),
+                bg_manager.clone(),
+            )
+            .expect("Failed to initialize PD metrics")
+        });
+
+        let metanode_mode = parse_metanode_mode(&conf.metanode.mode);
+        let federation_route_mode = Some(parse_federation_route_mode(&conf.metanode.route_mode));
+        let route_store = Arc::new(RouteStore::new(store.clone()));
+        let meta_manager = Arc::new(MetaManager::new(
+            metanode_mode,
+            federation_route_mode,
+            conf.metanode.hash_level,
+            node_manager.clone(),
+            route_store,
+            journal_client.clone(),
+        ));
+        meta_manager.restore()?;
 
         let app_store = PdAppStorage::new(
             engine,
             snapshot_dir,
             config_manager.clone(),
             mount_manager.clone(),
+            node_manager.clone(),
+            pool_manager.clone(),
+            bg_manager.clone(),
+            meta_manager.clone(),
         );
 
         let role_monitor = RoleMonitor::new();
+        let role_ctl = role_monitor.read_ctl();
+        let leader_checker: Arc<dyn LeaderChecker> = Arc::new(RaftLeaderChecker::new(role_ctl));
+
+        let rpc_conf = conf.pd_server_conf();
+        let rpc_rt: Arc<Runtime> = Arc::new(rpc_conf.create_runtime());
+        let scheduler_rt: Arc<Runtime> = Arc::new(Runtime::new(
+            "pd-scheduler",
+            conf.scheduler_io_threads,
+            conf.scheduler_worker_threads,
+        ));
+
+        let cluster_manager = Arc::new(ClusterManager::new(
+            node_manager,
+            pool_manager,
+            bg_manager,
+            config_manager.clone(),
+            mount_manager.clone(),
+            Some(meta_manager),
+            leader_checker,
+            scheduler_rt,
+        ));
+
         let raft_journal = PdRaftJournal::new(
             journal_rt,
             log_store,
@@ -116,15 +233,14 @@ impl Pd {
             role_monitor,
         );
 
-        let rpc_conf = conf.pd_server_conf();
-        let rt: Arc<Runtime> = Arc::new(rpc_conf.create_runtime());
         let service = PdService {
             conf: conf.clone(),
             config_manager,
             mount_manager,
+            cluster_manager,
         };
-        let rpc_server = RpcServer::with_rt(rt.clone(), rpc_conf, service.clone());
-        let web_server = WebServer::with_rt(rt.clone(), conf.pd_web_conf(), service.clone());
+        let rpc_server = RpcServer::with_rt(rpc_rt.clone(), rpc_conf, service.clone());
+        let web_server = WebServer::with_rt(rpc_rt, conf.pd_web_conf(), service.clone());
 
         Ok(Self {
             raft_journal,
@@ -147,11 +263,18 @@ impl Pd {
         // Step 3: start web server
         self.web_server.start();
 
+        // Step 4: start leader lifecycle monitor
+        self.service.cluster_manager.start_leader_monitor();
+
         Ok(rpc_status)
     }
 
     pub fn config_manager(&self) -> Arc<ConfigManager> {
         self.service.config_manager.clone()
+    }
+
+    pub fn get_metrics() -> &'static PdMetrics {
+        PD_METRICS.get().expect("PD metrics not initialized")
     }
 
     pub fn block_on_start(self) {
@@ -173,4 +296,39 @@ impl Pd {
             let _ = status.wait_stop().await;
         });
     }
+}
+
+#[cfg(test)]
+pub fn init_metrics_for_test() {
+    use crate::pd::bg::{BGManager, BGStore};
+    use crate::pd::journal::Client;
+    use crate::pd::node::{NodeManager, NodeStore};
+    use crate::pd::pool::{PoolManager, PoolStore};
+    use crate::pd::store::{KvStore, MemoryKvEngine};
+    use std::collections::HashMap;
+
+    PD_METRICS.get_or_init(|| {
+        let store: Arc<dyn KvStore> = Arc::new(MemoryKvEngine::new());
+        let raft = curvine_common::raft::RaftClient::from_conf(
+            curvine_common::conf::JournalConf::default().create_runtime(),
+            &curvine_common::conf::JournalConf::default(),
+        );
+        let jc = Arc::new(Client::new(raft));
+        let config = Arc::new(ConfigManager::new(store.clone(), jc.clone(), HashMap::new()));
+        let node_store = Arc::new(NodeStore::new(store.clone()));
+        let node_mgr = Arc::new(NodeManager::new(node_store, config.clone(), jc.clone()));
+        let pool_store = Arc::new(PoolStore::new(store.clone()));
+        let pool_mgr = Arc::new(PoolManager::new(pool_store, node_mgr.clone(), jc.clone()));
+        let bg_store = Arc::new(BGStore::new(store));
+        let bg_mgr = Arc::new(BGManager::new(
+            bg_store,
+            pool_mgr.clone(),
+            jc.clone(),
+            config.clone(),
+            1024,
+            vec![3],
+            vec![],
+        ));
+        PdMetrics::new(node_mgr, pool_mgr, bg_mgr).expect("Failed to init test metrics")
+    });
 }

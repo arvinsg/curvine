@@ -24,6 +24,32 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::read_to_string;
 
+/// MetaNode-related config: service mode and federation routing.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct MetaNodeConf {
+    /// Service mode: "proxy" | "shard" | "federation". Only federation is implemented.
+    #[serde(default)]
+    pub mode: String,
+
+    /// Federation route mode: "static" or "hash". Used when mode = "federation".
+    #[serde(default)]
+    pub route_mode: String,
+
+    /// Federation hash level (1-based path component). Used when route_mode = "hash".
+    #[serde(default)]
+    pub hash_level: u8,
+}
+
+impl Default for MetaNodeConf {
+    fn default() -> Self {
+        Self {
+            mode: "federation".to_string(),
+            route_mode: "hash".to_string(),
+            hash_level: 2,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PdConf {
     pub cluster_id: String,
@@ -40,9 +66,33 @@ pub struct PdConf {
     #[serde(default)]
     pub journal: JournalConf,
 
+    /// MetaNode mode and federation routing.
+    #[serde(default)]
+    pub metanode: MetaNodeConf,
+
+    /// Default bucket count for new BGTables.
+    #[serde(default = "default_bucket_count")]
+    pub bucket_count: u32,
+
+    /// Replica counts for BGTables. Each count creates a separate table per pool.
+    #[serde(default = "default_replica_counts")]
+    pub replica_counts: Vec<u16>,
+
+    /// Default location labels for placement isolation (e.g. ["az", "rack", "host"]).
+    #[serde(default)]
+    pub location_labels: Vec<String>,
+
     /// Dynamic config defaults. key → default_value (String).
     #[serde(default)]
     pub dynamic_config: HashMap<String, String>,
+
+    /// Scheduler runtime IO threads (default 1).
+    #[serde(default)]
+    pub scheduler_io_threads: usize,
+
+    /// Scheduler runtime worker threads (default 4).
+    #[serde(default)]
+    pub scheduler_worker_threads: usize,
 }
 
 impl Default for PdConf {
@@ -59,7 +109,14 @@ impl Default for PdConf {
 
             data_dir: default_data_dir(),
             journal: JournalConf::default(),
+            metanode: MetaNodeConf::default(),
+            bucket_count: default_bucket_count(),
+            replica_counts: default_replica_counts(),
+            location_labels: Vec::new(),
+            // dynamic_config is populated from pd config file (if any).
             dynamic_config: HashMap::new(),
+            scheduler_io_threads: 2,
+            scheduler_worker_threads: 8,
         }
     }
 }
@@ -138,4 +195,12 @@ impl PdConf {
 
 fn default_data_dir() -> String {
     "/data/pd/data".to_string()
+}
+
+fn default_bucket_count() -> u32 {
+    1024
+}
+
+fn default_replica_counts() -> Vec<u16> {
+    vec![1, 3]
 }

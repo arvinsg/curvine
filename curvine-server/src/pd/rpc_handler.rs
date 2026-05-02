@@ -12,15 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::pd::cluster::ClusterManager;
 use crate::pd::config::ConfigManager;
 use crate::pd::mount::MountManager;
+use crate::pd::pd_server::Pd;
 use crate::pd::rpc_context::RpcContext;
 use curvine_common::error::FsError;
 use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
-use curvine_common::utils::ProtoUtils;
+use curvine_common::utils::{ProtoUtils, SerdeUtils as Serde};
 use curvine_common::FsResult;
+use orpc::common::LocalTime;
 use orpc::handler::MessageHandler;
 use orpc::message::Message;
 use std::sync::Arc;
@@ -28,13 +31,19 @@ use std::sync::Arc;
 pub struct PdRpcHandler {
     config_manager: Arc<ConfigManager>,
     mount_manager: Arc<MountManager>,
+    cluster_manager: Arc<ClusterManager>,
 }
 
 impl PdRpcHandler {
-    pub fn new(config_manager: Arc<ConfigManager>, mount_manager: Arc<MountManager>) -> Self {
+    pub fn new(
+        config_manager: Arc<ConfigManager>,
+        mount_manager: Arc<MountManager>,
+        cluster_manager: Arc<ClusterManager>,
+    ) -> Self {
         Self {
             config_manager,
             mount_manager,
+            cluster_manager,
         }
     }
 }
@@ -44,6 +53,13 @@ impl MessageHandler for PdRpcHandler {
 
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let ctx = RpcContext::new(msg);
+        let operation = ctx.code.as_str();
+        let metrics = Pd::get_metrics();
+        metrics
+            .rpc_request_total
+            .with_label_values(&[operation])
+            .inc();
+        let start = LocalTime::mills();
 
         let response = match ctx.code {
             RpcCode::GetConfig => {
@@ -89,6 +105,14 @@ impl MessageHandler for PdRpcHandler {
                     mount_info: info.map(ProtoUtils::mount_info_to_pb),
                 })?
             }
+            RpcCode::GetMetaRouteSummary => {
+                let _req: GetMetaRouteSummaryRequest = ctx.parse_header()?;
+                let summary = self.cluster_manager.meta_manager().build_client_summary()?;
+                let summary_bytes = Serde::serialize(&summary)?;
+                ctx.response(GetMetaRouteSummaryResponse {
+                    summary: Some(summary_bytes),
+                })?
+            }
             RpcCode::Undefined => {
                 return Err(FsError::from("PD RPC: undefined config code".to_string()))
             }
@@ -99,6 +123,12 @@ impl MessageHandler for PdRpcHandler {
                 )));
             }
         };
+
+        let elapsed = LocalTime::mills().saturating_sub(start) as f64;
+        metrics
+            .rpc_request_duration
+            .with_label_values(&[operation])
+            .observe(elapsed);
 
         Ok(response)
     }

@@ -18,6 +18,25 @@ pub use rocks_kv_engine::RocksKvEngine;
 
 use orpc::CommonResult;
 
+// ---- Column Family Names ----
+pub const CF_META: &str = "meta";
+pub const CF_DATA: &str = "data";
+
+// ---- Key Prefixes for CF_META ----
+pub const PREFIX_CONFIG: u8 = 0x10;
+pub const PREFIX_NODE: u8 = 0x20;
+pub const PREFIX_POOL: u8 = 0x30;
+pub const PREFIX_MOUNT_VERSION: u8 = 0x40;
+pub const PREFIX_MOUNT: u8 = 0x41;
+pub const PREFIX_ROUTE_VERSION: u8 = 0x50;
+pub const PREFIX_ROUTE: u8 = 0x51;
+
+// ---- Key Prefixes for CF_DATA ----
+pub const PREFIX_BG_INFO: u8 = 0x01;
+pub const PREFIX_BG_NEXT_ID: u8 = 0x02;
+pub const PREFIX_BG_TABLE: u8 = 0x03;
+pub const PREFIX_BG_ACTIVE_SNAPSHOT: u8 = 0x04;
+
 pub type KvPair = (Vec<u8>, Vec<u8>);
 
 /// Namespace-aware KV store abstraction.
@@ -37,3 +56,6 @@ pub trait KvStore: Send + Sync {
 
 #[cfg(test)]
 pub mod memory_kv_engine;
+
+#[cfg(test)]
+pub use memory_kv_engine::MemoryKvEngine;

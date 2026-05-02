@@ -15,32 +15,33 @@
 use super::index::MountTableIndex;
 use super::store::MountStore;
 use crate::pd::journal::entry::MountEntry;
-use crate::pd::journal::PdEntry;
+use crate::pd::journal::{self, PdEntry};
 use crate::pd::store::KvStore;
 use curvine_common::fs::Path;
-use curvine_common::raft::RaftClient;
 use curvine_common::state::{MountInfo, MountOptions};
-use curvine_common::utils::SerdeUtils as Serde;
 use curvine_common::{FsError, FsResult};
 use log::info;
 use orpc::common::LocalTime;
 use rand::Rng;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 
 pub struct MountManager {
     index: Arc<RwLock<MountTableIndex>>,
     store: Arc<MountStore>,
-    raft_client: RaftClient,
+    journal_client: Arc<journal::Client>,
+    version: AtomicU64,
 }
 
 impl MountManager {
-    pub fn new(store: Arc<dyn KvStore>, raft_client: RaftClient) -> Self {
+    pub fn new(store: Arc<dyn KvStore>, journal_client: Arc<journal::Client>) -> Self {
         let store = Arc::new(MountStore::new(store));
         Self {
             index: Arc::new(RwLock::new(MountTableIndex::new())),
             store,
-            raft_client,
+            journal_client,
+            version: AtomicU64::new(0),
         }
     }
 
@@ -54,6 +55,8 @@ impl MountManager {
             );
             index.insert(mnt);
         }
+        let version = self.store.get_version()?;
+        self.version.store(version, Ordering::Relaxed);
         Ok(())
     }
 
@@ -65,6 +68,8 @@ impl MountManager {
         self.store.put_mount(&info)?;
         let mut index = self.index.write().unwrap();
         index.insert(info);
+        let v = self.version.fetch_add(1, Ordering::Relaxed) + 1;
+        self.store.put_version(v)?;
         Ok(())
     }
 
@@ -76,6 +81,8 @@ impl MountManager {
         };
         drop(index);
         self.store.delete_mount(mount_id)?;
+        let v = self.version.fetch_add(1, Ordering::Relaxed) + 1;
+        self.store.put_version(v)?;
         info!("Apply unmount: {} (id={})", info.cv_path, mount_id);
         Ok(())
     }
@@ -89,12 +96,6 @@ impl MountManager {
             }
         }
         Err(FsError::common("failed assign mount id"))
-    }
-
-    fn propose(&self, entry: PdEntry) -> FsResult<()> {
-        let data = Serde::serialize(&entry)?;
-        self.raft_client.block_on_send_propose(data)?;
-        Ok(())
     }
 
     fn add_mount(
@@ -121,7 +122,7 @@ impl MountManager {
         };
 
         let info = mnt_opt.clone().to_info(mount_id, cv_path, ufs_path);
-        self.propose(PdEntry::Mount(MountEntry {
+        self.journal_client.propose(PdEntry::Mount(MountEntry {
             op_ms: LocalTime::mills(),
             info,
         }))
@@ -149,7 +150,7 @@ impl MountManager {
         };
 
         let info = mnt_opt.clone().to_info(assign_id, cv_path, ufs_path);
-        self.propose(PdEntry::Mount(MountEntry {
+        self.journal_client.propose(PdEntry::Mount(MountEntry {
             op_ms: LocalTime::mills(),
             info,
         }))
@@ -182,7 +183,7 @@ impl MountManager {
                 .ok_or_else(|| FsError::common(format!("failed found {} to umount", cv_path)))?;
             info.mount_id
         };
-        self.propose(PdEntry::Unmount(mount_id))
+        self.journal_client.propose(PdEntry::Unmount(mount_id))
     }
 
     pub fn unmount_by_id(&self, id: u32) -> FsResult<()> {
@@ -227,5 +228,10 @@ impl MountManager {
             .get_by_id(mount_id)
             .cloned()
             .ok_or_else(|| FsError::common(format!("failed found {} entry", mount_id)))
+    }
+
+    /// Monotonic mount version (incremented on each mount/unmount apply).
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Relaxed)
     }
 }

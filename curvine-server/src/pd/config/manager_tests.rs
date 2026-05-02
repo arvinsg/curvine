@@ -1,4 +1,6 @@
 use super::manager::ConfigManager;
+use crate::pd::config::keys::{PD_BG_MIN_ISOLATION_LEVEL, PD_NODE_HEARTBEAT_TIMEOUT_MS};
+use crate::pd::journal;
 use crate::pd::store::memory_kv_engine::MemoryKvEngine;
 use crate::pd::store::KvStore;
 use curvine_common::conf::JournalConf;
@@ -13,7 +15,8 @@ fn test_manager(dynamic: HashMap<String, String>) -> ConfigManager {
     let journal_conf = JournalConf::default();
     let rt = journal_conf.create_runtime();
     let raft = RaftClient::from_conf(rt, &journal_conf);
-    ConfigManager::new(engine, raft, dynamic)
+    let jc = Arc::new(journal::Client::new(raft));
+    ConfigManager::new(engine, jc, dynamic)
 }
 
 fn dynamic(entries: &[(&str, &str)]) -> HashMap<String, String> {
@@ -25,23 +28,23 @@ fn dynamic(entries: &[(&str, &str)]) -> HashMap<String, String> {
 
 #[test]
 fn get_returns_default_when_not_persisted() {
-    let mgr = test_manager(dynamic(&[("pd.max_moves", "10")]));
+    let mgr = test_manager(dynamic(&[(PD_NODE_HEARTBEAT_TIMEOUT_MS, "10")]));
 
     let resp = mgr
         .get_config(GetConfigRequest {
-            key: "pd.max_moves".into(),
+            key: PD_NODE_HEARTBEAT_TIMEOUT_MS.into(),
         })
         .unwrap();
 
     let item = resp.item.unwrap();
-    assert_eq!(item.key, "pd.max_moves");
+    assert_eq!(item.key, PD_NODE_HEARTBEAT_TIMEOUT_MS);
     assert_eq!(item.value, b"10");
     assert_eq!(item.version, 0);
 }
 
 #[test]
 fn get_returns_none_for_unknown_key() {
-    let mgr = test_manager(dynamic(&[("pd.max_moves", "10")]));
+    let mgr = test_manager(HashMap::new());
 
     let resp = mgr
         .get_config(GetConfigRequest {
@@ -54,14 +57,14 @@ fn get_returns_none_for_unknown_key() {
 
 #[test]
 fn get_returns_persisted_over_default() {
-    let mgr = test_manager(dynamic(&[("pd.max_moves", "10")]));
+    let mgr = test_manager(dynamic(&[(PD_NODE_HEARTBEAT_TIMEOUT_MS, "10")]));
 
-    let persisted = ConfigInfo::new("pd.max_moves".to_string(), b"42".to_vec());
+    let persisted = ConfigInfo::new(PD_NODE_HEARTBEAT_TIMEOUT_MS.to_string(), b"42".to_vec());
     mgr.apply_set_config(&persisted).unwrap();
 
     let resp = mgr
         .get_config(GetConfigRequest {
-            key: "pd.max_moves".into(),
+            key: PD_NODE_HEARTBEAT_TIMEOUT_MS.into(),
         })
         .unwrap();
 
@@ -72,7 +75,7 @@ fn get_returns_persisted_over_default() {
 
 #[test]
 fn set_rejects_unknown_key() {
-    let mgr = test_manager(dynamic(&[("pd.max_moves", "10")]));
+    let mgr = test_manager(HashMap::new());
 
     let result = mgr.set_config(SetConfigRequest {
         key: "not.registered".into(),
@@ -85,43 +88,60 @@ fn set_rejects_unknown_key() {
 #[test]
 fn list_merges_persisted_and_defaults() {
     let mgr = test_manager(dynamic(&[
-        ("pd.a", "default_a"),
-        ("pd.b", "default_b"),
-        ("other.c", "default_c"),
+        (PD_NODE_HEARTBEAT_TIMEOUT_MS, "123"),
+        (PD_BG_MIN_ISOLATION_LEVEL, "rack"),
     ]));
 
-    let persisted = ConfigInfo::new("pd.a".to_string(), b"persisted_a".to_vec());
+    let persisted = ConfigInfo::new(
+        PD_NODE_HEARTBEAT_TIMEOUT_MS.to_string(),
+        b"persisted".to_vec(),
+    );
     mgr.apply_set_config(&persisted).unwrap();
 
     let resp = mgr
         .list_config(ListConfigRequest {
-            prefix: "pd.".into(),
+            prefix: "pd.node.".into(),
             limit: None,
         })
         .unwrap();
 
-    assert_eq!(resp.items.len(), 2);
+    // pd.node.* includes heartbeat_timeout + lost_recovery_window + persist_interval.
+    let hb = resp
+        .items
+        .iter()
+        .find(|i| i.key == PD_NODE_HEARTBEAT_TIMEOUT_MS)
+        .unwrap();
+    assert_eq!(hb.value, b"persisted");
+    assert!(hb.version >= 1);
 
-    let item_a = resp.items.iter().find(|i| i.key == "pd.a").unwrap();
-    assert_eq!(item_a.value, b"persisted_a");
-    assert!(item_a.version >= 1);
-
-    let item_b = resp.items.iter().find(|i| i.key == "pd.b").unwrap();
-    assert_eq!(item_b.value, b"default_b");
-    assert_eq!(item_b.version, 0);
+    // Another pd.node.* key stays at its default (version 0).
+    let default_item = resp
+        .items
+        .iter()
+        .find(|i| i.key != PD_NODE_HEARTBEAT_TIMEOUT_MS)
+        .unwrap();
+    assert_eq!(default_item.version, 0);
 }
 
 #[test]
 fn list_respects_prefix_filter() {
-    let mgr = test_manager(dynamic(&[("pd.a", "1"), ("pd.b", "2"), ("other.c", "3")]));
+    let mgr = test_manager(HashMap::new());
 
-    let resp = mgr
+    let resp_node = mgr
         .list_config(ListConfigRequest {
-            prefix: "other.".into(),
+            prefix: "pd.node.".into(),
+            limit: None,
+        })
+        .unwrap();
+    let resp_bg = mgr
+        .list_config(ListConfigRequest {
+            prefix: "pd.bg.".into(),
             limit: None,
         })
         .unwrap();
 
-    assert_eq!(resp.items.len(), 1);
-    assert_eq!(resp.items[0].key, "other.c");
+    assert!(!resp_node.items.is_empty());
+    assert!(resp_node.items.iter().all(|i| i.key.starts_with("pd.node.")));
+    assert!(!resp_bg.items.is_empty());
+    assert!(resp_bg.items.iter().all(|i| i.key.starts_with("pd.bg.")));
 }

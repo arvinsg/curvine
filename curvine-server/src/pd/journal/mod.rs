@@ -13,7 +13,12 @@
 // limitations under the License.
 
 pub mod app_storage;
+pub mod client;
 pub mod entry;
 
 pub use app_storage::PdAppStorage;
-pub use entry::PdEntry;
+pub use client::Client;
+pub use entry::{
+    BGDeleteEntry, BGEntry, BGUpdateEntry, BatchBGEntry, ConfigEntry, MountEntry, NodeEntry,
+    PdEntry, PoolEntry, UnMountEntry,
+};
