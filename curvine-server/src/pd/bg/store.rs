@@ -34,6 +34,11 @@ impl BGStore {
         Self { store }
     }
 
+    /// Build the Active-snapshot raw-key suffix for a table.
+    pub fn active_snapshot_suffix(table_id: u32) -> String {
+        format!("active_snapshot:{}", table_id)
+    }
+
     fn bg_info_key(&self, bg_id: u32) -> [u8; 5] {
         let mut k = [0u8; 5];
         k[0] = BG_INFO_PREFIX;

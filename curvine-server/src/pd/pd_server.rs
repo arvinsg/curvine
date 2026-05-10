@@ -220,7 +220,7 @@ impl Pd {
             bg_manager,
             config_manager.clone(),
             mount_manager.clone(),
-            Some(meta_manager),
+            meta_manager,
             leader_checker,
             scheduler_rt,
         ));

@@ -42,6 +42,13 @@ pub const PD_BG_BALANCE_POLICY: &str = "pd.bg.balance_policy";
 /// `topology_aware` uses `location_labels` from server config for hierarchical isolation.
 pub const PD_BG_PLACEMENT_POLICY: &str = "pd.bg.placement_policy";
 
+/// Strategy name constants for `PD_BG_BALANCE_POLICY`.
+pub const PD_BG_BALANCE_POLICY_QUOTA: &str = "quota";
+pub const PD_BG_BALANCE_POLICY_CAPACITY: &str = "capacity";
+
+/// Strategy name constants for `PD_BG_PLACEMENT_POLICY`.
+pub const PD_BG_PLACEMENT_POLICY_TOPOLOGY_AWARE: &str = "topology_aware";
+
 /// Hard minimum isolation level (a label name from `location_labels`).
 /// When set, replicas MUST NOT share the same value at this level.
 /// Empty string = no hard isolation (only soft score preference).
@@ -51,26 +58,17 @@ pub const PD_BG_MIN_ISOLATION_LEVEL: &str = "pd.bg.min_isolation_level";
 /// 100 bps = 1%. Default 1000 bps = 10%.
 pub const PD_BG_REBUILD_TOLERANT_RATIO_BPS: &str = "pd.bg.rebuild.tolerant_ratio_bps";
 
-/// BG assignment check interval (in milliseconds).
-pub const PD_SCHEDULE_BG_CHECK_INTERVAL_MS: &str = "pd.schedule.bg_check_interval_ms";
-
 /// Patrol interval for checkers (in milliseconds).
 pub const PD_SCHEDULE_PATROL_INTERVAL_MS: &str = "pd.schedule.patrol_interval_ms";
 
 /// Operator tick interval (in milliseconds).
 pub const PD_SCHEDULE_OPERATOR_TICK_INTERVAL_MS: &str = "pd.schedule.operator_tick_interval_ms";
 
-/// Lease check interval (in milliseconds).
-pub const PD_SCHEDULE_LEASE_CHECK_INTERVAL_MS: &str = "pd.schedule.lease_check_interval_ms";
-
 /// Max waiting operators in queue.
 pub const PD_SCHEDULE_MAX_WAITING_OPERATORS: &str = "pd.schedule.max_waiting_operators";
 
 /// Max concurrent operators per worker.
 pub const PD_SCHEDULE_MAX_OPERATORS_PER_WORKER: &str = "pd.schedule.max_operators_per_worker";
-
-/// Max concurrent recovery operators.
-pub const PD_RECOVERY_MAX_CONCURRENT: &str = "pd.recovery.max_concurrent";
 
 /// Liveness check interval for node manager, in milliseconds.
 pub const PD_NODE_LIVENESS_CHECK_INTERVAL_MS: &str = "pd.node.liveness_check_interval_ms";
@@ -128,14 +126,8 @@ pub const PD_SCHEDULE_STORE_LIMIT_REBUILD_CAPACITY: &str =
 /// Enable BG count balance scheduler.
 pub const PD_SCHEDULE_BALANCE_BG_ENABLED: &str = "pd.schedule.balance_bg_enabled";
 
-/// BG balance check interval (in milliseconds).
-pub const PD_SCHEDULE_BALANCE_BG_INTERVAL_MS: &str = "pd.schedule.balance_bg_interval_ms";
-
 /// Enable leader balance scheduler.
 pub const PD_SCHEDULE_BALANCE_LEADER_ENABLED: &str = "pd.schedule.balance_leader_enabled";
-
-/// Leader balance check interval (in milliseconds).
-pub const PD_SCHEDULE_BALANCE_LEADER_INTERVAL_MS: &str = "pd.schedule.balance_leader_interval_ms";
 
 /// Balance tolerant ratio in basis points (e.g. 500 = 5%).
 pub const PD_SCHEDULE_BALANCE_TOLERANT_RATIO_BPS: &str = "pd.schedule.balance_tolerant_ratio_bps";
@@ -149,9 +141,6 @@ pub const PD_SCHEDULE_BALANCE_POST_REGISTER_DELAY_MS: &str =
 
 /// Enable all checkers globally.
 pub const PD_SCHEDULE_CHECKER_ENABLED: &str = "pd.schedule.checker.enabled";
-
-/// Placement rule check interval (in milliseconds).
-pub const PD_SCHEDULE_PLACEMENT_CHECK_INTERVAL_MS: &str = "pd.schedule.placement_check_interval_ms";
 
 /// Auto-repair Live workers that are not assigned to any pool.
 pub const PD_CHECKER_POOL_MEMBERSHIP_AUTO_REPAIR: &str = "pd.checker.pool_membership_auto_repair";
@@ -202,16 +191,6 @@ pub static DYNAMIC_CONFIG_ITEMS: &[DynamicConfigItem] = &[
         desc: "Hard minimum isolation level (label name). Empty = soft only",
     },
     DynamicConfigItem {
-        key: PD_BG_REBUILD_TOLERANT_RATIO_BPS,
-        default: "1000",
-        desc: "Planner tolerant ratio (basis points) used during build/rebuild",
-    },
-    DynamicConfigItem {
-        key: PD_SCHEDULE_BG_CHECK_INTERVAL_MS,
-        default: "10000",
-        desc: "BG assignment check interval in milliseconds",
-    },
-    DynamicConfigItem {
         key: PD_SCHEDULE_PATROL_INTERVAL_MS,
         default: "10000",
         desc: "Patrol interval for checkers in milliseconds",
@@ -222,11 +201,6 @@ pub static DYNAMIC_CONFIG_ITEMS: &[DynamicConfigItem] = &[
         desc: "Operator tick interval in milliseconds",
     },
     DynamicConfigItem {
-        key: PD_SCHEDULE_LEASE_CHECK_INTERVAL_MS,
-        default: "10000",
-        desc: "Lease check interval in milliseconds",
-    },
-    DynamicConfigItem {
         key: PD_SCHEDULE_MAX_WAITING_OPERATORS,
         default: "100",
         desc: "Max waiting operators in queue",
@@ -235,11 +209,6 @@ pub static DYNAMIC_CONFIG_ITEMS: &[DynamicConfigItem] = &[
         key: PD_SCHEDULE_MAX_OPERATORS_PER_WORKER,
         default: "5",
         desc: "Max concurrent operators per worker",
-    },
-    DynamicConfigItem {
-        key: PD_RECOVERY_MAX_CONCURRENT,
-        default: "10",
-        desc: "Max concurrent recovery operators",
     },
     DynamicConfigItem {
         key: PD_NODE_LIVENESS_CHECK_INTERVAL_MS,
@@ -317,19 +286,9 @@ pub static DYNAMIC_CONFIG_ITEMS: &[DynamicConfigItem] = &[
         desc: "Enable BG count balance scheduler",
     },
     DynamicConfigItem {
-        key: PD_SCHEDULE_BALANCE_BG_INTERVAL_MS,
-        default: "30000",
-        desc: "BG balance check interval in milliseconds",
-    },
-    DynamicConfigItem {
         key: PD_SCHEDULE_BALANCE_LEADER_ENABLED,
         default: "true",
         desc: "Enable leader balance scheduler",
-    },
-    DynamicConfigItem {
-        key: PD_SCHEDULE_BALANCE_LEADER_INTERVAL_MS,
-        default: "30000",
-        desc: "Leader balance check interval in milliseconds",
     },
     DynamicConfigItem {
         key: PD_SCHEDULE_BALANCE_TOLERANT_RATIO_BPS,
@@ -350,11 +309,6 @@ pub static DYNAMIC_CONFIG_ITEMS: &[DynamicConfigItem] = &[
         key: PD_SCHEDULE_CHECKER_ENABLED,
         default: "true",
         desc: "Enable all checkers globally",
-    },
-    DynamicConfigItem {
-        key: PD_SCHEDULE_PLACEMENT_CHECK_INTERVAL_MS,
-        default: "30000",
-        desc: "Placement rule check interval in milliseconds",
     },
     DynamicConfigItem {
         key: PD_CHECKER_POOL_MEMBERSHIP_AUTO_REPAIR,

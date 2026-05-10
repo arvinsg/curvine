@@ -14,7 +14,7 @@
 
 use super::context::PlacementContext;
 use super::policy::{PlacementPolicy, PolicyState, RebuildOptions, ReplicaDecision};
-use super::rule::{best_isolation_candidates, filter_min_isolation, PlacementRule};
+use super::rule::{best_isolation_candidates, filter_min_isolation, Labels, PlacementRule};
 use crate::pd::bg::{BGTable, BGTableStats};
 use curvine_common::state::{BGLease, BGState, BlockGroupInfo};
 use curvine_common::FsError;
@@ -67,74 +67,27 @@ pub fn build_table(
         let mut exclude = HashSet::new();
 
         for _ in 0..replica_count {
-            // Hard isolation filter (if configured).
-            let hard_filtered = if let Some(ref min_level) = rule.min_isolation_level {
-                let f = filter_min_isolation(
-                    &constrained_workers,
-                    &replica_set,
-                    min_level,
-                    &rule.location_labels,
-                    &worker_labels,
-                );
-                if f.is_empty() {
-                    constrained_workers.clone()
-                } else {
-                    f
-                }
-            } else {
-                constrained_workers.clone()
-            };
-
-            // Soft isolation preference.
-            let best = best_isolation_candidates(
-                &hard_filtered,
-                &replica_set,
-                &rule.location_labels,
+            let picked = select_with_fallback(
+                ctx,
+                st,
+                rule,
+                policy,
+                &constrained_workers,
                 &worker_labels,
+                &replica_set,
+                &exclude,
             );
 
-            let mut pool_ids = match policy.select_bg_targets(ctx, st, &best, 1, &exclude) {
-                Ok(v) => v,
-                Err(_) => vec![],
-            };
-            if pool_ids.is_empty() {
-                log::warn!(
-                    "build_table bg {}: best isolation candidates exhausted, falling back to constrained (replicas={:?})",
-                    bg_id, replica_set
-                );
-                pool_ids =
-                    match policy.select_bg_targets(ctx, st, &constrained_workers, 1, &exclude) {
-                        Ok(v) => v,
-                        Err(_) => vec![],
-                    };
-            }
-            if pool_ids.is_empty() {
-                log::warn!(
-                    "build_table bg {}: constrained workers exhausted, trying all remaining (replicas={:?})",
-                    bg_id, replica_set
-                );
-                let fallback: Vec<u32> = constrained_workers
-                    .iter()
-                    .copied()
-                    .filter(|wid| !exclude.contains(wid))
-                    .collect();
-                if !fallback.is_empty() {
-                    pool_ids =
-                        match policy.select_bg_targets(ctx, st, &fallback, 1, &HashSet::new()) {
-                            Ok(v) => v,
-                            Err(_) => vec![],
-                        };
-                }
-            }
-
-            if let Some(&wid) = pool_ids.first() {
+            if let Some(wid) = picked {
                 replica_set.push(wid);
                 exclude.insert(wid);
                 st.record_bg_change(None, wid);
             } else {
                 log::warn!(
                     "build_table bg {}: no candidate available, allocated {}/{} replicas",
-                    bg_id, replica_set.len(), replica_count
+                    bg_id,
+                    replica_set.len(),
+                    replica_count
                 );
                 break;
             }
@@ -214,7 +167,7 @@ pub fn rebuild_table(
                 ReplicaDecision::Keep => continue,
 
                 ReplicaDecision::MustReplace(_reason) => {
-                    if let Some(new_wid) = find_replacement(
+                    if let Some(new_wid) = select_replacement_worker(
                         ctx,
                         st,
                         rule,
@@ -235,7 +188,7 @@ pub fn rebuild_table(
                     if replaced >= budget {
                         continue;
                     }
-                    if let Some(new_wid) = find_replacement(
+                    if let Some(new_wid) = select_replacement_worker(
                         ctx,
                         st,
                         rule,
@@ -288,18 +241,45 @@ pub fn rebuild_table(
     Ok(RebuildTableResult { updated_bgs })
 }
 
-/// Find a replacement worker for a replica position.
-fn find_replacement(
+/// Select one replacement worker for a replica position using the
+/// standard three-tier selection cascade.
+fn select_replacement_worker(
     ctx: &PlacementContext<'_>,
     st: &mut PolicyState,
     rule: &PlacementRule,
     policy: &dyn PlacementPolicy,
     current_replicas: &[u32],
     constrained_workers: &[u32],
-    worker_labels: &std::collections::HashMap<u32, std::collections::HashMap<String, String>>,
+    worker_labels: &Labels,
 ) -> Result<Option<u32>, FsError> {
     let exclude: HashSet<u32> = current_replicas.iter().copied().collect();
+    Ok(select_with_fallback(
+        ctx,
+        st,
+        rule,
+        policy,
+        constrained_workers,
+        worker_labels,
+        current_replicas,
+        &exclude,
+    ))
+}
 
+/// Pick one worker via the standard three-tier cascade:
+///   1. best-isolation candidates (strictest),
+///   2. constrained candidates (placement rule satisfied),
+///   3. fallback over `constrained_workers \ exclude` (rule-only),
+///
+pub(crate) fn select_with_fallback(
+    ctx: &PlacementContext<'_>,
+    st: &mut PolicyState,
+    rule: &PlacementRule,
+    policy: &dyn PlacementPolicy,
+    constrained_workers: &[u32],
+    worker_labels: &Labels,
+    current_replicas: &[u32],
+    exclude: &HashSet<u32>,
+) -> Option<u32> {
     let hard_filtered = if let Some(ref min_level) = rule.min_isolation_level {
         let f = filter_min_isolation(
             constrained_workers,
@@ -316,7 +296,6 @@ fn find_replacement(
     } else {
         constrained_workers.to_vec()
     };
-
     let best = best_isolation_candidates(
         &hard_filtered,
         current_replicas,
@@ -324,39 +303,45 @@ fn find_replacement(
         worker_labels,
     );
 
-    let mut targets = match policy.select_bg_targets(ctx, st, &best, 1, &exclude) {
-        Ok(v) => v,
-        Err(_) => vec![],
-    };
-    if targets.is_empty() {
-        log::warn!(
-            "find_replacement: best isolation exhausted, falling back (replicas={:?})",
-            current_replicas
-        );
-        targets = match policy.select_bg_targets(ctx, st, constrained_workers, 1, &exclude) {
-            Ok(v) => v,
-            Err(_) => vec![],
-        };
+    if let Some(picked) = try_pick(policy, ctx, st, &best, exclude) {
+        return Some(picked);
     }
-    if targets.is_empty() {
-        log::warn!(
-            "find_replacement: constrained exhausted, trying all remaining (replicas={:?})",
-            current_replicas
-        );
-        let fallback: Vec<u32> = constrained_workers
-            .iter()
-            .copied()
-            .filter(|wid| !exclude.contains(wid))
-            .collect();
-        if !fallback.is_empty() {
-            targets = match policy.select_bg_targets(ctx, st, &fallback, 1, &HashSet::new()) {
-                Ok(v) => v,
-                Err(_) => vec![],
-            };
+    log::warn!(
+        "Best isolation exhausted, falling back to constrained (replicas={:?})",
+        current_replicas
+    );
+    if let Some(picked) = try_pick(policy, ctx, st, constrained_workers, exclude) {
+        return Some(picked);
+    }
+    log::warn!(
+        "Constrained exhausted, trying all remaining (replicas={:?})",
+        current_replicas
+    );
+    let fallback: Vec<u32> = constrained_workers
+        .iter()
+        .copied()
+        .filter(|w| !exclude.contains(w))
+        .collect();
+    if fallback.is_empty() {
+        return None;
+    }
+    try_pick(policy, ctx, st, &fallback, &HashSet::new())
+}
+
+fn try_pick(
+    policy: &dyn PlacementPolicy,
+    ctx: &PlacementContext<'_>,
+    st: &PolicyState,
+    candidates: &[u32],
+    exclude: &HashSet<u32>,
+) -> Option<u32> {
+    match policy.select_bg_targets(ctx, st, candidates, 1, exclude) {
+        Ok(v) => v.into_iter().next(),
+        Err(e) => {
+            log::debug!("policy.select_bg_targets failed: {}", e);
+            None
         }
     }
-
-    Ok(targets.first().copied())
 }
 
 #[cfg(test)]

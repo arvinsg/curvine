@@ -85,7 +85,7 @@ impl ClusterManager {
         bg_manager: Arc<BGManager>,
         config_manager: Arc<ConfigManager>,
         mount_manager: Arc<MountManager>,
-        meta_manager: Option<Arc<MetaManager>>,
+        meta_manager: Arc<MetaManager>,
         leader_checker: Arc<dyn LeaderChecker>,
         runtime: Arc<orpc::runtime::Runtime>,
     ) -> Self {
@@ -103,7 +103,6 @@ impl ClusterManager {
         });
         let schedule_manager = Arc::new(Manager::new(ctx));
 
-        let meta_manager = meta_manager.expect("MetaManager is required");
         Self {
             node_manager,
             pool_manager,

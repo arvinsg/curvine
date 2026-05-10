@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::pd::bg::BGManager;
+use crate::pd::pool::PoolManager;
+use curvine_common::state::{table_id_pool_id, BlockGroupInfo, StorageType};
 use std::collections::{HashMap, HashSet};
 
 /// Per-worker load snapshot for one table, constructed by the scheduler layer.
@@ -107,12 +110,12 @@ impl<'a> PlacementContext<'a> {
 /// Build a per-table worker load snapshot with operator influence.
 pub fn build_table_snapshot(
     table_id: u32,
-    bg_manager: &crate::pd::bg::BGManager,
-    pool_manager: &crate::pd::pool::PoolManager,
+    bg_manager: &BGManager,
+    pool_manager: &PoolManager,
     influence: &PendingInfluence,
-    media: curvine_common::state::StorageType,
+    media: StorageType,
 ) -> HashMap<u32, WorkerLoadSnapshot> {
-    let pool_id = (table_id >> 16) as u16;
+    let pool_id = table_id_pool_id(table_id);
     let live_workers = pool_manager.get_live_workers(pool_id);
 
     let Some(table) = bg_manager.get_table(table_id) else {
@@ -133,10 +136,10 @@ pub fn build_table_snapshot(
 
 fn build_worker_snapshot(
     wid: u32,
-    table_bgs: &[curvine_common::state::BlockGroupInfo],
-    pool_manager: &crate::pd::pool::PoolManager,
+    table_bgs: &[BlockGroupInfo],
+    pool_manager: &PoolManager,
     influence: &PendingInfluence,
-    media: curvine_common::state::StorageType,
+    media: StorageType,
 ) -> WorkerLoadSnapshot {
     let actual_bg = table_bgs
         .iter()

@@ -109,13 +109,7 @@ impl BGManager {
     }
 
     pub fn get_replica_state(&self, bg_id: u32, worker_id: u32) -> ReplicaState {
-        self.replica_states
-            .read()
-            .unwrap()
-            .get(&bg_id)
-            .and_then(|m| m.get(&worker_id))
-            .copied()
-            .unwrap_or(ReplicaState::Pending)
+        replica_state_in(self.replica_states.read().unwrap().get(&bg_id), worker_id)
     }
 
     pub fn set_replica_state(&self, bg_id: u32, worker_id: u32, state: ReplicaState) {
@@ -203,13 +197,7 @@ impl BGManager {
         let states = rs.get(&bg_id);
         bg.replica_set
             .iter()
-            .filter(|&&wid| {
-                states
-                    .and_then(|m| m.get(&wid))
-                    .copied()
-                    .unwrap_or(ReplicaState::Pending)
-                    == ReplicaState::Active
-            })
+            .filter(|&&wid| replica_state_in(states, wid) == ReplicaState::Active)
             .copied()
             .collect()
     }
@@ -225,13 +213,7 @@ impl BGManager {
         let states = rs.get(&bg_id);
         bg.replica_set
             .iter()
-            .filter(|&&wid| {
-                states
-                    .and_then(|m| m.get(&wid))
-                    .copied()
-                    .unwrap_or(ReplicaState::Pending)
-                    != ReplicaState::Offline
-            })
+            .filter(|&&wid| replica_state_in(states, wid) != ReplicaState::Offline)
             .copied()
             .collect()
     }
@@ -317,13 +299,18 @@ impl BGManager {
         self.journal_client.propose(PdEntry::UpdateBG(entry))
     }
 
-    /// Flush table_epoch bump if Active set has changed (coalesce window).
-    /// Bumps all tables that have dirty BGs and persists the Active snapshot.
+    /// If any replica entered or left the client-visible set since the last
+    /// flush, bump table epochs and persist an Active snapshot.
     pub fn flush_table_epoch_if_dirty(&self) {
         if !self.epoch_dirty.swap(false, Ordering::Relaxed) {
             return;
         }
-        // Bump epoch for all tables (simple: one global dirty flag covers all tables)
+        self.bump_dirty_table_epochs();
+        self.persist_active_snapshot();
+    }
+
+    /// Bump epoch for every table that has a dirty BG.
+    fn bump_dirty_table_epochs(&self) {
         let tables: Vec<BGTable> = self.tables.read().unwrap().values().cloned().collect();
         for table in &tables {
             let new_epoch = table.epoch.saturating_add(1);
@@ -335,8 +322,6 @@ impl BGManager {
                 );
             }
         }
-        // Persist Active snapshot for leader-switch recovery
-        self.persist_active_snapshot();
     }
 
     /// Persist current Active replica set for each table.
@@ -353,11 +338,7 @@ impl BGManager {
                         .replica_set
                         .iter()
                         .filter(|&&wid| {
-                            rs.get(&bg_id)
-                                .and_then(|m| m.get(&wid))
-                                .copied()
-                                .unwrap_or(ReplicaState::Pending)
-                                == ReplicaState::Active
+                            replica_state_in(rs.get(&bg_id), wid) == ReplicaState::Active
                         })
                         .copied()
                         .collect();
@@ -366,7 +347,7 @@ impl BGManager {
                     }
                 }
             }
-            let key = format!("active_snapshot:{}", table.table_id);
+            let key = BGStore::active_snapshot_suffix(table.table_id);
             let value = serde_json::to_vec(&snapshot).unwrap_or_default();
             if let Err(e) = self.store.put_raw(&key, &value) {
                 log::error!(
@@ -385,7 +366,7 @@ impl BGManager {
         let bgs = self.bgs.read().unwrap();
         let mut rs = self.replica_states.write().unwrap();
         for table in tables.values() {
-            let key = format!("active_snapshot:{}", table.table_id);
+            let key = BGStore::active_snapshot_suffix(table.table_id);
             let snapshot: HashMap<u32, Vec<u32>> = match self.store.get_raw(&key) {
                 Ok(Some(data)) => serde_json::from_slice(&data).unwrap_or_default(),
                 _ => continue,
@@ -427,19 +408,43 @@ impl BGManager {
     }
 
     pub fn apply_update_bg(&self, entry: &BGUpdateEntry) -> FsResult<()> {
-        let mut info = self
-            .bgs
-            .read()
-            .unwrap()
+        let table_id = {
+            let mut bgs = self.bgs.write().unwrap();
+            let mut w2b = self.worker_to_bgs.write().unwrap();
+            let mut rs = self.replica_states.write().unwrap();
+            match self.apply_single_update(entry, &mut bgs, &mut w2b, &mut rs)? {
+                Some(tid) => tid,
+                None => return Ok(()),
+            }
+        };
+
+        if let Some(new_epoch) = entry.new_table_epoch {
+            self.set_table_epoch(table_id, new_epoch)?;
+        }
+        Ok(())
+    }
+
+    /// Apply one `BGUpdateEntry` to the in-memory indexes and persist the
+    /// updated `BlockGroupInfo`. Returns `Some(table_id)` if mutation
+    /// happened, `None` for the idempotent-skip case (epoch already past).
+    ///
+    /// Caller holds the three write locks.
+    fn apply_single_update(
+        &self,
+        entry: &BGUpdateEntry,
+        bgs: &mut HashMap<u32, BlockGroupInfo>,
+        w2b: &mut HashMap<u32, HashSet<u32>>,
+        rs: &mut HashMap<u32, HashMap<u32, ReplicaState>>,
+    ) -> FsResult<Option<u32>> {
+        let mut info = bgs
             .get(&entry.bg_id)
             .cloned()
             .ok_or_else(|| FsError::common(format!("bg {} not found for update", entry.bg_id)))?;
 
         if info.bg_epoch >= entry.new_bg_epoch {
-            return Ok(());
+            return Ok(None); // idempotent skip
         }
 
-        // Validate state transition before any mutation.
         if let Some(s) = entry.state {
             state_machine::validate_transition(info.state, s)?;
         }
@@ -450,20 +455,20 @@ impl BGManager {
         if let Some(s) = entry.state {
             info.state = s;
         }
-        if let Some(ref rs) = entry.replica_set {
-            info.replica_set = rs.clone();
+        if let Some(ref new_rs) = entry.replica_set {
+            info.replica_set = new_rs.clone();
         }
         if let Some(ref lease) = entry.lease_owner {
             info.lease_owner = Some(lease.clone());
         }
 
         self.store.put(&info)?;
-        self.bgs.write().unwrap().insert(entry.bg_id, info.clone());
+        let table_id = info.table_id;
+        bgs.insert(entry.bg_id, info.clone());
 
         if entry.replica_set.is_some() {
             let old_set: HashSet<u32> = old_replica_set.iter().copied().collect();
             let new_set: HashSet<u32> = info.replica_set.iter().copied().collect();
-            let mut w2b = self.worker_to_bgs.write().unwrap();
             for &removed in old_set.difference(&new_set) {
                 if let Some(set) = w2b.get_mut(&removed) {
                     set.remove(&entry.bg_id);
@@ -475,8 +480,7 @@ impl BGManager {
             for &added in new_set.difference(&old_set) {
                 w2b.entry(added).or_default().insert(entry.bg_id);
             }
-            // Sync replica_states: add Pending for new workers, remove departed workers
-            let mut rs = self.replica_states.write().unwrap();
+            // Sync replica_states: Pending for new workers, drop departed workers.
             let states = rs.entry(entry.bg_id).or_default();
             for &added in new_set.difference(&old_set) {
                 states.entry(added).or_insert(ReplicaState::Pending);
@@ -486,10 +490,7 @@ impl BGManager {
             }
         }
 
-        if let Some(new_epoch) = entry.new_table_epoch {
-            self.set_table_epoch(info.table_id, new_epoch)?;
-        }
-        Ok(())
+        Ok(Some(table_id))
     }
 
     pub fn apply_delete_bg(&self, entry: &BGDeleteEntry) -> FsResult<()> {
@@ -523,55 +524,21 @@ impl BGManager {
                 .insert(table.table_id, table.clone());
         }
 
-        for bg in &entry.creates {
-            self.store.put(bg)?;
-            self.bgs.write().unwrap().insert(bg.bg_id, bg.clone());
+        {
+            let mut bgs = self.bgs.write().unwrap();
             let mut w2b = self.worker_to_bgs.write().unwrap();
-            for &wid in &bg.replica_set {
-                w2b.entry(wid).or_default().insert(bg.bg_id);
-            }
-        }
+            let mut rs = self.replica_states.write().unwrap();
 
-        for update in &entry.updates {
-            let mut info = match self.bgs.read().unwrap().get(&update.bg_id).cloned() {
-                Some(bg) => bg,
-                None => continue,
-            };
-            if info.bg_epoch >= update.new_bg_epoch {
-                continue; // idempotent skip
-            }
-            if let Some(s) = update.state {
-                state_machine::validate_transition(info.state, s)?;
+            for bg in &entry.creates {
+                self.store.put(bg)?;
+                bgs.insert(bg.bg_id, bg.clone());
+                for &wid in &bg.replica_set {
+                    w2b.entry(wid).or_default().insert(bg.bg_id);
+                }
             }
 
-            let old_replica_set = info.replica_set.clone();
-            info.bg_epoch = update.new_bg_epoch;
-            if let Some(s) = update.state {
-                info.state = s;
-            }
-            if let Some(ref rs) = update.replica_set {
-                info.replica_set = rs.clone();
-            }
-            if let Some(ref lease) = update.lease_owner {
-                info.lease_owner = Some(lease.clone());
-            }
-            self.store.put(&info)?;
-            self.bgs.write().unwrap().insert(update.bg_id, info.clone());
-            if update.replica_set.is_some() {
-                let old_set: HashSet<u32> = old_replica_set.iter().copied().collect();
-                let new_set: HashSet<u32> = info.replica_set.iter().copied().collect();
-                let mut w2b = self.worker_to_bgs.write().unwrap();
-                for &removed in old_set.difference(&new_set) {
-                    if let Some(set) = w2b.get_mut(&removed) {
-                        set.remove(&update.bg_id);
-                        if set.is_empty() {
-                            w2b.remove(&removed);
-                        }
-                    }
-                }
-                for &added in new_set.difference(&old_set) {
-                    w2b.entry(added).or_default().insert(update.bg_id);
-                }
+            for update in &entry.updates {
+                self.apply_single_update(update, &mut bgs, &mut w2b, &mut rs)?;
             }
         }
 
@@ -598,7 +565,7 @@ impl BGManager {
         pool_id: u16,
         bucket_count: u32,
         replica_count: u16,
-        workers: &[u32],
+        _workers: &[u32],
     ) -> FsResult<()> {
         let table_id = gen_table_id(pool_id, replica_count);
 
@@ -608,8 +575,6 @@ impl BGManager {
                 pool_id, replica_count
             )));
         }
-
-        let pool = self.pool_manager.get_pool(pool_id)?;
 
         let next_bg_id = self.id_allocator.alloc(bucket_count)?;
 
@@ -622,20 +587,17 @@ impl BGManager {
             last_rebuild_ms: 0,
             stats: BGTableStats::default(),
         };
-        let worker_snapshots = self.build_worker_snapshots(&stub_table, pool.media, true);
+        let inputs = self.prepare_placement_inputs(pool_id, &stub_table, true)?;
 
         let tolerant = self.rebuild_tolerant_ratio();
         let ctx = PlacementContext {
-            workers: &worker_snapshots,
+            workers: &inputs.workers,
             bucket_count,
             replica_count,
             tolerant_ratio: tolerant,
             lease_tolerant_ratio: tolerant,
         };
-
-        let rule = self.placement_rule();
-        let balance_policy = create_policy(&self.balance_policy_strategy());
-        let mut st = balance_policy.prepare(&ctx)?;
+        let mut st = inputs.policy.prepare(&ctx)?;
 
         let result = super::placement::build_table(
             table_id,
@@ -643,8 +605,8 @@ impl BGManager {
             replica_count,
             next_bg_id,
             &ctx,
-            &rule,
-            balance_policy.as_ref(),
+            &inputs.rule,
+            inputs.policy.as_ref(),
             &mut st,
         )?;
 
@@ -841,10 +803,7 @@ impl BGManager {
                     .replica_set
                     .iter()
                     .filter_map(|&wid| {
-                        let state = states
-                            .and_then(|m| m.get(&wid))
-                            .copied()
-                            .unwrap_or(ReplicaState::Pending);
+                        let state = replica_state_in(states, wid);
                         match state {
                             ReplicaState::Active => Some((wid, 0u8)),
                             ReplicaState::Lost => Some((wid, 1u8)),
@@ -951,26 +910,19 @@ impl BGManager {
             .get(&bg.table_id)
             .cloned()
             .ok_or_else(|| FsError::common(format!("table {} not found", bg.table_id)))?;
-
-        let pool_id = table.pool_id();
-        let pool = self.pool_manager.get_pool(pool_id)?;
-        let worker_snapshots = self.build_worker_snapshots(&table, pool.media, false);
+        let inputs = self.prepare_placement_inputs(table.pool_id(), &table, false)?;
 
         let tolerant = self.rebuild_tolerant_ratio();
         let ctx = PlacementContext {
-            workers: &worker_snapshots,
+            workers: &inputs.workers,
             bucket_count: table.bucket_count,
             replica_count: table.replica_count(),
             tolerant_ratio: tolerant,
             lease_tolerant_ratio: tolerant,
         };
-
-        let rule = self.placement_rule();
         let worker_labels = ctx.worker_labels();
-        let constrained = rule.filter(&ctx.worker_ids(), &worker_labels);
-
-        let balance_policy = create_policy(&self.balance_policy_strategy());
-        let mut st = balance_policy.prepare(&ctx)?;
+        let constrained = inputs.rule.filter(&ctx.worker_ids(), &worker_labels);
+        let mut st = inputs.policy.prepare(&ctx)?;
 
         let mut selected: Vec<u32> = Vec::with_capacity(count as usize);
         let mut exclude: HashSet<u32> = bg.replica_set.iter().copied().collect();
@@ -983,66 +935,18 @@ impl BGManager {
                 .chain(selected.iter().copied())
                 .collect();
 
-            let hard_filtered = if let Some(ref min_level) = rule.min_isolation_level {
-                let f = super::placement::filter_min_isolation(
-                    &constrained,
-                    &current,
-                    min_level,
-                    &rule.location_labels,
-                    &worker_labels,
-                );
-                if f.is_empty() {
-                    constrained.clone()
-                } else {
-                    f
-                }
-            } else {
-                constrained.clone()
-            };
-
-            let best = super::placement::best_isolation_candidates(
-                &hard_filtered,
-                &current,
-                &rule.location_labels,
+            let picked = super::placement::select_with_fallback(
+                &ctx,
+                &mut st,
+                &inputs.rule,
+                inputs.policy.as_ref(),
+                &constrained,
                 &worker_labels,
+                &current,
+                &exclude,
             );
+            let Some(picked) = picked else { break };
 
-            let mut targets = match balance_policy.select_bg_targets(&ctx, &st, &best, 1, &exclude)
-            {
-                Ok(v) => v,
-                Err(_) => vec![],
-            };
-            if targets.is_empty() {
-                targets =
-                    match balance_policy.select_bg_targets(&ctx, &st, &constrained, 1, &exclude) {
-                        Ok(v) => v,
-                        Err(_) => vec![],
-                    };
-            }
-            if targets.is_empty() {
-                let fallback: Vec<u32> = constrained
-                    .iter()
-                    .copied()
-                    .filter(|w| !exclude.contains(w))
-                    .collect();
-                if !fallback.is_empty() {
-                    targets = match balance_policy.select_bg_targets(
-                        &ctx,
-                        &st,
-                        &fallback,
-                        1,
-                        &HashSet::new(),
-                    ) {
-                        Ok(v) => v,
-                        Err(_) => vec![],
-                    };
-                }
-            }
-            if targets.is_empty() {
-                break;
-            }
-
-            let picked = targets[0];
             selected.push(picked);
             exclude.insert(picked);
             st.record_bg_change(None, picked);
@@ -1059,8 +963,30 @@ impl BGManager {
         Ok(selected)
     }
 
-    /// Rebuild table buckets: for each bucket, verify the BG's replica_set workers are still alive.
+    /// Used by the scheduler to inspect what a rebuild would change.
     pub fn compute_rebuild_diff(&self, table_id: u32) -> FsResult<Vec<(BlockGroupInfo, Vec<u32>)>> {
+        Ok(self
+            .plan_rebuild(table_id)?
+            .map(|p| p.changes)
+            .unwrap_or_default())
+    }
+
+    /// Plan and persist: propose a Raft batch entry that applies the rebuild.
+    pub fn rebuild_table(&self, table_id: u32) -> FsResult<()> {
+        let Some(plan) = self.plan_rebuild(table_id)? else {
+            return Ok(());
+        };
+        if plan.changes.is_empty() {
+            return Ok(());
+        }
+        let entry = self.build_rebuild_batch_entry(&plan);
+        self.propose_batch_bg(entry)
+    }
+
+    /// Plan-only side of rebuild: read table + existing BGs,
+    /// run the placement algorithm, return the diff.
+    /// Returns `None` if the table has no existing BGs to rebuild.
+    fn plan_rebuild(&self, table_id: u32) -> FsResult<Option<RebuildPlan>> {
         let table = {
             let tables = self.tables.read().unwrap();
             tables
@@ -1074,124 +1000,59 @@ impl BGManager {
             table
                 .buckets
                 .iter()
-                .filter_map(|&bg_id| {
-                    if bg_id == 0 {
-                        return None;
-                    }
-                    bgs.get(&bg_id).cloned()
-                })
+                .filter(|&&id| id != 0)
+                .filter_map(|id| bgs.get(id).cloned())
                 .collect()
         };
-
         if existing_bgs.is_empty() {
-            return Ok(vec![]);
+            return Ok(None);
         }
 
-        let pool = self.pool_manager.get_pool(table.pool_id())?;
-        let worker_snapshots = self.build_worker_snapshots(&table, pool.media, false);
-
+        let inputs = self.prepare_placement_inputs(table.pool_id(), &table, false)?;
         let tolerant = self.rebuild_tolerant_ratio();
         let ctx = PlacementContext {
-            workers: &worker_snapshots,
+            workers: &inputs.workers,
             bucket_count: table.bucket_count,
             replica_count: table.replica_count(),
             tolerant_ratio: tolerant,
             lease_tolerant_ratio: tolerant,
         };
+        let mut st = inputs.policy.prepare(&ctx)?;
 
-        let rule = self.placement_rule();
-        let balance_policy = create_policy(&self.balance_policy_strategy());
-        let mut st = balance_policy.prepare(&ctx)?;
-
-        let options = RebuildOptions::default();
         let result = super::placement::rebuild_table(
             &table,
             &existing_bgs,
             &ctx,
-            &rule,
-            balance_policy.as_ref(),
+            &inputs.rule,
+            inputs.policy.as_ref(),
             &mut st,
-            &options,
+            &RebuildOptions::default(),
         )?;
 
-        // Pair each updated BG with its OLD replica_set so caller can compute diff.
         let old_by_id: HashMap<u32, Vec<u32>> = existing_bgs
             .iter()
             .map(|bg| (bg.bg_id, bg.replica_set.clone()))
             .collect();
-        Ok(result
+        let changes = result
             .updated_bgs
             .into_iter()
             .map(|bg| {
                 let old = old_by_id.get(&bg.bg_id).cloned().unwrap_or_default();
                 (bg, old)
             })
-            .collect())
+            .collect();
+        Ok(Some(RebuildPlan { table, changes }))
     }
 
-    pub fn rebuild_table(&self, table_id: u32) -> FsResult<()> {
-        let table = {
-            let tables = self.tables.read().unwrap();
-            tables
-                .get(&table_id)
-                .cloned()
-                .ok_or_else(|| FsError::common(format!("table {} not found", table_id)))?
-        };
-
-        let existing_bgs: Vec<BlockGroupInfo> = {
-            let bgs = self.bgs.read().unwrap();
-            table
-                .buckets
-                .iter()
-                .filter_map(|&bg_id| {
-                    if bg_id == 0 {
-                        return None;
-                    }
-                    bgs.get(&bg_id).cloned()
-                })
-                .collect()
-        };
-
-        if existing_bgs.is_empty() {
-            return Ok(());
-        }
-
-        let pool = self.pool_manager.get_pool(table.pool_id())?;
-        let worker_snapshots = self.build_worker_snapshots(&table, pool.media, false);
-
-        let tolerant = self.rebuild_tolerant_ratio();
-        let ctx = PlacementContext {
-            workers: &worker_snapshots,
-            bucket_count: table.bucket_count,
-            replica_count: table.replica_count(),
-            tolerant_ratio: tolerant,
-            lease_tolerant_ratio: tolerant,
-        };
-
-        let rule = self.placement_rule();
-        let balance_policy = create_policy(&self.balance_policy_strategy());
-        let mut st = balance_policy.prepare(&ctx)?;
-
-        let options = RebuildOptions::default();
-        let result = super::placement::rebuild_table(
-            &table,
-            &existing_bgs,
-            &ctx,
-            &rule,
-            balance_policy.as_ref(),
-            &mut st,
-            &options,
-        )?;
-
-        if result.updated_bgs.is_empty() {
-            return Ok(());
-        }
-
-        let updates: Vec<BGUpdateEntry> = result
-            .updated_bgs
+    /// Serialize a planned rebuild into a single batched journal entry,
+    /// bumping the table's epoch.
+    fn build_rebuild_batch_entry(&self, plan: &RebuildPlan) -> BatchBGEntry {
+        let now = orpc::common::LocalTime::mills();
+        let updates = plan
+            .changes
             .iter()
-            .map(|bg| BGUpdateEntry {
-                op_ms: orpc::common::LocalTime::mills(),
+            .map(|(bg, _old)| BGUpdateEntry {
+                op_ms: now,
                 bg_id: bg.bg_id,
                 state: None,
                 replica_set: Some(bg.replica_set.clone()),
@@ -1200,18 +1061,14 @@ impl BGManager {
                 new_table_epoch: None,
             })
             .collect();
-
-        let new_table_epoch = Some((table.table_id, table.epoch.saturating_add(1)));
-
-        let entry = BatchBGEntry {
-            op_ms: orpc::common::LocalTime::mills(),
+        BatchBGEntry {
+            op_ms: now,
             table: None,
             creates: vec![],
             updates,
             next_bg_id: None,
-            new_table_epoch,
-        };
-        self.propose_batch_bg(entry)
+            new_table_epoch: Some((plan.table.table_id, plan.table.epoch.saturating_add(1))),
+        }
     }
 
     /// Rebuild all tables for a pool, calls rebuild_table for each table in the pool.
@@ -1243,8 +1100,8 @@ impl BGManager {
         };
 
         match policy_name.as_str() {
-            "topology_aware" => PlacementRule {
-                id: "topology_aware".into(),
+            keys::PD_BG_PLACEMENT_POLICY_TOPOLOGY_AWARE => PlacementRule {
+                id: keys::PD_BG_PLACEMENT_POLICY_TOPOLOGY_AWARE.into(),
                 label_constraints: vec![],
                 location_labels: self.location_labels.clone(),
                 min_isolation_level,
@@ -1275,6 +1132,46 @@ impl BGManager {
     pub fn replica_counts(&self) -> &[u16] {
         &self.replica_counts
     }
+
+    /// Assemble the worker snapshot, placement rule, and balance policy for `pool_id`.
+    fn prepare_placement_inputs(
+        &self,
+        pool_id: u16,
+        table_for_snapshot: &BGTable,
+        for_create: bool,
+    ) -> FsResult<PlacementInputs> {
+        let pool = self.pool_manager.get_pool(pool_id)?;
+        let workers = self.build_worker_snapshots(table_for_snapshot, pool.media, for_create);
+        let rule = self.placement_rule();
+        let policy = create_policy(&self.balance_policy_strategy());
+        Ok(PlacementInputs {
+            workers,
+            rule,
+            policy,
+        })
+    }
+}
+
+/// Resolve a per-replica state from `states`, defaulting to Pending.
+fn replica_state_in(states: Option<&HashMap<u32, ReplicaState>>, wid: u32) -> ReplicaState {
+    states
+        .and_then(|m| m.get(&wid))
+        .copied()
+        .unwrap_or(ReplicaState::Pending)
+}
+
+/// the Rule → Policy pipeline.
+struct PlacementInputs {
+    workers: HashMap<u32, WorkerLoadSnapshot>,
+    rule: PlacementRule,
+    policy: Box<dyn super::placement::PlacementPolicy>,
+}
+
+/// Output of `plan_rebuild`: the table being rebuilt and the per-BG
+/// diff (`new_bg`, `old_replica_set`) for every BG that actually changed
+struct RebuildPlan {
+    table: BGTable,
+    changes: Vec<(BlockGroupInfo, Vec<u32>)>,
 }
 
 #[cfg(test)]
@@ -1743,5 +1640,46 @@ mod tests {
             }],
         );
         assert!(mgr.test_epoch_dirty(), "Pending→Active enters view");
+    }
+
+    /// Regression: the batch path used to update `worker_to_bgs` but skipped
+    /// `replica_states`, leaking stale states for removed workers.
+    #[test]
+    fn apply_batch_bg_syncs_replica_states_on_replica_change() {
+        let mgr = test_manager();
+        let info = make_bg(20, 10, vec![100, 101, 102]);
+        mgr.apply_create_bg(&BGEntry { op_ms: 0, info }).unwrap();
+        // Seed all three replicas as Active so we can tell them apart from
+        // defaulted Pending later.
+        for wid in [100, 101, 102] {
+            mgr.set_replica_state(20, wid, ReplicaState::Active);
+        }
+
+        // Batch update: drop 102, add 103.
+        let batch = BatchBGEntry {
+            op_ms: 1,
+            table: None,
+            creates: vec![],
+            updates: vec![BGUpdateEntry {
+                op_ms: 1,
+                bg_id: 20,
+                state: None,
+                replica_set: Some(vec![100, 101, 103]),
+                lease_owner: None,
+                new_bg_epoch: 2,
+                new_table_epoch: None,
+            }],
+            next_bg_id: None,
+            new_table_epoch: None,
+        };
+        mgr.apply_batch_bg(&batch).unwrap();
+
+        // Survivors keep Active state.
+        assert_eq!(mgr.get_replica_state(20, 100), ReplicaState::Active);
+        assert_eq!(mgr.get_replica_state(20, 101), ReplicaState::Active);
+        // Removed replica's state is gone (defaults to Pending).
+        assert_eq!(mgr.get_replica_state(20, 102), ReplicaState::Pending);
+        // New replica is seeded Pending.
+        assert_eq!(mgr.get_replica_state(20, 103), ReplicaState::Pending);
     }
 }
