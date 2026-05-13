@@ -19,8 +19,9 @@ use crate::pd::bg::placement::{
     isolation_score, PlacementContext,
 };
 use crate::pd::config::keys;
-use crate::pd::node::{NodeEvent, NodeEventType};
-use crate::pd::schedule::{BGOperator, ManagerContext, OpPriority, OperatorBuilder, OperatorKind};
+use crate::pd::schedule::{
+    BGOperator, ManagerContext, OpPriority, OperatorBuilder, OperatorKind, ScheduleEvent,
+};
 use curvine_common::state::{BGOpState, ReplicaState};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -238,11 +239,16 @@ impl Scheduler for BGBalanceScheduler {
         BaseScheduler::default_next_interval(current)
     }
 
-    fn on_event(&self, event: &NodeEvent) {
-        if matches!(event.event_type, NodeEventType::Registered) {
+    fn on_event(&self, event: &ScheduleEvent) {
+        if let ScheduleEvent::WorkerJoinedPools { event_time_ms, .. } = event {
             self.last_register_ms
-                .store(event.event_time_ms, Ordering::Relaxed);
+                .store(*event_time_ms, Ordering::Relaxed);
         }
+    }
+
+    fn on_leader_start(&self) {
+        self.last_register_ms
+            .store(orpc::common::LocalTime::mills(), Ordering::Relaxed);
     }
 }
 

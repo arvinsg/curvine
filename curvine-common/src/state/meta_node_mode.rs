@@ -43,12 +43,21 @@ pub enum FederationRouteMode {
 }
 
 /// Single path -> group_id entry (Federation Static).
+///
+/// `expected_table_version` (P4.1) is the table version the proposer observed
+/// at construction time. apply uses it as a CAS guard:
+///   - existing.version == expected_table_version → accept
+///   - mismatch → SkippedStale (concurrent admin operation in flight)
+/// `serde(default)` keeps pre-P4.1 entries decodable: legacy entries decode
+/// with `expected_table_version = 0` and bypass CAS for first-time inserts.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PathRouteEntry {
     pub path: String,
     pub group_id: u64,
     pub create_time_ms: u64,
     pub update_time_ms: u64,
+    #[serde(default)]
+    pub expected_table_version: u64,
 }
 
 /// Trie node for longest-prefix path lookup, built from routes on first use.
@@ -145,6 +154,13 @@ impl PathRouteTable {
             }
             root
         })
+    }
+
+    /// Reset the cached trie. Must be called whenever `routes` is mutated,
+    /// otherwise subsequent lookups will return stale results from the
+    /// trie built on the first lookup.
+    pub fn invalidate_cache(&mut self) {
+        self.trie_cache = OnceCell::new();
     }
 
     /// Longest prefix match. O(path length) after first call (trie built once).
@@ -254,6 +270,7 @@ mod tests {
             group_id,
             create_time_ms: 0,
             update_time_ms: 0,
+            expected_table_version: 0,
         }
     }
 
@@ -273,6 +290,66 @@ mod tests {
         assert_eq!(table.lookup_group_id("/user/a"), Some(2));
         assert_eq!(table.lookup_group_id("/user/a/b/c"), Some(3));
         assert_eq!(table.lookup_group_id("/other"), None);
+    }
+
+    /// Regression: lookup populates `trie_cache` on first call. If `routes` is
+    /// later mutated without invalidating the cache, lookup keeps returning
+    /// the stale trie. `invalidate_cache()` must be called by every mutator.
+    #[test]
+    fn invalidate_cache_picks_up_route_mutations() {
+        let mut table = PathRouteTable {
+            version: 1,
+            routes: vec![entry("/data", 1)],
+            last_update_ms: 0,
+            trie_cache: once_cell::sync::OnceCell::new(),
+        };
+        // First lookup builds the trie.
+        assert_eq!(table.lookup_group_id("/data"), Some(1));
+        assert_eq!(table.lookup_group_id("/data/x"), Some(1));
+        assert_eq!(table.lookup_group_id("/other"), None);
+
+        // Mutate routes: add a new entry.
+        table.routes.push(entry("/other", 2));
+        // Without invalidate_cache, the trie still says /other → None.
+        // After invalidate_cache, the next lookup rebuilds the trie.
+        table.invalidate_cache();
+        assert_eq!(table.lookup_group_id("/other"), Some(2));
+        // Original entries still resolve correctly.
+        assert_eq!(table.lookup_group_id("/data"), Some(1));
+
+        // Mutate routes: remove an entry.
+        table.routes.retain(|e| e.path != "/data");
+        table.invalidate_cache();
+        assert_eq!(table.lookup_group_id("/data"), None);
+        assert_eq!(table.lookup_group_id("/other"), Some(2));
+
+        // Mutate routes: replace group_id for an existing path.
+        if let Some(e) = table.routes.iter_mut().find(|e| e.path == "/other") {
+            e.group_id = 99;
+        }
+        table.invalidate_cache();
+        assert_eq!(table.lookup_group_id("/other"), Some(99));
+    }
+
+    /// Regression: forgetting invalidate_cache leaves the trie stale.
+    /// This test documents the failure mode (NOT a fix-test): if it ever
+    /// passes without `invalidate_cache`, the trie cache logic regressed.
+    #[test]
+    fn lookup_without_invalidate_returns_stale() {
+        let mut table = PathRouteTable {
+            version: 1,
+            routes: vec![entry("/data", 1)],
+            last_update_ms: 0,
+            trie_cache: once_cell::sync::OnceCell::new(),
+        };
+        // Populate cache.
+        assert_eq!(table.lookup_group_id("/data"), Some(1));
+
+        // Mutate without invalidating.
+        table.routes.push(entry("/added", 7));
+
+        // Stale view: /added not in trie because cache was built before push.
+        assert_eq!(table.lookup_group_id("/added"), None);
     }
 
     #[test]

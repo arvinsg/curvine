@@ -35,7 +35,6 @@ pub const PREFIX_ROUTE: u8 = 0x51;
 pub const PREFIX_BG_INFO: u8 = 0x01;
 pub const PREFIX_BG_NEXT_ID: u8 = 0x02;
 pub const PREFIX_BG_TABLE: u8 = 0x03;
-pub const PREFIX_BG_ACTIVE_SNAPSHOT: u8 = 0x04;
 
 pub type KvPair = (Vec<u8>, Vec<u8>);
 

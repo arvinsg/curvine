@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::scheduler::{default_schedulers, Scheduler};
+use super::scheduler::{default_schedulers, ScheduleEvent, Scheduler};
 use super::ManagerContext;
-use crate::pd::node::NodeEvent;
 use orpc::runtime::RpcRuntime;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -89,9 +88,15 @@ impl SchedulerController {
         log::info!("Scheduler '{}' stopped", scheduler.name());
     }
 
-    pub fn on_event(&self, event: &NodeEvent) {
+    pub fn on_event(&self, event: &ScheduleEvent) {
         for scheduler in &self.schedulers {
             scheduler.on_event(event);
+        }
+    }
+
+    pub fn on_leader_start(&self) {
+        for scheduler in &self.schedulers {
+            scheduler.on_leader_start();
         }
     }
 }

@@ -58,7 +58,7 @@ impl BGState {
     ];
 }
 
-/// Replica lifecycle state (PD runtime, not Raft-persisted).
+/// Replica lifecycle state managed by PD.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ReplicaState {
     Pending,
@@ -83,10 +83,10 @@ impl ReplicaState {
     pub fn client_view(self) -> ReplicaClientView {
         match self {
             ReplicaState::Active => ReplicaClientView::Active,
-            ReplicaState::Lost => ReplicaClientView::Lost,
-            ReplicaState::Pending | ReplicaState::Syncing | ReplicaState::Offline => {
-                ReplicaClientView::Hidden
-            }
+            ReplicaState::Pending
+            | ReplicaState::Syncing
+            | ReplicaState::Lost
+            | ReplicaState::Offline => ReplicaClientView::Hidden,
         }
     }
 
@@ -96,7 +96,7 @@ impl ReplicaState {
 }
 
 /// How a `ReplicaState` is exposed to clients.
-/// Active = preferred read target; Lost = fallback; Hidden = not advertised.
+/// Active = advertised read/write target; Hidden = not advertised.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReplicaClientView {
     Active,

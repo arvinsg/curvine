@@ -23,7 +23,6 @@ const NS: &str = store::CF_DATA;
 const BG_INFO_PREFIX: u8 = store::PREFIX_BG_INFO;
 const BG_NEXT_ID_KEY: &[u8] = &[store::PREFIX_BG_NEXT_ID];
 const BG_TABLE_PREFIX: u8 = store::PREFIX_BG_TABLE;
-const BG_SNAPSHOT_PREFIX: u8 = store::PREFIX_BG_ACTIVE_SNAPSHOT;
 
 pub struct BGStore {
     store: Arc<dyn KvStore>,
@@ -32,11 +31,6 @@ pub struct BGStore {
 impl BGStore {
     pub fn new(store: Arc<dyn KvStore>) -> Self {
         Self { store }
-    }
-
-    /// Build the Active-snapshot raw-key suffix for a table.
-    pub fn active_snapshot_suffix(table_id: u32) -> String {
-        format!("active_snapshot:{}", table_id)
     }
 
     fn bg_info_key(&self, bg_id: u32) -> [u8; 5] {
@@ -129,20 +123,5 @@ impl BGStore {
             out.push(table);
         }
         Ok(out)
-    }
-
-    /// Store raw bytes (used for Active snapshot persistence).
-    pub fn put_raw(&self, key_suffix: &str, value: &[u8]) -> CommonResult<()> {
-        let mut key = vec![BG_SNAPSHOT_PREFIX];
-        key.extend_from_slice(key_suffix.as_bytes());
-        self.store.put(NS, &key, value)?;
-        Ok(())
-    }
-
-    /// Retrieve raw bytes (used for Active snapshot recovery).
-    pub fn get_raw(&self, key_suffix: &str) -> CommonResult<Option<Vec<u8>>> {
-        let mut key = vec![BG_SNAPSHOT_PREFIX];
-        key.extend_from_slice(key_suffix.as_bytes());
-        self.store.get(NS, &key)
     }
 }

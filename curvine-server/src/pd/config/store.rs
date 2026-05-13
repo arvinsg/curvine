@@ -16,7 +16,7 @@ use crate::pd::store::{self, KvStore};
 use curvine_common::state::ConfigInfo;
 use curvine_common::utils::SerdeUtils as Serde;
 use log::info;
-use orpc::{err_box, CommonResult};
+use orpc::CommonResult;
 use std::sync::Arc;
 
 const NS: &str = store::CF_META;
@@ -56,6 +56,7 @@ impl ConfigStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn delete(&self, key: &str) -> CommonResult<bool> {
         let db_key = self.make_key(key);
         if !self.store.exists(NS, &db_key)? {
@@ -79,21 +80,6 @@ impl ConfigStore {
             }
         }
         Ok(items)
-    }
-
-    pub fn exists(&self, key: &str) -> CommonResult<bool> {
-        let db_key = self.make_key(key);
-        self.store.exists(NS, &db_key)
-    }
-
-    pub fn update(&self, key: &str, value: Vec<u8>) -> CommonResult<ConfigInfo> {
-        let mut item = match self.get(key)? {
-            Some(item) => item,
-            None => return err_box!("Config key {} not found", key),
-        };
-        item.update_value(value);
-        self.set(&item)?;
-        Ok(item)
     }
 }
 

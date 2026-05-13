@@ -167,7 +167,6 @@ impl Pd {
             conf.location_labels.clone(),
         ));
         bg_manager.restore()?;
-        bg_manager.restore_active_snapshot();
 
         PD_METRICS.get_or_init(|| {
             PdMetrics::new(
@@ -205,6 +204,10 @@ impl Pd {
         let role_monitor = RoleMonitor::new();
         let role_ctl = role_monitor.read_ctl();
         let leader_checker: Arc<dyn LeaderChecker> = Arc::new(RaftLeaderChecker::new(role_ctl));
+
+        // Wire the leader checker into the journal client so propose_as_leader*
+        // paths can fast-fail when this node is no longer the raft leader.
+        journal_client.set_leader_checker(leader_checker.clone());
 
         let rpc_conf = conf.pd_server_conf();
         let rpc_rt: Arc<Runtime> = Arc::new(rpc_conf.create_runtime());
@@ -314,7 +317,11 @@ pub fn init_metrics_for_test() {
             &curvine_common::conf::JournalConf::default(),
         );
         let jc = Arc::new(Client::new(raft));
-        let config = Arc::new(ConfigManager::new(store.clone(), jc.clone(), HashMap::new()));
+        let config = Arc::new(ConfigManager::new(
+            store.clone(),
+            jc.clone(),
+            HashMap::new(),
+        ));
         let node_store = Arc::new(NodeStore::new(store.clone()));
         let node_mgr = Arc::new(NodeManager::new(node_store, config.clone(), jc.clone()));
         let pool_store = Arc::new(PoolStore::new(store.clone()));

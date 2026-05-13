@@ -61,6 +61,13 @@ impl Scheduler for StatsScheduler {
         // Aggregate BG-level stats into each BGTable.stats.
         ctx.bg_manager.refresh_table_stats();
 
+        if let Err(e) = ctx.bg_manager.retry_dirty_route_publish() {
+            log::warn!(
+                "stats scheduler failed to retry dirty BG route publish: {}",
+                e
+            );
+        }
+
         Vec::new()
     }
 

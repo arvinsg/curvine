@@ -64,9 +64,9 @@ impl PdAppStorage {
         }
     }
 
-    fn apply_entry(&self, _is_leader: bool, message: &[u8]) -> RaftResult<()> {
+    fn apply_entry(&self, is_leader: bool, message: &[u8]) -> RaftResult<Vec<u8>> {
         if message.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let pd_entry: PdEntry = Serde::deserialize(message)?;
@@ -79,9 +79,18 @@ impl PdAppStorage {
             PdEntry::Noop => {
                 info!("Apply noop entry");
             }
-            PdEntry::SetConfig(entry) => self.config_manager.apply_set_config(&entry.info)?,
-            PdEntry::Mount(entry) => self.mount_manager.apply_mount(entry.info)?,
-            PdEntry::Unmount(mount_id) => self.mount_manager.apply_unmount(mount_id)?,
+            PdEntry::SetConfig(entry) => {
+                let outcome = self.config_manager.apply_set_config(&entry.info)?;
+                return Ok(outcome.encode()?);
+            }
+            PdEntry::Mount(entry) => {
+                let outcome = self.mount_manager.apply_mount(entry.info)?;
+                return Ok(outcome.encode()?);
+            }
+            PdEntry::Unmount(mount_id) => {
+                let outcome = self.mount_manager.apply_unmount(mount_id)?;
+                return Ok(outcome.encode()?);
+            }
             PdEntry::RegisterNode(entry) => {
                 info!(
                     "Apply RegisterNode node_id:{}, address:{:?}",
@@ -96,29 +105,64 @@ impl PdAppStorage {
                 );
                 self.node_manager.apply_save_node(&entry)?;
             }
-            PdEntry::DeleteNode(node_id) => {
-                info!("Apply DeleteNode node_id:{}", node_id);
-                self.node_manager.apply_delete_node(node_id)?;
+            PdEntry::UpdateNodeState(entry) => {
+                info!(
+                    "Apply UpdateNodeState node_id:{}, expected_epoch:{}, expected_state:{:?}, new_state:{:?}",
+                    entry.node_id, entry.expected_epoch, entry.expected_state, entry.new_state
+                );
+                self.node_manager.apply_update_node_state(&entry)?;
+            }
+            PdEntry::BatchUpdateNodeState(entry) => {
+                info!("Apply BatchUpdateNodeState entries={}", entry.entries.len());
+                self.node_manager.apply_batch_update_node_state(&entry)?;
+            }
+            PdEntry::HeartbeatCheckpoint(entry) => {
+                self.node_manager.apply_heartbeat_checkpoint(&entry)?;
+            }
+            PdEntry::DeleteNode(entry) => {
+                info!(
+                    "Apply DeleteNode node_id:{}, expected_epoch:{}, expected_state:{:?}",
+                    entry.node_id, entry.expected_epoch, entry.expected_state
+                );
+                self.node_manager.apply_delete_node(&entry)?;
             }
             PdEntry::SavePool(entry) => {
                 info!(
-                    "Apply SavePool pool_id:{}, workers:{}",
+                    "Apply SavePool pool_id:{}, workers:{}, expected_epoch:{}, info_epoch:{}",
                     entry.info.pool_id,
-                    entry.info.workers.len()
+                    entry.info.workers.len(),
+                    entry.expected_epoch,
+                    entry.info.epoch
                 );
-                self.pool_manager.apply_save_pool(&entry)?;
+                let outcome = self.pool_manager.apply_save_pool(&entry)?;
+                // Migrated to ApplyOutcome (P1.1): leaders receive structured
+                // result via ProposeResponse.apply_result.
+                return Ok(outcome.encode()?);
             }
             PdEntry::CreateBG(entry) => {
                 info!("Apply CreateBG bg_id={}", entry.info.bg_id);
-                self.bg_manager.apply_create_bg(&entry)?;
+                self.bg_manager
+                    .apply_create_bg_with_role(&entry, is_leader)?;
             }
             PdEntry::UpdateBG(entry) => {
-                info!("Apply UpdateBG bg_id={}", entry.bg_id);
-                self.bg_manager.apply_update_bg(&entry)?;
+                info!(
+                    "Apply UpdateBG bg_id={}, expected_epoch={}, new_epoch={}",
+                    entry.bg_id, entry.expected_bg_epoch, entry.new_bg_epoch
+                );
+                let outcome = self
+                    .bg_manager
+                    .apply_update_bg_with_role(&entry, is_leader)?;
+                return Ok(outcome.encode()?);
             }
             PdEntry::DeleteBG(ref entry) => {
-                info!("Apply DeleteBG bg_id={}", entry.bg_id);
-                self.bg_manager.apply_delete_bg(entry)?;
+                info!(
+                    "Apply DeleteBG bg_id={}, expected_epoch={}",
+                    entry.bg_id, entry.expected_bg_epoch
+                );
+                let outcome = self
+                    .bg_manager
+                    .apply_delete_bg_with_role(entry, is_leader)?;
+                return Ok(outcome.encode()?);
             }
             PdEntry::BatchBG(entry) => {
                 info!(
@@ -127,24 +171,42 @@ impl PdAppStorage {
                     entry.creates.len(),
                     entry.updates.len()
                 );
-                self.bg_manager.apply_batch_bg(&entry)?;
+                let outcome = self
+                    .bg_manager
+                    .apply_batch_bg_with_role(&entry, is_leader)?;
+                return Ok(outcome.encode()?);
+            }
+            PdEntry::BumpTableEpoch(entry) => {
+                info!("Apply BumpTableEpoch updates={}", entry.updates.len());
+                self.bg_manager
+                    .apply_bump_table_epoch_with_role(&entry, is_leader)?;
             }
             PdEntry::AddPathRoute(ref entry) => {
-                info!("Apply AddPathRoute path={}", entry.path);
-                self.meta_manager.apply_add_route(entry)?;
+                info!(
+                    "Apply AddPathRoute path={}, expected_table_version={}",
+                    entry.path, entry.expected_table_version
+                );
+                let outcome = self.meta_manager.apply_add_route(entry)?;
+                return Ok(outcome.encode()?);
             }
             PdEntry::RemovePathRoute(ref path) => {
                 info!("Apply RemovePathRoute path={}", path);
-                self.meta_manager.apply_remove_route(path)?;
+                let outcome = self.meta_manager.apply_remove_route(path)?;
+                return Ok(outcome.encode()?);
             }
         }
 
-        Ok(())
+        // For now, modules return FsResult<()> and we surface no structured
+        // outcome. An empty byte slice on the wire is decoded as
+        // `ApplyOutcome::Applied` by the propose caller (see
+        // `pd/journal/apply_outcome.rs`). Per-module migrations in P1/P2/P3
+        // will replace `Ok(Vec::new())` with `outcome.encode()?`.
+        Ok(Vec::new())
     }
 }
 
 impl AppStorage for PdAppStorage {
-    fn apply(&self, is_leader: bool, message: &[u8]) -> RaftResult<()> {
+    fn apply(&self, is_leader: bool, message: &[u8]) -> RaftResult<Vec<u8>> {
         self.apply_entry(is_leader, message)
     }
 
@@ -178,7 +240,7 @@ impl AppStorage for PdAppStorage {
         self.node_manager.restore()?;
         self.pool_manager.restore()?;
         self.bg_manager.restore()?;
-        self.bg_manager.restore_active_snapshot();
+        self.bg_manager.reset_runtime_route_state_after_snapshot();
         self.meta_manager.restore()?;
         Ok(())
     }

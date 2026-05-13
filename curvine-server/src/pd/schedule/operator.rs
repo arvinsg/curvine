@@ -122,6 +122,116 @@ impl OpStep {
         )
     }
 
+    /// P2.5: how much this step is expected to advance bg_epoch when it
+    /// successfully applies via Raft. Used by `OperatorController::check_progress`
+    /// to detect external mutations:
+    ///
+    ///   delta = bg.bg_epoch - op.origin_bg_epoch
+    ///   consumed = sum of epoch_consumed() for steps[0..=current]
+    ///   if delta > consumed → someone else mutated this BG → cancel + reschedule
+    ///
+    /// Mirrors TiKV PD's `Step::ConfVerChanged` (§14.2).
+    pub fn epoch_consumed(&self) -> u64 {
+        match self {
+            // AddReplica / RemoveReplica / TransferLease each propose a single
+            // BGUpdateEntry that bumps bg_epoch by 1.
+            OpStep::AddReplica { .. }
+            | OpStep::RemoveReplica { .. }
+            | OpStep::TransferLease { .. } => 1,
+            // WaitReplicaReady is a passive wait; no Raft entry, no epoch change.
+            OpStep::WaitReplicaReady { .. } => 0,
+        }
+    }
+
+    /// #3-C: Semantic safety check — does this step's precondition still
+    /// hold against the current BG snapshot? Returns `Err(reason)` if the
+    /// step would be unsafe or meaningless to execute; the operator
+    /// controller cancels operators that fail this check.
+    ///
+    /// Distinct from:
+    /// - `is_finish`: "has the effect already been achieved?"
+    /// - epoch-delta stale detection: "did an external mutation advance bg_epoch
+    ///   beyond what our step budget can explain?"
+    ///
+    /// `check_safety` catches cases where the step's preconditions are broken
+    /// even without an epoch delta — e.g. a TransferLease whose target was
+    /// removed out-of-band (replica_set shrunk but epoch attribution happens
+    /// to balance). Mirrors TiKV PD's `OpStep::check_safety` (§14.2).
+    pub fn check_safety(&self, bg: &BlockGroupInfo) -> Result<(), String> {
+        match self {
+            // AddReplica: no precondition beyond "not already added". If the
+            // worker is already in the set, `is_finish` handles completion;
+            // if not, the propose CAS handles racing adds.
+            OpStep::AddReplica { .. } => Ok(()),
+
+            // RemoveReplica: unsafe to remove the current lease owner — the
+            // lease must be transferred first. `is_finish` handles the
+            // "already removed" case.
+            OpStep::RemoveReplica { worker_id } => {
+                if bg.replica_set.contains(worker_id) {
+                    if let Some(lease) = &bg.lease_owner {
+                        if lease.node_id == *worker_id {
+                            return Err(format!(
+                                "cannot remove worker {}: it is the current lease owner (epoch {})",
+                                worker_id, lease.epoch
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            // TransferLease:
+            // - target must be an actual replica; otherwise the lease would
+            //   point at a node that doesn't hold the data
+            // - the current lease must still live at `from_worker` OR have
+            //   already reached `to_worker` (in which case `is_finish`
+            //   completes us). Any other holder means someone else moved
+            //   the lease — continuing would overwrite their decision.
+            OpStep::TransferLease {
+                from_worker,
+                to_worker,
+            } => {
+                if !bg.replica_set.contains(to_worker) {
+                    return Err(format!(
+                        "cannot transfer lease to worker {}: not in replica_set {:?}",
+                        to_worker, bg.replica_set
+                    ));
+                }
+                if let Some(lease) = &bg.lease_owner {
+                    if lease.node_id != *from_worker && lease.node_id != *to_worker {
+                        return Err(format!(
+                            "cannot transfer lease from worker {}: lease is held by worker {}",
+                            from_worker, lease.node_id
+                        ));
+                    }
+                }
+                Ok(())
+            }
+
+            // WaitReplicaReady: passive wait. If we're waiting for an active
+            // state the worker must still be a replica; Lost/Offline can
+            // legitimately apply to a worker no longer in replica_set, so
+            // we don't treat absence as unsafe there.
+            OpStep::WaitReplicaReady {
+                worker_id,
+                expected_state,
+            } => {
+                let requires_membership = matches!(
+                    expected_state,
+                    ReplicaState::Active | ReplicaState::Syncing | ReplicaState::Pending
+                );
+                if requires_membership && !bg.replica_set.contains(worker_id) {
+                    return Err(format!(
+                        "cannot wait for worker {} to reach {:?}: not in replica_set {:?}",
+                        worker_id, expected_state, bg.replica_set
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Whether this step operates on the given worker (either endpoint for TransferLease).
     pub fn involves_worker(&self, worker_id: u32) -> bool {
         match self {
@@ -150,7 +260,11 @@ pub struct BGOperator {
     /// Timestamp when the current step started (for per-step timeout calculation)
     pub step_start_time_ms: u64,
     pub priority: u32,
-    /// BG epoch at operator creation time, used for stale detection.
+    /// P2.5: BG epoch observed at operator creation time. Replaces the
+    /// pre-P2.5 `bg_epoch` field, which was used for in-place "white-stealing"
+    /// (`op.bg_epoch += 1` on is_finish). The new contract: this stays
+    /// constant across the operator's lifetime; check_progress compares
+    /// `bg.bg_epoch - origin_bg_epoch` against `sum(steps.epoch_consumed())`.
     pub bg_epoch: u64,
 }
 
@@ -325,7 +439,7 @@ mod tests {
             jc.clone(),
         ));
         let bg_store = std::sync::Arc::new(crate::pd::bg::BGStore::new(store));
-        std::sync::Arc::new(BGManager::new(
+        let bg_mgr = std::sync::Arc::new(BGManager::new(
             bg_store,
             pool_mgr,
             jc,
@@ -333,7 +447,9 @@ mod tests {
             1024,
             vec![3],
             vec![],
-        ))
+        ));
+        bg_mgr.test_disable_route_publish();
+        bg_mgr
     }
 
     fn make_bg(bg_id: u32, replica_set: Vec<u32>, lease_node: Option<u32>) -> BlockGroupInfo {
@@ -364,22 +480,108 @@ mod tests {
 
         let cases: Vec<(&str, OpStep, BlockGroupInfo, bool)> = vec![
             // AddReplica
-            ("add: worker in set", OpStep::AddReplica { worker_id: 20 }, make_bg(1, vec![10, 20, 30], None), true),
-            ("add: worker absent", OpStep::AddReplica { worker_id: 30 }, make_bg(2, vec![10, 20], None), false),
-            ("add: empty set", OpStep::AddReplica { worker_id: 1 }, make_bg(3, vec![], None), false),
+            (
+                "add: worker in set",
+                OpStep::AddReplica { worker_id: 20 },
+                make_bg(1, vec![10, 20, 30], None),
+                true,
+            ),
+            (
+                "add: worker absent",
+                OpStep::AddReplica { worker_id: 30 },
+                make_bg(2, vec![10, 20], None),
+                false,
+            ),
+            (
+                "add: empty set",
+                OpStep::AddReplica { worker_id: 1 },
+                make_bg(3, vec![], None),
+                false,
+            ),
             // RemoveReplica
-            ("remove: worker absent", OpStep::RemoveReplica { worker_id: 30 }, make_bg(4, vec![10, 20], None), true),
-            ("remove: worker present", OpStep::RemoveReplica { worker_id: 20 }, make_bg(5, vec![10, 20, 30], None), false),
-            ("remove: empty set", OpStep::RemoveReplica { worker_id: 1 }, make_bg(6, vec![], None), true),
+            (
+                "remove: worker absent",
+                OpStep::RemoveReplica { worker_id: 30 },
+                make_bg(4, vec![10, 20], None),
+                true,
+            ),
+            (
+                "remove: worker present",
+                OpStep::RemoveReplica { worker_id: 20 },
+                make_bg(5, vec![10, 20, 30], None),
+                false,
+            ),
+            (
+                "remove: empty set",
+                OpStep::RemoveReplica { worker_id: 1 },
+                make_bg(6, vec![], None),
+                true,
+            ),
             // TransferLease
-            ("lease: matches target", OpStep::TransferLease { from_worker: 10, to_worker: 20 }, make_bg(7, vec![10, 20], Some(20)), true),
-            ("lease: still on source", OpStep::TransferLease { from_worker: 10, to_worker: 20 }, make_bg(8, vec![10, 20], Some(10)), false),
-            ("lease: no lease", OpStep::TransferLease { from_worker: 10, to_worker: 20 }, make_bg(9, vec![10, 20], None), false),
+            (
+                "lease: matches target",
+                OpStep::TransferLease {
+                    from_worker: 10,
+                    to_worker: 20,
+                },
+                make_bg(7, vec![10, 20], Some(20)),
+                true,
+            ),
+            (
+                "lease: still on source",
+                OpStep::TransferLease {
+                    from_worker: 10,
+                    to_worker: 20,
+                },
+                make_bg(8, vec![10, 20], Some(10)),
+                false,
+            ),
+            (
+                "lease: no lease",
+                OpStep::TransferLease {
+                    from_worker: 10,
+                    to_worker: 20,
+                },
+                make_bg(9, vec![10, 20], None),
+                false,
+            ),
             // WaitReplicaReady
-            ("wait: active=ok", OpStep::WaitReplicaReady { worker_id: 10, expected_state: ReplicaState::Active }, make_bg(100, vec![10], None), true),
-            ("wait: syncing!=active", OpStep::WaitReplicaReady { worker_id: 10, expected_state: ReplicaState::Active }, make_bg(101, vec![10], None), false),
-            ("wait: offline!=active", OpStep::WaitReplicaReady { worker_id: 10, expected_state: ReplicaState::Active }, make_bg(102, vec![10], None), false),
-            ("wait: pending(default)", OpStep::WaitReplicaReady { worker_id: 10, expected_state: ReplicaState::Active }, make_bg(999, vec![10], None), false),
+            (
+                "wait: active=ok",
+                OpStep::WaitReplicaReady {
+                    worker_id: 10,
+                    expected_state: ReplicaState::Active,
+                },
+                make_bg(100, vec![10], None),
+                true,
+            ),
+            (
+                "wait: syncing!=active",
+                OpStep::WaitReplicaReady {
+                    worker_id: 10,
+                    expected_state: ReplicaState::Active,
+                },
+                make_bg(101, vec![10], None),
+                false,
+            ),
+            (
+                "wait: offline!=active",
+                OpStep::WaitReplicaReady {
+                    worker_id: 10,
+                    expected_state: ReplicaState::Active,
+                },
+                make_bg(102, vec![10], None),
+                false,
+            ),
+            (
+                "wait: pending(default)",
+                OpStep::WaitReplicaReady {
+                    worker_id: 10,
+                    expected_state: ReplicaState::Active,
+                },
+                make_bg(999, vec![10], None),
+                false,
+            ),
         ];
 
         for (name, step, bg, expected) in &cases {
@@ -404,9 +606,17 @@ mod tests {
         ];
         for (kind, expected) in cases {
             let op = BGOperator {
-                id: 1, kind: kind.clone(), bg_id: 1, description: String::new(),
-                steps: vec![], current_step: 0, status: OpStatus::Pending,
-                create_time_ms: 0, step_start_time_ms: 0, priority: 1, bg_epoch: 0,
+                id: 1,
+                kind: kind.clone(),
+                bg_id: 1,
+                description: String::new(),
+                steps: vec![],
+                current_step: 0,
+                status: OpStatus::Pending,
+                create_time_ms: 0,
+                step_start_time_ms: 0,
+                priority: 1,
+                bg_epoch: 0,
             };
             assert_eq!(op.bg_op_state(), expected, "kind {:?}", kind);
         }
@@ -423,6 +633,71 @@ mod tests {
         assert_eq!(op.priority, 100);
         assert_eq!(op.bg_epoch, 0);
         assert!(op.steps.is_empty());
+    }
+
+    #[test]
+    fn check_safety_cases() {
+        // AddReplica is always safe — the propose-time CAS handles races.
+        assert!(OpStep::AddReplica { worker_id: 99 }
+            .check_safety(&make_bg(1, vec![1, 2], Some(1)))
+            .is_ok());
+
+        // RemoveReplica: unsafe if the worker is the current lease owner.
+        assert!(OpStep::RemoveReplica { worker_id: 1 }
+            .check_safety(&make_bg(2, vec![1, 2], Some(1)))
+            .is_err());
+        // RemoveReplica: safe if the worker holds no lease.
+        assert!(OpStep::RemoveReplica { worker_id: 2 }
+            .check_safety(&make_bg(3, vec![1, 2], Some(1)))
+            .is_ok());
+        // RemoveReplica: worker already gone → still safe (is_finish completes).
+        assert!(OpStep::RemoveReplica { worker_id: 99 }
+            .check_safety(&make_bg(4, vec![1, 2], Some(1)))
+            .is_ok());
+
+        // TransferLease: target not in replica_set → unsafe.
+        assert!(OpStep::TransferLease {
+            from_worker: 1,
+            to_worker: 99,
+        }
+        .check_safety(&make_bg(5, vec![1, 2], Some(1)))
+        .is_err());
+        // TransferLease: lease held by a third party → unsafe.
+        assert!(OpStep::TransferLease {
+            from_worker: 1,
+            to_worker: 2,
+        }
+        .check_safety(&make_bg(6, vec![1, 2, 3], Some(3)))
+        .is_err());
+        // TransferLease: lease already at target → safe (is_finish completes).
+        assert!(OpStep::TransferLease {
+            from_worker: 1,
+            to_worker: 2,
+        }
+        .check_safety(&make_bg(7, vec![1, 2], Some(2)))
+        .is_ok());
+        // TransferLease: normal path, lease at from_worker, target in set.
+        assert!(OpStep::TransferLease {
+            from_worker: 1,
+            to_worker: 2,
+        }
+        .check_safety(&make_bg(8, vec![1, 2], Some(1)))
+        .is_ok());
+
+        // WaitReplicaReady for Active: worker absent from replica_set → unsafe.
+        assert!(OpStep::WaitReplicaReady {
+            worker_id: 99,
+            expected_state: ReplicaState::Active,
+        }
+        .check_safety(&make_bg(9, vec![1, 2], Some(1)))
+        .is_err());
+        // WaitReplicaReady for Offline: absence is legitimate → safe.
+        assert!(OpStep::WaitReplicaReady {
+            worker_id: 99,
+            expected_state: ReplicaState::Offline,
+        }
+        .check_safety(&make_bg(10, vec![1, 2], Some(1)))
+        .is_ok());
     }
 
     #[test]

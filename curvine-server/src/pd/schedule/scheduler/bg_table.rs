@@ -14,11 +14,13 @@
 
 use super::Scheduler;
 use crate::pd::config::keys;
-use crate::pd::node::{NodeEvent, NodeEventType};
-use crate::pd::schedule::{BGOperator, ManagerContext, OpPriority, OperatorBuilder, OperatorKind};
-use curvine_common::state::{gen_table_id, BGOpState, NodeType, ReplicaState};
+use crate::pd::schedule::{
+    BGOperator, ManagerContext, OpPriority, OperatorBuilder, OperatorKind, ScheduleEvent,
+};
+use curvine_common::state::{gen_table_id, BGOpState, ReplicaState};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -41,6 +43,7 @@ pub struct PendingPoolRebuild {
 pub struct BGTableScheduler {
     ctx: Arc<ManagerContext>,
     pending: Mutex<HashMap<u16, PendingPoolRebuild>>,
+    pool_generations: Mutex<HashMap<u16, u64>>,
 }
 
 impl BGTableScheduler {
@@ -48,6 +51,7 @@ impl BGTableScheduler {
         Self {
             ctx,
             pending: Mutex::new(HashMap::new()),
+            pool_generations: Mutex::new(HashMap::new()),
         }
     }
 
@@ -87,6 +91,37 @@ impl BGTableScheduler {
             .replica_counts()
             .iter()
             .any(|&rc| self.has_table(pool_id, rc))
+    }
+
+    fn pool_generation(pool: &curvine_common::state::PoolInfo) -> u64 {
+        let mut workers: Vec<u32> = pool.workers.iter().copied().collect();
+        workers.sort_unstable();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        pool.pool_id.hash(&mut hasher);
+        workers.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn detect_pool_membership_changes(&self) {
+        let pools = self.ctx.pool_manager.list_active_pools();
+        let mut generations = self.pool_generations.lock().unwrap();
+        for pool in pools {
+            let generation = Self::pool_generation(&pool);
+            let changed = generations
+                .insert(pool.pool_id, generation)
+                .map(|old| old != generation)
+                .unwrap_or(true);
+            if changed {
+                log::info!(
+                    "BGTableScheduler detected pool membership generation change pool_id={}, generation={}",
+                    pool.pool_id,
+                    generation
+                );
+                drop(generations);
+                self.enqueue(pool.pool_id);
+                generations = self.pool_generations.lock().unwrap();
+            }
+        }
     }
 
     fn bootstrap_missing_tables(&self) {
@@ -287,6 +322,7 @@ impl Scheduler for BGTableScheduler {
 
     fn schedule(&self, _ctx: &ManagerContext) -> Vec<BGOperator> {
         self.bootstrap_missing_tables();
+        self.detect_pool_membership_changes();
         self.check_and_execute()
     }
 
@@ -303,16 +339,21 @@ impl Scheduler for BGTableScheduler {
         Duration::from_millis(ms).min(BGTABLE_MAX_INTERVAL)
     }
 
-    fn on_event(&self, event: &NodeEvent) {
-        if event.node_type != NodeType::Worker {
-            return;
+    fn on_event(&self, event: &ScheduleEvent) {
+        if let ScheduleEvent::WorkerJoinedPools {
+            changed_pool_ids, ..
+        } = event
+        {
+            for &pool_id in changed_pool_ids {
+                self.enqueue(pool_id);
+            }
         }
-        if event.event_type != NodeEventType::Registered {
-            return;
-        }
-        for pool_id in self.ctx.pool_manager.get_pools_by_worker(event.node_id) {
-            self.enqueue(pool_id);
-        }
+    }
+
+    fn on_leader_start(&self) {
+        self.pending.lock().unwrap().clear();
+        self.pool_generations.lock().unwrap().clear();
+        log::info!("BGTableScheduler leader-start cooldown state reset");
     }
 }
 
@@ -536,16 +577,38 @@ mod tests {
         assert!(pending_deadline(&s, POOL_ID_SSD).is_some());
     }
 
-    fn make_event(event_type: NodeEventType, node_type: NodeType, node_id: u32) -> NodeEvent {
-        NodeEvent {
-            event_type,
-            node_id,
-            node_type,
-            old_state: None,
-            new_state: None,
-            epoch: 1,
+    fn worker_joined_event(changed_pool_ids: Vec<u16>) -> ScheduleEvent {
+        ScheduleEvent::WorkerJoinedPools {
+            worker_id: 100,
+            node_epoch: 1,
+            target_pool_ids: changed_pool_ids.clone(),
+            changed_pool_ids,
             event_time_ms: 0,
         }
+    }
+
+    #[test]
+    fn detect_pool_membership_changes_enqueues_only_on_generation_change() {
+        let f = Fixture::new();
+        let s = scheduler_for(&f);
+
+        s.detect_pool_membership_changes();
+        assert!(s.pending.lock().unwrap().is_empty());
+
+        f.add_worker(100, POOL_ID_SSD, &[]);
+        s.detect_pool_membership_changes();
+        assert!(pending_deadline(&s, POOL_ID_SSD).is_some());
+
+        s.pending.lock().unwrap().clear();
+        s.detect_pool_membership_changes();
+        assert!(
+            s.pending.lock().unwrap().is_empty(),
+            "unchanged pool generation must not enqueue again"
+        );
+
+        f.add_worker(101, POOL_ID_SSD, &[]);
+        s.detect_pool_membership_changes();
+        assert!(pending_deadline(&s, POOL_ID_SSD).is_some());
     }
 
     #[test]
@@ -554,11 +617,7 @@ mod tests {
         f.add_worker(100, POOL_ID_SSD, &[]);
         let s = scheduler_for(&f);
 
-        s.on_event(&make_event(
-            NodeEventType::Registered,
-            NodeType::Worker,
-            100,
-        ));
+        s.on_event(&worker_joined_event(vec![POOL_ID_SSD]));
 
         assert!(pending_deadline(&s, POOL_ID_SSD).is_some());
     }
@@ -570,23 +629,26 @@ mod tests {
         f.add_worker(100, POOL_ID_SSD, &[]);
         let s = scheduler_for(&f);
 
-        s.on_event(&make_event(NodeEventType::Offline, NodeType::Worker, 100));
-        s.on_event(&make_event(
-            NodeEventType::DecommissionFinished,
-            NodeType::Worker,
-            100,
-        ));
+        s.on_event(&ScheduleEvent::WorkerOffline {
+            worker_id: 100,
+            node_epoch: 1,
+            event_time_ms: 0,
+        });
+        s.on_event(&ScheduleEvent::WorkerDecommissionFinished {
+            worker_id: 100,
+            node_epoch: 1,
+            event_time_ms: 0,
+        });
 
         assert!(s.pending.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn meta_events_are_ignored() {
+    fn joined_event_without_changed_pools_is_ignored() {
         let f = Fixture::new();
-        f.add_worker(100, POOL_ID_SSD, &[]);
         let s = scheduler_for(&f);
 
-        s.on_event(&make_event(NodeEventType::Registered, NodeType::Meta, 100));
+        s.on_event(&worker_joined_event(vec![]));
 
         assert!(s.pending.lock().unwrap().is_empty());
     }
@@ -597,17 +659,15 @@ mod tests {
         f.add_worker(100, POOL_ID_SSD, &[]);
         let s = scheduler_for(&f);
 
-        s.on_event(&make_event(
-            NodeEventType::Registered,
-            NodeType::Worker,
-            100,
-        ));
+        s.on_event(&worker_joined_event(vec![POOL_ID_SSD]));
         f.add_worker(101, POOL_ID_SSD, &[]);
-        s.on_event(&make_event(
-            NodeEventType::Registered,
-            NodeType::Worker,
-            101,
-        ));
+        s.on_event(&ScheduleEvent::WorkerJoinedPools {
+            worker_id: 101,
+            node_epoch: 1,
+            target_pool_ids: vec![POOL_ID_SSD],
+            changed_pool_ids: vec![POOL_ID_SSD],
+            event_time_ms: 0,
+        });
 
         assert_eq!(s.pending.lock().unwrap().len(), 1);
     }

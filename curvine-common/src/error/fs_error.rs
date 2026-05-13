@@ -60,6 +60,8 @@ pub enum ErrorKind {
     JobNotFound = 23,
     MountPathExists = 24,
     MountPathConflict = 25,
+    StaleEntry = 26,
+    NotFound = 27,
 
     #[num_enum(default)]
     Common = 10000,
@@ -165,6 +167,17 @@ pub enum FsError {
     #[error("{0}")]
     MountPathConflict(ErrorImpl<StringError>),
 
+    // Apply-side CAS failed: the entry was rejected because the in-memory state
+    // moved past the entry's `expected_*` guard. Caller should treat this as a
+    // soft conflict and let upper-layer scheduling retry on a fresh snapshot.
+    #[error("{0}")]
+    StaleEntry(ErrorImpl<StringError>),
+
+    // Target object (pool/bg/mount/node/etc.) does not exist. Use this for
+    // generic not-found cases; file-specific not-found uses FileNotFound.
+    #[error("{0}")]
+    NotFound(ErrorImpl<StringError>),
+
     // Other errors that are not defined.
     #[error("{0}")]
     Common(ErrorImpl<StringError>),
@@ -220,6 +233,28 @@ impl FsError {
 
     pub fn mount_path_conflict(msg: impl Into<String>) -> Self {
         Self::MountPathConflict(ErrorImpl::with_source(msg.into().into()))
+    }
+
+    /// Construct a stale-entry error: an apply-side CAS rejected the entry
+    /// because the in-memory state already moved past the expected guard.
+    /// `kind` identifies the entry type (e.g. "save_pool", "update_bg").
+    pub fn stale_entry(
+        kind: impl AsRef<str>,
+        expected: impl std::fmt::Display,
+        actual: impl std::fmt::Display,
+    ) -> Self {
+        let msg = format!(
+            "stale {}: expected={}, actual={}",
+            kind.as_ref(),
+            expected,
+            actual
+        );
+        Self::StaleEntry(ErrorImpl::with_source(msg.into()))
+    }
+
+    /// Construct a generic not-found error (for non-file objects like pools, BGs, mounts).
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self::NotFound(ErrorImpl::with_source(msg.into().into()))
     }
 
     pub fn file_exists(path: impl AsRef<str>) -> Self {
@@ -291,6 +326,8 @@ impl FsError {
             FsError::JobNotFound(_) => ErrorKind::JobNotFound,
             FsError::MountPathExists(_) => ErrorKind::MountPathExists,
             FsError::MountPathConflict(_) => ErrorKind::MountPathConflict,
+            FsError::StaleEntry(_) => ErrorKind::StaleEntry,
+            FsError::NotFound(_) => ErrorKind::NotFound,
             FsError::Common(_) => ErrorKind::Common,
         }
     }
@@ -407,6 +444,8 @@ impl ErrorExt for FsError {
             FsError::JobNotFound(e) => FsError::JobNotFound(e.ctx(ctx)),
             FsError::MountPathExists(e) => FsError::MountPathExists(e.ctx(ctx)),
             FsError::MountPathConflict(e) => FsError::MountPathConflict(e.ctx(ctx)),
+            FsError::StaleEntry(e) => FsError::StaleEntry(e.ctx(ctx)),
+            FsError::NotFound(e) => FsError::NotFound(e.ctx(ctx)),
             FsError::Common(e) => FsError::Common(e.ctx(ctx)),
         }
     }
@@ -438,6 +477,8 @@ impl ErrorExt for FsError {
             FsError::JobNotFound(e) => e.encode(ErrorKind::JobNotFound),
             FsError::MountPathExists(e) => e.encode(ErrorKind::MountPathExists),
             FsError::MountPathConflict(e) => e.encode(ErrorKind::MountPathConflict),
+            FsError::StaleEntry(e) => e.encode(ErrorKind::StaleEntry),
+            FsError::NotFound(e) => e.encode(ErrorKind::NotFound),
             FsError::Common(e) => e.encode(ErrorKind::Common),
         }
     }
@@ -472,6 +513,8 @@ impl ErrorExt for FsError {
             ErrorKind::JobNotFound => FsError::JobNotFound(de.into_string()),
             ErrorKind::MountPathExists => FsError::MountPathExists(de.into_string()),
             ErrorKind::MountPathConflict => FsError::MountPathConflict(de.into_string()),
+            ErrorKind::StaleEntry => FsError::StaleEntry(de.into_string()),
+            ErrorKind::NotFound => FsError::NotFound(de.into_string()),
             ErrorKind::Common => FsError::Common(de.into_string()),
         }
     }

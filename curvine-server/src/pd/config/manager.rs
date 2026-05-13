@@ -16,7 +16,7 @@ use super::error::unknown_key_error;
 use super::keys::{DynamicConfigItem, DYNAMIC_CONFIG_ITEMS};
 use super::store::ConfigStore;
 use crate::pd::journal::entry::ConfigEntry;
-use crate::pd::journal::{self, PdEntry};
+use crate::pd::journal::{self, ApplyOutcome, PdEntry};
 use crate::pd::store::KvStore;
 use curvine_common::proto::*;
 use curvine_common::state::ConfigInfo;
@@ -125,20 +125,23 @@ impl ConfigManager {
         self.dynamic_cache.is_valid_key(key)
     }
 
-    pub fn apply_set_config(&self, item: &ConfigInfo) -> FsResult<()> {
+    pub fn apply_set_config(&self, item: &ConfigInfo) -> FsResult<ApplyOutcome> {
         if let Some(existing) = self.config_store.get(&item.key)? {
             if existing.version >= item.version {
                 warn!(
                     "Apply set config: {} skipped (existing version {} >= {})",
                     item.key, existing.version, item.version
                 );
-                return Ok(());
+                return Ok(ApplyOutcome::stale(format!(
+                    "version mismatch: current={}, entry={}",
+                    existing.version, item.version
+                )));
             }
         }
         info!("Apply set config: {}", item.key);
         self.config_store.set(item)?;
         self.dynamic_cache.update_from_kv(item);
-        Ok(())
+        Ok(ApplyOutcome::Applied)
     }
 
     pub fn get_u32(&self, key: &str) -> u32 {
@@ -219,15 +222,26 @@ impl ConfigManager {
             item.version = existing.version + 1;
         }
 
-        self.journal_client
-            .propose(PdEntry::SetConfig(ConfigEntry {
+        // #6 fix: use propose_with_result so apply-side stale skip surfaces as
+        // an Err. Pre-#6 used plain propose(), client got success+version even
+        // when apply silently skipped (stale version).
+        let key = item.key.clone();
+        let version = item.version;
+        let outcome = self
+            .journal_client
+            .propose_as_leader_with_result(PdEntry::SetConfig(ConfigEntry {
                 op_ms: LocalTime::mills(),
-                info: item.clone(),
+                info: item,
             }))?;
-
-        Ok(SetConfigResponse {
-            success: true,
-            version: item.version,
-        })
+        match outcome {
+            ApplyOutcome::Applied | ApplyOutcome::SkippedNoop => Ok(SetConfigResponse {
+                success: true,
+                version,
+            }),
+            ApplyOutcome::SkippedStale { reason } => {
+                Err(FsError::stale_entry("set_config", key, reason))
+            }
+            ApplyOutcome::NotFound { reason } => Err(FsError::not_found(reason)),
+        }
     }
 }

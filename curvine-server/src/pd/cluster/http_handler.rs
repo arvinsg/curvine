@@ -91,7 +91,14 @@ pub async fn list_bg_tables_handler(
     Extension(instance): Extension<Arc<PdHttpHandler>>,
 ) -> impl IntoResponse {
     let bg_mgr = instance.cluster_manager.bg_manager();
-    ApiResponse::success(bg_mgr.list_tables())
+    // Deref Arc<BGTable> for serde — the Arc wrapper isn't Serialize without
+    // the `serde_with` rc feature.
+    let tables: Vec<crate::pd::bg::BGTable> = bg_mgr
+        .list_tables()
+        .into_iter()
+        .map(|arc| (*arc).clone())
+        .collect();
+    ApiResponse::success(tables)
 }
 
 /// GET /api/v1/bg/table/:table_id — get BG table summary (client-facing view with replica addresses).

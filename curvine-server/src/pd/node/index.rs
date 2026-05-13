@@ -34,16 +34,18 @@ impl NodeIndex {
 
     pub fn insert(&mut self, node: NodeInfo) {
         let node_id = node.base.node_id;
+        if let Some(old) = self.nodes.get(&node_id) {
+            self.by_type
+                .get_mut(&old.base.node_type)
+                .and_then(|s| s.take(&node_id));
+            self.by_state
+                .get_mut(&old.state)
+                .and_then(|s| s.take(&node_id));
+        }
         let nt = node.base.node_type;
         let st = node.state;
-        self.by_type
-            .entry(nt)
-            .or_default()
-            .insert(node_id);
-        self.by_state
-            .entry(st)
-            .or_default()
-            .insert(node_id);
+        self.by_type.entry(nt).or_default().insert(node_id);
+        self.by_state.entry(st).or_default().insert(node_id);
         self.nodes.insert(node_id, node);
     }
 
@@ -69,22 +71,14 @@ impl NodeIndex {
     pub fn get_by_type(&self, node_type: NodeType) -> Vec<&NodeInfo> {
         self.by_type
             .get(&node_type)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| self.nodes.get(id))
-                    .collect()
-            })
+            .map(|ids| ids.iter().filter_map(|id| self.nodes.get(id)).collect())
             .unwrap_or_default()
     }
 
     pub fn get_by_state(&self, state: NodeState) -> Vec<&NodeInfo> {
         self.by_state
             .get(&state)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| self.nodes.get(id))
-                    .collect()
-            })
+            .map(|ids| ids.iter().filter_map(|id| self.nodes.get(id)).collect())
             .unwrap_or_default()
     }
 
@@ -100,10 +94,7 @@ impl NodeIndex {
         self.by_state
             .get_mut(&old_state)
             .and_then(|s| s.take(&node_id));
-        self.by_state
-            .entry(new_state)
-            .or_default()
-            .insert(node_id);
+        self.by_state.entry(new_state).or_default().insert(node_id);
         node.state = new_state;
         node.state_since_ms = LocalTime::mills();
         true

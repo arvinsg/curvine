@@ -26,5 +26,5 @@ pub use operator::{
     OperatorKind,
 };
 pub use operator_controller::OperatorController;
-pub use scheduler::Scheduler;
+pub use scheduler::{ScheduleEvent, Scheduler};
 pub use scheduler_controller::SchedulerController;

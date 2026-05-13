@@ -14,7 +14,8 @@
 
 use curvine_common::state::BGLease;
 use curvine_common::state::{
-    BlockGroupInfo, ConfigInfo, MountInfo, NodeInfo, PathRouteEntry, PoolInfo,
+    BlockGroupInfo, ConfigInfo, MountInfo, NodeInfo, NodePayload, NodeState, PathRouteEntry,
+    PoolInfo,
 };
 use serde::{Deserialize, Serialize};
 
@@ -46,11 +47,71 @@ pub struct NodeEntry {
     pub info: NodeInfo,
 }
 
-/// Pool entry (Raft log) — used for worker add/remove persistence
+/// Optional persistent node payload update.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub enum NodePayloadUpdate {
+    Replace(NodePayload),
+}
+
+/// Strong-semantic node state update with epoch/state CAS.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct UpdateNodeStateEntry {
+    pub op_ms: u64,
+    pub node_id: u32,
+    pub expected_epoch: u64,
+    pub expected_state: Option<NodeState>,
+    pub new_state: NodeState,
+    pub state_since_ms: u64,
+    #[serde(default)]
+    pub last_heartbeat_ms: Option<u64>,
+    #[serde(default)]
+    pub payload_update: Option<NodePayloadUpdate>,
+}
+
+/// Periodic heartbeat checkpoint.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct HeartbeatCheckpointEntry {
+    pub op_ms: u64,
+    pub node_id: u32,
+    pub expected_epoch: u64,
+    pub expected_state: Option<NodeState>,
+    pub last_heartbeat_ms: u64,
+}
+
+/// Batch node state update with per-node epoch/state CAS.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct BatchUpdateNodeStateEntry {
+    pub op_ms: u64,
+    pub entries: Vec<UpdateNodeStateEntry>,
+}
+
+/// Node deletion with epoch/state CAS.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct DeleteNodeEntry {
+    pub op_ms: u64,
+    pub node_id: u32,
+    pub expected_epoch: u64,
+    pub expected_state: Option<NodeState>,
+}
+
+/// Pool entry (Raft log) — used for worker add/remove persistence.
+///
+/// `expected_epoch` is the pool's epoch as observed by the proposer when the
+/// entry was constructed. apply_save_pool uses it as a CAS guard:
+///   - existing.epoch == expected_epoch  → accept (replaces with info)
+///   - existing.epoch != expected_epoch  → SkippedStale (concurrent write)
+/// `info.epoch` MUST be `existing.epoch + 1`. apply enforces strict +1
+/// monotonicity to catch malformed entries.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct PoolEntry {
     pub op_ms: u64,
     pub info: PoolInfo,
+    /// Pool epoch the proposer based this entry on. `serde(default)` keeps
+    /// pre-P1.1 logs decodable: legacy entries decode with expected_epoch=0,
+    /// which combined with monotonicity check makes them effectively reject
+    /// against any non-zero pool. New entries always set this explicitly.
+    #[serde(default)]
+    pub expected_epoch: u64,
 }
 
 /// BG create entry (Raft log)
@@ -61,6 +122,13 @@ pub struct BGEntry {
 }
 
 /// BG update entry (Raft log).
+///
+/// `expected_bg_epoch` is the bg_epoch the proposer observed when the entry
+/// was constructed. apply uses it as a CAS guard:
+///   - existing.bg_epoch == expected_bg_epoch  → accept
+///   - existing.bg_epoch != expected_bg_epoch  → SkippedStale (concurrent update)
+/// `new_bg_epoch` MUST be strictly greater than `existing.bg_epoch`. apply
+/// also rejects non-monotonic entries as SkippedStale.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct BGUpdateEntry {
     pub op_ms: u64,
@@ -68,8 +136,14 @@ pub struct BGUpdateEntry {
     pub state: Option<curvine_common::state::BGState>,
     pub replica_set: Option<Vec<u32>>,
     pub lease_owner: Option<BGLease>,
+    /// BG epoch the proposer based this entry on. `serde(default)` keeps
+    /// pre-P2.1 logs decodable: legacy entries decode with expected_bg_epoch=0
+    /// and rely on the `new_bg_epoch > info.bg_epoch` monotonicity check.
+    #[serde(default)]
+    pub expected_bg_epoch: u64,
     pub new_bg_epoch: u64,
-    pub new_table_epoch: Option<u64>,
+    /// Table whose route epoch should be bumped at apply time if this BG mutation succeeds.
+    pub bump_table_epoch: Option<u32>,
 }
 
 /// Batch BG entry (Raft log) — atomically applies table + multiple BG creates/updates.
@@ -83,16 +157,49 @@ pub struct BatchBGEntry {
     #[serde(default)]
     pub next_bg_id: Option<u32>,
     #[serde(default)]
-    pub new_table_epoch: Option<(u32, u64)>,
+    /// Table whose route epoch should be bumped at apply time if this batch mutates route-visible state.
+    pub bump_table_epoch: Option<u32>,
+    /// P2.3: when `table` is set and this is true, apply requires the table to
+    /// NOT already exist. Used by `create_table` to prevent two concurrent
+    /// creates with the same `(pool_id, replica_count)` from clobbering each
+    /// other's BGs (the second batch's CAS fails and orphan BGs are avoided).
+    /// Pre-P2.3 entries decode with `expected_table_absent = false` (no guard).
+    #[serde(default)]
+    pub expected_table_absent: bool,
 }
 
 /// BG delete entry (Raft log).
+///
+/// `expected_bg_epoch` (P2.2) protects against deleting a BG whose epoch has
+/// moved since the proposer's snapshot. `table_id` is kept for backward
+/// compatibility but apply now reads `info.table_id` from the BG itself
+/// instead of trusting this field, eliminating the "delete bumps wrong
+/// table_epoch" risk described in §4.6.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct BGDeleteEntry {
     pub op_ms: u64,
     pub bg_id: u32,
     pub table_id: u32,
-    pub new_table_epoch: u64,
+    /// BG epoch the proposer based the delete on. `serde(default)` keeps
+    /// pre-P2.2 logs decodable.
+    #[serde(default)]
+    pub expected_bg_epoch: u64,
+}
+
+/// A single table epoch bump. Replica lifecycle state is leader-runtime only;
+/// this entry only publishes a monotonically increasing route epoch.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct TableEpochUpdate {
+    pub table_id: u32,
+    pub expected_epoch: u64,
+    pub new_epoch: u64,
+}
+
+/// Batch table epoch bump entry (Raft log).
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct BumpTableEpochEntry {
+    pub op_ms: u64,
+    pub updates: Vec<TableEpochUpdate>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -105,7 +212,10 @@ pub enum PdEntry {
     // Node management
     RegisterNode(NodeEntry),
     SaveNode(NodeEntry),
-    DeleteNode(u32),
+    UpdateNodeState(UpdateNodeStateEntry),
+    BatchUpdateNodeState(BatchUpdateNodeStateEntry),
+    HeartbeatCheckpoint(HeartbeatCheckpointEntry),
+    DeleteNode(DeleteNodeEntry),
 
     // Pool management
     SavePool(PoolEntry),
@@ -115,6 +225,7 @@ pub enum PdEntry {
     UpdateBG(BGUpdateEntry),
     DeleteBG(BGDeleteEntry),
     BatchBG(BatchBGEntry),
+    BumpTableEpoch(BumpTableEpochEntry),
 
     // Path route (MetaNode Federation static mode)
     AddPathRoute(PathRouteEntry),
@@ -130,12 +241,16 @@ impl PdEntry {
             PdEntry::Unmount(_) => "unmount",
             PdEntry::RegisterNode(_) => "register_node",
             PdEntry::SaveNode(_) => "save_node",
+            PdEntry::UpdateNodeState(_) => "update_node_state",
+            PdEntry::BatchUpdateNodeState(_) => "batch_update_node_state",
+            PdEntry::HeartbeatCheckpoint(_) => "heartbeat_checkpoint",
             PdEntry::DeleteNode(_) => "delete_node",
             PdEntry::SavePool(_) => "save_pool",
             PdEntry::CreateBG(_) => "create_bg",
             PdEntry::UpdateBG(_) => "update_bg",
             PdEntry::DeleteBG(_) => "delete_bg",
             PdEntry::BatchBG(_) => "batch_bg",
+            PdEntry::BumpTableEpoch(_) => "bump_table_epoch",
             PdEntry::AddPathRoute(_) => "add_path_route",
             PdEntry::RemovePathRoute(_) => "remove_path_route",
         }

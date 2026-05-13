@@ -91,9 +91,10 @@ impl MessageHandler for PdRpcHandler {
             }
             RpcCode::GetMountTable => {
                 let table = self.mount_manager.get_mount_table()?;
+                // Wire format expects MountInfoProto; deref Arc and convert.
                 let mount_table: Vec<MountInfoProto> = table
                     .into_iter()
-                    .map(ProtoUtils::mount_info_to_pb)
+                    .map(|arc| ProtoUtils::mount_info_to_pb((*arc).clone()))
                     .collect();
                 ctx.response(GetMountTableResponse { mount_table })?
             }
@@ -102,7 +103,7 @@ impl MessageHandler for PdRpcHandler {
                 let path = Path::from_str(req.path)?;
                 let info = self.mount_manager.get_mount_info(&path)?;
                 ctx.response(GetMountInfoResponse {
-                    mount_info: info.map(ProtoUtils::mount_info_to_pb),
+                    mount_info: info.map(|arc| ProtoUtils::mount_info_to_pb((*arc).clone())),
                 })?
             }
             RpcCode::GetMetaRouteSummary => {

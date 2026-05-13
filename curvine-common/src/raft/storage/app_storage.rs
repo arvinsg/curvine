@@ -18,7 +18,15 @@ use crate::raft::RaftResult;
 /// Application layer storage.
 /// Replay raft log
 pub trait AppStorage: Clone + Send + Sync + 'static {
-    fn apply(&self, is_leader: bool, message: &[u8]) -> RaftResult<()>;
+    /// Apply a committed entry to application state.
+    ///
+    /// Returns bytes that the leader will forward to the propose caller via
+    /// `ProposeResponse.apply_result`. Implementations that have no structured
+    /// result to return should return `Ok(Vec::new())`. PD interprets the
+    /// returned bytes as an `ApplyOutcome`; an empty slice is decoded as
+    /// `ApplyOutcome::Applied` for forward compatibility with un-upgraded
+    /// leaders.
+    fn apply(&self, is_leader: bool, message: &[u8]) -> RaftResult<Vec<u8>>;
 
     fn create_snapshot(&self, node_id: u64, last_applied: u64) -> RaftResult<SnapshotData>;
 

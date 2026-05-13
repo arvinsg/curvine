@@ -141,7 +141,10 @@ fn list_respects_prefix_filter() {
         .unwrap();
 
     assert!(!resp_node.items.is_empty());
-    assert!(resp_node.items.iter().all(|i| i.key.starts_with("pd.node.")));
+    assert!(resp_node
+        .items
+        .iter()
+        .all(|i| i.key.starts_with("pd.node.")));
     assert!(!resp_bg.items.is_empty());
     assert!(resp_bg.items.iter().all(|i| i.key.starts_with("pd.bg.")));
 }

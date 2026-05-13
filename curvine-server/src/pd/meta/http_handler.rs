@@ -53,6 +53,7 @@ pub async fn post_path_route_handler(
         group_id: body.group_id,
         create_time_ms: 0,
         update_time_ms: 0,
+        expected_table_version: 0,
     };
     match mm.add_route(entry) {
         Ok(()) => ApiResponse::<()>::success_with_status_code(axum::http::StatusCode::OK),
@@ -117,7 +118,11 @@ pub async fn get_meta_group_handler(
         Some(g) => ApiResponse::success(g),
         None => {
             let err = crate::pd::meta::MetaError::group_not_found(group_id);
-            ApiResponse::<NodeGroupInfo>::error(err.code().into(), err.to_string(), err.status_code())
+            ApiResponse::<NodeGroupInfo>::error(
+                err.code().into(),
+                err.to_string(),
+                err.status_code(),
+            )
         }
     }
 }

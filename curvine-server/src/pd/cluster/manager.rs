@@ -19,49 +19,21 @@ use crate::pd::mount::MountManager;
 use crate::pd::node::NodeManager;
 use crate::pd::pool::PoolManager;
 use crate::pd::schedule::{Manager, ManagerContext, OperatorController};
-use curvine_common::raft::RoleState;
 use curvine_common::state::{
     HeartbeatRequest, HeartbeatResponse, HeartbeatResponsePayload, MetaHeartbeatResponse,
     NodePayload, NodeState, RegisterRequest, WorkerHeartbeatResponse,
 };
 use curvine_common::{FsError, FsResult};
 use orpc::runtime::RpcRuntime;
-use orpc::sync::StateCtl;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-/// Trait for checking PD leader status.
-pub trait LeaderChecker: Send + Sync {
-    fn is_leader(&self) -> bool;
-}
-
-/// Raft-based leader checker.
-pub struct RaftLeaderChecker {
-    role_ctl: StateCtl,
-}
-
-impl RaftLeaderChecker {
-    pub fn new(role_ctl: StateCtl) -> Self {
-        Self { role_ctl }
-    }
-}
-
-impl LeaderChecker for RaftLeaderChecker {
-    fn is_leader(&self) -> bool {
-        let state: RoleState = self.role_ctl.state();
-        state == RoleState::Leader
-    }
-}
-
+// LeaderChecker / RaftLeaderChecker / AlwaysLeader were moved to
+// `pd/journal/leader.rs` to avoid a circular dependency with `journal::Client`.
+// Re-exports keep existing call sites (`crate::pd::cluster::manager::...`) working.
+pub use crate::pd::journal::{LeaderChecker, RaftLeaderChecker};
 #[cfg(test)]
-pub struct AlwaysLeader;
-
-#[cfg(test)]
-impl LeaderChecker for AlwaysLeader {
-    fn is_leader(&self) -> bool {
-        true
-    }
-}
+pub use crate::pd::journal::AlwaysLeader;
 
 /// Cluster manager: ties node, pool, bg and schedule manager.
 /// Owns the leader lifecycle: starts/stops schedule+liveness loops on leader change.
@@ -132,8 +104,7 @@ impl ClusterManager {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             let is_leader = self.leader_checker.is_leader();
             if is_leader && !was_leader {
-                self.on_leader_start();
-                was_leader = true;
+                was_leader = self.on_leader_start();
             } else if !is_leader && was_leader {
                 self.on_leader_stop();
                 was_leader = false;
@@ -141,12 +112,21 @@ impl ClusterManager {
         }
     }
 
-    fn on_leader_start(&self) {
+    fn on_leader_start(&self) -> bool {
         let mut guard = self.leader_token.lock().unwrap();
         if guard.is_some() {
-            return;
+            return true;
         }
-        log::info!("PD became leader, starting schedule and liveness loops");
+        log::info!(
+            "PD became leader, rebuilding runtime route view and starting schedule/liveness loops"
+        );
+        if let Err(e) = self.bg_manager.on_leader_start() {
+            log::warn!(
+                "BG leader-start route epoch bump failed, will retry leader start: {}",
+                e
+            );
+            return false;
+        }
         let token = CancellationToken::new();
         let event_rx = self.node_manager.subscribe();
         self.schedule_manager.clone().start(event_rx, token.clone());
@@ -154,6 +134,7 @@ impl ClusterManager {
             .clone()
             .start_liveness_loop(self.runtime.clone(), token.clone());
         *guard = Some(token);
+        true
     }
 
     fn on_leader_stop(&self) {
@@ -165,18 +146,18 @@ impl ClusterManager {
     }
 
     pub fn handle_worker_register(&self, req: RegisterRequest) -> FsResult<HeartbeatResponse> {
-        let worker_payload = match &req.payload {
-            NodePayload::Worker(p) => p.clone(),
-            _ => return Err(FsError::common("expected Worker payload")),
-        };
+        if !matches!(&req.payload, NodePayload::Worker(_)) {
+            return Err(FsError::common("expected Worker payload"));
+        }
 
         let (node_info, new_epoch) = self.node_manager.register(req)?;
 
-        let _pool_ids = self
-            .pool_manager
-            .assign_worker_to_pools(node_info.base.node_id, &worker_payload.storage_specs)?;
-
         let worker_bgs = self.bg_manager.get_bgs_on_worker(node_info.base.node_id);
+        // Wire format expects Vec<BlockGroupInfo>; deref-clone Arc-wrapped values.
+        let worker_bgs: Vec<curvine_common::state::BlockGroupInfo> = worker_bgs
+            .into_iter()
+            .map(|arc| (*arc).clone())
+            .collect();
 
         Ok(HeartbeatResponse {
             error: None,
@@ -192,22 +173,23 @@ impl ClusterManager {
     }
 
     pub fn handle_worker_heartbeat(&self, req: HeartbeatRequest) -> FsResult<HeartbeatResponse> {
+        let mut resp = self.node_manager.handle_heartbeat(req.clone())?;
+
         let reported_bg_epochs: std::collections::HashMap<u32, u64> =
             if let curvine_common::state::HeartbeatPayload::Worker(ref w) = req.payload {
                 if !w.bg_reports.is_empty() {
                     self.bg_manager
-                        .apply_replica_reports(req.node_id, &w.bg_reports);
+                        .apply_replica_reports(req.node_id, &w.bg_reports)?;
                 } else if !w.bg_epochs.is_empty() {
                     let bg_ids: Vec<u32> = w.bg_epochs.keys().copied().collect();
                     self.bg_manager
-                        .promote_pending_replicas(req.node_id, &bg_ids);
+                        .promote_pending_replicas(req.node_id, &bg_ids)?;
                 }
                 w.bg_epochs.clone()
             } else {
                 std::collections::HashMap::new()
             };
 
-        let mut resp = self.node_manager.handle_heartbeat(req.clone())?;
         resp.mount_version = self.mount_manager.version();
         resp.table_epochs = self.bg_manager.get_table_epochs();
 

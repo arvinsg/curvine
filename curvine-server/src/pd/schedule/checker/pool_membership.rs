@@ -56,17 +56,18 @@ impl super::Checker for PoolMembershipChecker {
             .pool_manager
             .assign_worker_to_pools(wid, &payload.storage_specs)
         {
-            Ok(assigned) if assigned.is_empty() => {
+            Ok(result) if result.target_pool_ids.is_empty() => {
                 log::error!(
                     "PoolMembershipChecker: worker {} has no usable storage specs for pool assignment",
                     wid
                 );
             }
-            Ok(assigned) => {
+            Ok(result) => {
                 log::info!(
-                    "PoolMembershipChecker repaired worker {}: assigned to pools {:?}",
+                    "PoolMembershipChecker repaired worker {}: target_pools={:?}, changed_pools={:?}",
                     wid,
-                    assigned
+                    result.target_pool_ids,
+                    result.changed_pool_ids
                 );
             }
             Err(e) => {

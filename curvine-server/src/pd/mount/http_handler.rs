@@ -113,7 +113,11 @@ pub async fn list_mounts_handler(
 ) -> impl IntoResponse {
     match instance.mount_manager.get_mount_table() {
         Ok(table) => {
-            let mut mounts = table;
+            // Deref Arc<MountInfo> for the wire response.
+            let mut mounts: Vec<curvine_common::state::MountInfo> = table
+                .into_iter()
+                .map(|arc| (*arc).clone())
+                .collect();
             if let Some(prefix) = &params.prefix {
                 if !prefix.is_empty() {
                     mounts.retain(|m| {
@@ -172,7 +176,7 @@ pub async fn get_mount_by_path_handler(
     };
 
     match instance.mount_manager.get_mount_info(&path) {
-        Ok(Some(info)) => ApiResponse::success(info),
+        Ok(Some(info)) => ApiResponse::success((*info).clone()),
         Ok(None) => ApiResponse::<MountInfo>::success_with_status_code(StatusCode::NOT_FOUND),
         Err(e) => {
             let err = MountError::from_fs_error(e);

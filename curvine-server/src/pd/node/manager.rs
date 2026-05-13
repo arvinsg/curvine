@@ -15,15 +15,19 @@
 use super::event::{NodeEvent, NodeEventType};
 use super::{HandlerRegistry, HeartbeatHandler, MetaHeartbeatHandler, WorkerHeartbeatHandler};
 use crate::pd::config::ConfigManager;
-use crate::pd::journal::entry::NodeEntry;
+use crate::pd::journal::entry::{
+    BatchUpdateNodeStateEntry, DeleteNodeEntry, HeartbeatCheckpointEntry, NodeEntry,
+    NodePayloadUpdate, UpdateNodeStateEntry,
+};
 use crate::pd::journal::{self, PdEntry};
 use crate::pd::pd_server::Pd;
 use curvine_common::state::{
-    HeartbeatRequest, HeartbeatResponse, NodeInfo, NodeState, NodeType, RegisterRequest,
+    HeartbeatRequest, HeartbeatResponse, NodeInfo, NodePayload, NodeState, NodeType,
+    RegisterRequest,
 };
 use curvine_common::{FsError, FsResult};
 
-use log::info;
+use log::{info, warn};
 use orpc::common::LocalTime;
 use orpc::runtime::RpcRuntime;
 use std::sync::Arc;
@@ -34,6 +38,7 @@ use super::index::NodeIndex;
 use super::store::NodeStore;
 
 const EVENT_CHANNEL_CAPACITY: usize = 2048;
+const MAX_BATCH_UPDATE_NODE_STATE: usize = 256;
 
 pub struct NodeManager {
     index: Arc<RwLock<NodeIndex>>,
@@ -87,6 +92,14 @@ impl NodeManager {
     }
 
     pub fn register(&self, req: RegisterRequest) -> FsResult<(NodeInfo, u64)> {
+        // #2: leader fence at RPC entry. register reads self.index but doesn't
+        // mutate before propose, so leader fence here mainly avoids unnecessary
+        // work on followers; propose_as_leader below would also reject.
+        if !self.journal_client.is_leader() {
+            return Err(FsError::not_leader(
+                "register rejected: this PD node is not the raft leader",
+            ));
+        }
         let handler = self.get_handler(req.base.node_type)?;
         let now = LocalTime::mills();
 
@@ -120,8 +133,38 @@ impl NodeManager {
             op_ms: now,
             info: node.clone(),
         };
-        self.journal_client.propose(PdEntry::RegisterNode(entry))?;
+        self.journal_client.propose_as_leader(PdEntry::RegisterNode(entry))?;
 
+        let Some(applied) = self.get_node(node.base.node_id) else {
+            warn!(
+                "RegisterNode propose returned but node {} is missing; skip event",
+                node.base.node_id
+            );
+            return Err(FsError::common(format!(
+                "register node {} was not applied",
+                node.base.node_id
+            )));
+        };
+        if !Self::register_apply_matches(&applied, &node, new_epoch) {
+            warn!(
+                "RegisterNode stale/skip node_id={}, expected_epoch={}, current_epoch={}, current_state={:?}, expected_address={:?}, current_address={:?}; skip event",
+                node.base.node_id,
+                new_epoch,
+                applied.epoch,
+                applied.state,
+                node.base.address,
+                applied.base.address
+            );
+            return Err(FsError::common(format!(
+                "register node {} was skipped by CAS or overwritten by another register",
+                node.base.node_id
+            )));
+        }
+
+        info!(
+            "Registered node {} type {:?} epoch {} state {:?}",
+            node.base.node_id, node.base.node_type, node.epoch, node.state
+        );
         self.emit_event(NodeEvent {
             event_type: NodeEventType::Registered,
             node_id: node.base.node_id,
@@ -132,10 +175,20 @@ impl NodeManager {
             event_time_ms: now,
         });
 
-        Ok((node, new_epoch))
+        Ok((applied, new_epoch))
     }
 
     pub fn handle_heartbeat(&self, req: HeartbeatRequest) -> FsResult<HeartbeatResponse> {
+        // #2 fix: leader fence at RPC entry. handle_heartbeat MUTATES the
+        // in-memory NodeIndex (last_heartbeat_ms, payload fields) before
+        // propose. Pre-#2 fix, a follower receiving heartbeat RPC would
+        // silently mutate its local index, then propose_as_leader fails
+        // — leaving runtime state diverged from the leader's. Reject early.
+        if !self.journal_client.is_leader() {
+            return Err(FsError::not_leader(
+                "heartbeat rejected: this PD node is not the raft leader",
+            ));
+        }
         Pd::get_metrics()
             .heartbeat_total
             .with_label_values(&[req.node_type.as_str()])
@@ -145,7 +198,14 @@ impl NodeManager {
         let now = LocalTime::mills();
         let persist_interval = self.persist_interval_ms();
 
-        let (node_snapshot, need_persist) = {
+        let (
+            node_snapshot,
+            old_state,
+            state_changed,
+            critical_changed,
+            need_checkpoint,
+            payload_update,
+        ) = {
             let mut index = self.index.write().unwrap();
             let node = index
                 .get_by_id_mut(req.node_id)
@@ -158,7 +218,6 @@ impl NodeManager {
                 )));
             }
 
-            // Reject heartbeats from terminal/decommissioning states
             match node.state {
                 NodeState::Offline | NodeState::Blacklist | NodeState::Decommission => {
                     return Err(FsError::common(format!(
@@ -169,60 +228,96 @@ impl NodeManager {
                 _ => {}
             }
 
-            // Delegate payload processing to handler
+            let old_payload = node.payload.clone();
             let critical_changed = handler.process_heartbeat(node, &req)?;
+            let payload_update = if critical_changed {
+                let update = node.payload.clone();
+                // Persistent payload fields (currently Meta group view) must be changed by apply only.
+                // Keep runtime-only fields updated in memory, but roll persistent fields back until
+                // the UpdateNodeState entry is committed and applied locally.
+                Self::restore_persistent_payload_fields(&mut node.payload, &old_payload);
+                Some(NodePayloadUpdate::Replace(update))
+            } else {
+                None
+            };
             node.last_heartbeat_ms = now;
 
-            // State transition: Starting/Lost → Live
             let old_state = node.state;
             let state_changed = matches!(old_state, NodeState::Starting | NodeState::Lost);
-
-            let need_persist = critical_changed || node.need_persist(now, persist_interval);
-
-            let node_id = req.node_id;
-            let node_type = node.base.node_type;
-            if state_changed {
-                index.update_state(node_id, NodeState::Live);
-            }
-
-            let snapshot = index.get_by_id(node_id).unwrap().clone();
-            if state_changed {
-                let event_type = match old_state {
-                    NodeState::Starting => NodeEventType::HeartbeatResumed,
-                    NodeState::Lost => NodeEventType::HeartbeatResumed,
-                    _ => NodeEventType::HeartbeatResumed,
-                };
-                self.emit_event(NodeEvent {
-                    event_type,
-                    node_id,
-                    node_type,
-                    old_state: Some(old_state),
-                    new_state: Some(NodeState::Live),
-                    epoch: snapshot.epoch,
-                    event_time_ms: now,
-                });
-            }
-            (snapshot, need_persist)
+            let need_checkpoint =
+                !state_changed && !critical_changed && node.need_persist(now, persist_interval);
+            let snapshot = node.clone();
+            (
+                snapshot,
+                old_state,
+                state_changed,
+                critical_changed,
+                need_checkpoint,
+                payload_update,
+            )
         };
 
-        let response_payload = handler.build_heartbeat_response(&node_snapshot, &req)?;
-
-        if need_persist {
-            let entry = NodeEntry {
-                op_ms: now,
-                info: node_snapshot.clone(),
+        if state_changed || critical_changed {
+            let new_state = if state_changed {
+                NodeState::Live
+            } else {
+                old_state
             };
-            self.journal_client.propose(PdEntry::SaveNode(entry))?;
-
-            let mut index = self.index.write().unwrap();
-            if let Some(n) = index.get_by_id_mut(req.node_id) {
-                n.last_persist_ms = now;
+            let state_since_ms = if state_changed {
+                now
+            } else {
+                node_snapshot.state_since_ms
+            };
+            let entry = UpdateNodeStateEntry {
+                op_ms: now,
+                node_id: node_snapshot.base.node_id,
+                expected_epoch: node_snapshot.epoch,
+                expected_state: Some(old_state),
+                new_state,
+                state_since_ms,
+                last_heartbeat_ms: Some(now),
+                payload_update,
+            };
+            self.journal_client
+                .propose_as_leader(PdEntry::UpdateNodeState(entry))?;
+            if state_changed
+                && self.emit_state_event_if_current(
+                    node_snapshot.base.node_id,
+                    node_snapshot.epoch,
+                    Some(old_state),
+                    NodeState::Live,
+                    NodeEventType::HeartbeatResumed,
+                    now,
+                )
+            {
+                info!(
+                    "Node {} heartbeat resumed {:?} -> Live epoch {}",
+                    node_snapshot.base.node_id, old_state, node_snapshot.epoch
+                );
+            } else if critical_changed {
+                info!(
+                    "Node {} heartbeat committed critical payload update epoch {} state {:?}",
+                    node_snapshot.base.node_id, node_snapshot.epoch, old_state
+                );
             }
+        } else if need_checkpoint {
+            let entry = HeartbeatCheckpointEntry {
+                op_ms: now,
+                node_id: node_snapshot.base.node_id,
+                expected_epoch: node_snapshot.epoch,
+                expected_state: Some(node_snapshot.state),
+                last_heartbeat_ms: now,
+            };
+            self.journal_client
+                .propose_as_leader(PdEntry::HeartbeatCheckpoint(entry))?;
         }
+
+        let latest = self.get_node(req.node_id).unwrap_or(node_snapshot.clone());
+        let response_payload = handler.build_heartbeat_response(&latest, &req)?;
 
         Ok(HeartbeatResponse {
             error: None,
-            epoch: node_snapshot.epoch,
+            epoch: latest.epoch,
             mount_version: 0,
             table_epochs: Default::default(),
             payload: response_payload,
@@ -234,61 +329,208 @@ impl NodeManager {
         let mut node = entry.info.clone();
         node.last_persist_ms = entry.op_ms;
 
-        self.store.put(&node)?;
         let mut index = self.index.write().unwrap();
-        index.insert(node);
+        if let Some(existing) = index.get_by_id(node.base.node_id) {
+            if node.epoch != existing.epoch.saturating_add(1) {
+                warn!(
+                    "stale/non-contiguous RegisterNode node_id={}, entry_epoch={}, current_epoch={}, current_state={:?}; skip",
+                    node.base.node_id, node.epoch, existing.epoch, existing.state
+                );
+                return Ok(());
+            }
+            if !matches!(existing.state, NodeState::Lost | NodeState::Offline) {
+                warn!(
+                    "RegisterNode rejected by current state node_id={}, entry_epoch={}, current_epoch={}, current_state={:?}; skip",
+                    node.base.node_id, node.epoch, existing.epoch, existing.state
+                );
+                return Ok(());
+            }
+        } else if node.epoch == 0 {
+            warn!(
+                "RegisterNode for missing node with invalid epoch=0 node_id={}; skip",
+                node.base.node_id
+            );
+            return Ok(());
+        } else if node.epoch > 1 {
+            warn!(
+                "RegisterNode for missing node with epoch>1 node_id={}, entry_epoch={}; accept for Raft replay/snapshot recovery",
+                node.base.node_id, node.epoch
+            );
+        }
+
+        self.store.put(&node)?;
+        index.insert(node.clone());
+        info!(
+            "RegisterNode applied node_id={}, epoch={}, state={:?}",
+            node.base.node_id, node.epoch, node.state
+        );
         Ok(())
     }
 
-    /// Apply SaveNode entry from Raft — persists full NodeInfo.
+    /// Apply legacy SaveNode entry from Raft — persists full NodeInfo.
     pub fn apply_save_node(&self, entry: &NodeEntry) -> FsResult<()> {
-        self.store.put(&entry.info)?;
         let mut index = self.index.write().unwrap();
+        let Some(existing) = index.get_by_id(entry.info.base.node_id).cloned() else {
+            warn!(
+                "legacy SaveNode for unknown/deleted node_id={}, epoch={}, state={:?}; skip",
+                entry.info.base.node_id, entry.info.epoch, entry.info.state
+            );
+            return Ok(());
+        };
+        if entry.info.epoch <= existing.epoch {
+            warn!(
+                "legacy SaveNode stale/non-newer node_id={}, entry_epoch={}, current_epoch={}; skip",
+                entry.info.base.node_id, entry.info.epoch, existing.epoch
+            );
+            return Ok(());
+        }
+
         let mut updated = entry.info.clone();
-        let old_state = index.get_by_id(entry.info.base.node_id).map(|n| n.state);
-        if let Some(existing) = index.get_by_id(entry.info.base.node_id) {
-            updated.preserve_memory_fields(existing);
+        updated.preserve_memory_fields(&existing);
+        updated.last_persist_ms = entry.op_ms;
+        self.store.put(&updated)?;
+        index.insert(updated.clone());
+        info!(
+            "legacy SaveNode applied node_id={}, epoch={}, state={:?}",
+            updated.base.node_id, updated.epoch, updated.state
+        );
+        Ok(())
+    }
+
+    pub fn apply_update_node_state(&self, entry: &UpdateNodeStateEntry) -> FsResult<()> {
+        let mut index = self.index.write().unwrap();
+        let Some(existing) = index.get_by_id(entry.node_id).cloned() else {
+            warn!(
+                "UpdateNodeState for unknown node_id={}, expected_epoch={}, target_state={:?}; skip",
+                entry.node_id, entry.expected_epoch, entry.new_state
+            );
+            return Ok(());
+        };
+        if existing.epoch != entry.expected_epoch {
+            warn!(
+                "stale UpdateNodeState epoch node_id={}, expected_epoch={}, current_epoch={}, current_state={:?}, target_state={:?}; skip",
+                entry.node_id, entry.expected_epoch, existing.epoch, existing.state, entry.new_state
+            );
+            return Ok(());
+        }
+        if let Some(expected_state) = entry.expected_state {
+            if existing.state != expected_state {
+                warn!(
+                    "stale UpdateNodeState state node_id={}, expected_state={:?}, current_state={:?}, epoch={}, target_state={:?}; skip",
+                    entry.node_id, expected_state, existing.state, existing.epoch, entry.new_state
+                );
+                return Ok(());
+            }
+        }
+        if !Self::is_valid_state_transition(existing.state, entry.new_state) {
+            warn!(
+                "invalid UpdateNodeState transition node_id={}, current_state={:?}, target_state={:?}, epoch={}; skip",
+                entry.node_id, existing.state, entry.new_state, existing.epoch
+            );
+            return Ok(());
+        }
+
+        let mut updated = existing.clone();
+        updated.state = entry.new_state;
+        updated.state_since_ms = entry.state_since_ms;
+        if let Some(ms) = entry.last_heartbeat_ms {
+            updated.last_heartbeat_ms = ms;
+        }
+        if let Some(NodePayloadUpdate::Replace(payload)) = &entry.payload_update {
+            if !Self::payload_matches_node_type(payload, existing.base.node_type) {
+                warn!(
+                    "UpdateNodeState payload type mismatch node_id={}, node_type={:?}; skip",
+                    entry.node_id, existing.base.node_type
+                );
+                return Ok(());
+            }
+            updated.payload = payload.clone();
+            Self::preserve_runtime_fields(&mut updated, &existing);
         }
         updated.last_persist_ms = entry.op_ms;
-        index.insert(updated);
-        drop(index);
-
-        // Emit event on state change
-        let new_state = entry.info.state;
-        if old_state.is_some() && old_state != Some(new_state) {
-            let event_type = match new_state {
-                NodeState::Offline => NodeEventType::Offline,
-                NodeState::Decommission => NodeEventType::DecommissionStarted,
-                NodeState::Live => NodeEventType::HeartbeatResumed,
-                NodeState::Lost => NodeEventType::Lost,
-                _ => return Ok(()),
-            };
-            self.emit_event(NodeEvent {
-                event_type,
-                node_id: entry.info.base.node_id,
-                node_type: entry.info.base.node_type,
-                old_state,
-                new_state: Some(new_state),
-                epoch: entry.info.epoch,
-                event_time_ms: entry.op_ms,
-            });
-        }
+        self.store.put(&updated)?;
+        index.insert(updated.clone());
+        info!(
+            "UpdateNodeState applied node_id={}, epoch={}, {:?}->{:?}",
+            entry.node_id, entry.expected_epoch, existing.state, entry.new_state
+        );
         Ok(())
     }
 
-    /// Persist the current in-memory state of a node to Raft.
+    pub fn apply_batch_update_node_state(&self, entry: &BatchUpdateNodeStateEntry) -> FsResult<()> {
+        for update in &entry.entries {
+            self.apply_update_node_state(update)?;
+        }
+        info!(
+            "BatchUpdateNodeState applied entries={}",
+            entry.entries.len()
+        );
+        Ok(())
+    }
+
+    pub fn apply_heartbeat_checkpoint(&self, entry: &HeartbeatCheckpointEntry) -> FsResult<()> {
+        let mut index = self.index.write().unwrap();
+        let Some(existing) = index.get_by_id(entry.node_id).cloned() else {
+            warn!(
+                "HeartbeatCheckpoint for unknown node_id={}, expected_epoch={}; skip",
+                entry.node_id, entry.expected_epoch
+            );
+            return Ok(());
+        };
+        if existing.epoch != entry.expected_epoch {
+            warn!(
+                "stale HeartbeatCheckpoint node_id={}, expected_epoch={}, current_epoch={}; skip",
+                entry.node_id, entry.expected_epoch, existing.epoch
+            );
+            return Ok(());
+        }
+        if let Some(expected_state) = entry.expected_state {
+            if existing.state != expected_state {
+                warn!(
+                    "stale HeartbeatCheckpoint state node_id={}, expected_state={:?}, current_state={:?}, epoch={}; skip",
+                    entry.node_id, expected_state, existing.state, existing.epoch
+                );
+                return Ok(());
+            }
+        }
+        if !matches!(existing.state, NodeState::Starting | NodeState::Live) {
+            warn!(
+                "HeartbeatCheckpoint for non-live node_id={}, state={:?}, epoch={}; skip",
+                entry.node_id, existing.state, existing.epoch
+            );
+            return Ok(());
+        }
+        let mut updated = existing.clone();
+        updated.last_heartbeat_ms = entry.last_heartbeat_ms;
+        updated.last_persist_ms = entry.op_ms;
+        self.store.put(&updated)?;
+        index.insert(updated);
+        Ok(())
+    }
+
+    /// Persist the current heartbeat timestamp checkpoint via Raft.
     pub fn persist_node(&self, node_id: u32) -> FsResult<()> {
         let node = {
             let index = self.index.read().unwrap();
             index.get_by_id(node_id).cloned()
         };
         let Some(node) = node else { return Ok(()) };
+        if !matches!(node.state, NodeState::Starting | NodeState::Live) {
+            warn!(
+                "skip HeartbeatCheckpoint for non-live node_id={}, state={:?}, epoch={}",
+                node_id, node.state, node.epoch
+            );
+            return Ok(());
+        }
         let now = LocalTime::mills();
-        let entry = NodeEntry {
-            op_ms: now,
-            info: node,
-        };
-        self.journal_client.propose(PdEntry::SaveNode(entry))
+        self.journal_client
+            .propose_as_leader(PdEntry::HeartbeatCheckpoint(HeartbeatCheckpointEntry {
+                op_ms: now,
+                node_id,
+                expected_epoch: node.epoch,
+                expected_state: Some(node.state),
+                last_heartbeat_ms: node.last_heartbeat_ms,
+            }))
     }
 
     /// Start decommissioning a node.
@@ -297,46 +539,50 @@ impl NodeManager {
             .get_node(node_id)
             .ok_or_else(|| FsError::common(format!("node {} not found", node_id)))?;
 
-        let mut updated = node.clone();
-        updated.state = NodeState::Decommission;
+        if node.state == NodeState::Decommission {
+            return Ok(NodeState::Decommission);
+        }
+        if matches!(node.state, NodeState::Blacklist) {
+            return Err(FsError::common(format!(
+                "node {} is {:?}, cannot decommission",
+                node_id, node.state
+            )));
+        }
+
         let now = LocalTime::mills();
-        self.journal_client.propose(PdEntry::SaveNode(NodeEntry {
-            op_ms: now,
-            info: updated,
-        }))?;
+        self.journal_client
+            .propose_as_leader(PdEntry::UpdateNodeState(UpdateNodeStateEntry {
+                op_ms: now,
+                node_id,
+                expected_epoch: node.epoch,
+                expected_state: Some(node.state),
+                new_state: NodeState::Decommission,
+                state_since_ms: now,
+                last_heartbeat_ms: None,
+                payload_update: None,
+            }))?;
+
+        if self.emit_state_event_if_current(
+            node_id,
+            node.epoch,
+            Some(node.state),
+            NodeState::Decommission,
+            NodeEventType::DecommissionStarted,
+            now,
+        ) {
+            info!(
+                "Node {} decommission started {:?} -> Decommission epoch {}",
+                node_id, node.state, node.epoch
+            );
+        }
         Ok(NodeState::Decommission)
     }
 
-    /// Update state in-memory and emit the corresponding event. Does NOT persist.
+    /// Deprecated: strong semantic state changes must go through Raft.
+    #[cfg(test)]
     pub fn update_state(&self, node_id: u32, new_state: NodeState) {
-        let old_info = {
-            let mut index = self.index.write().unwrap();
-            let old_info = index
-                .get_by_id(node_id)
-                .map(|n| (n.state, n.base.node_type, n.epoch));
-            index.update_state(node_id, new_state);
-            old_info
-        };
-        if let Some((old_state, node_type, epoch)) = old_info {
-            if old_state != new_state {
-                let event_type = match new_state {
-                    NodeState::Offline => NodeEventType::Offline,
-                    NodeState::Decommission => NodeEventType::DecommissionStarted,
-                    NodeState::Live => NodeEventType::HeartbeatResumed,
-                    NodeState::Lost => NodeEventType::Lost,
-                    _ => return,
-                };
-                self.emit_event(NodeEvent {
-                    event_type,
-                    node_id,
-                    node_type,
-                    old_state: Some(old_state),
-                    new_state: Some(new_state),
-                    epoch,
-                    event_time_ms: orpc::common::LocalTime::mills(),
-                });
-            }
-        }
+        let mut index = self.index.write().unwrap();
+        index.update_state(node_id, new_state);
     }
 
     /// Restore in-memory index from store (call on startup).
@@ -368,38 +614,64 @@ impl NodeManager {
     }
 
     /// Detect nodes that have exceeded heartbeat timeout.
-    /// Transitions Live → Lost in-memory and returns the timed-out node IDs.
+    /// Proposes Starting/Live → Lost through Raft and returns successfully transitioned IDs.
     pub fn detect_heartbeat_timeout(&self, now_ms: u64, timeout_ms: u64) -> Vec<u32> {
-        let mut index = self.index.write().unwrap();
-        let all_ids = index.all_node_ids();
-        let mut timeout_nodes = Vec::new();
-        for node_id in all_ids {
-            let timeout_info = index.get_by_id(node_id).and_then(|n| {
-                if n.state == NodeState::Live
-                    && n.last_heartbeat_ms > 0
-                    && now_ms.saturating_sub(n.last_heartbeat_ms) > timeout_ms
-                {
-                    Some(n.base.node_type)
-                } else {
-                    None
+        let timed_out: Vec<NodeInfo> = {
+            let index = self.index.read().unwrap();
+            index
+                .all_node_ids()
+                .into_iter()
+                .filter_map(|node_id| index.get_by_id(node_id).cloned())
+                .filter(|n| {
+                    matches!(n.state, NodeState::Starting | NodeState::Live)
+                        && n.last_heartbeat_ms > 0
+                        && now_ms.saturating_sub(n.last_heartbeat_ms) > timeout_ms
+                })
+                .collect()
+        };
+
+        let mut changed = Vec::new();
+        for chunk in timed_out.chunks(MAX_BATCH_UPDATE_NODE_STATE) {
+            let entries: Vec<UpdateNodeStateEntry> = chunk
+                .iter()
+                .map(|node| UpdateNodeStateEntry {
+                    op_ms: now_ms,
+                    node_id: node.base.node_id,
+                    expected_epoch: node.epoch,
+                    expected_state: Some(node.state),
+                    new_state: NodeState::Lost,
+                    state_since_ms: now_ms,
+                    last_heartbeat_ms: None,
+                    payload_update: None,
+                })
+                .collect();
+            if let Err(e) = self.journal_client.propose_as_leader(PdEntry::BatchUpdateNodeState(
+                BatchUpdateNodeStateEntry {
+                    op_ms: now_ms,
+                    entries,
+                },
+            )) {
+                warn!(
+                    "propose timeout BatchUpdateNodeState failed batch_size={}, err={}",
+                    chunk.len(),
+                    e
+                );
+                continue;
+            }
+            for node in chunk {
+                if self.emit_state_event_if_current(
+                    node.base.node_id,
+                    node.epoch,
+                    Some(node.state),
+                    NodeState::Lost,
+                    NodeEventType::Lost,
+                    now_ms,
+                ) {
+                    changed.push(node.base.node_id);
                 }
-            });
-            if let Some(node_type) = timeout_info {
-                index.update_state(node_id, NodeState::Lost);
-                timeout_nodes.push(node_id);
-                let epoch = index.get_by_id(node_id).map(|n| n.epoch).unwrap_or(0);
-                self.emit_event(NodeEvent {
-                    event_type: NodeEventType::Lost,
-                    node_id,
-                    node_type,
-                    old_state: Some(NodeState::Live),
-                    new_state: Some(NodeState::Lost),
-                    epoch,
-                    event_time_ms: now_ms,
-                });
             }
         }
-        timeout_nodes
+        changed
     }
 
     fn heartbeat_timeout_ms(&self) -> u64 {
@@ -435,6 +707,7 @@ impl NodeManager {
     }
 
     async fn liveness_loop(&self, token: tokio_util::sync::CancellationToken) {
+        let leader_start_ms = LocalTime::mills();
         loop {
             let check_interval = self.liveness_check_interval_ms();
             tokio::select! {
@@ -444,34 +717,179 @@ impl NodeManager {
 
             let now = LocalTime::mills();
 
-            // 1. Detect heartbeat timeouts: Live→Lost
+            // Grace period after leader switch; persisted heartbeat checkpoints may lag.
             let timeout = self.heartbeat_timeout_ms();
-            for &node_id in &self.detect_heartbeat_timeout(now, timeout) {
-                log::warn!("Node {} marked Lost (heartbeat timeout)", node_id);
+            if now.saturating_sub(leader_start_ms) > timeout {
+                for &node_id in &self.detect_heartbeat_timeout(now, timeout) {
+                    log::warn!("Node {} marked Lost (heartbeat timeout)", node_id);
+                }
             }
 
-            // 2. Promote Lost→Offline after recovery window
             let recovery_window = self.recovery_window_ms();
-            let to_offline: Vec<u32> = self
+            let to_offline: Vec<NodeInfo> = self
                 .get_nodes_by_state(NodeState::Lost)
                 .into_iter()
                 .filter(|n| now.saturating_sub(n.state_since_ms) > recovery_window)
-                .map(|n| n.base.node_id)
                 .collect();
 
-            for node_id in to_offline {
+            for chunk in to_offline.chunks(MAX_BATCH_UPDATE_NODE_STATE) {
+                let entries: Vec<UpdateNodeStateEntry> = chunk
+                    .iter()
+                    .map(|node| UpdateNodeStateEntry {
+                        op_ms: now,
+                        node_id: node.base.node_id,
+                        expected_epoch: node.epoch,
+                        expected_state: Some(NodeState::Lost),
+                        new_state: NodeState::Offline,
+                        state_since_ms: now,
+                        last_heartbeat_ms: None,
+                        payload_update: None,
+                    })
+                    .collect();
                 log::error!(
-                    "Node {} exceeded recovery window ({}ms), promoting to Offline",
-                    node_id,
+                    "{} Lost nodes exceeded recovery window ({}ms), promoting to Offline",
+                    entries.len(),
                     recovery_window
                 );
-                self.update_state(node_id, NodeState::Offline);
+                if let Err(e) = self.journal_client.propose_as_leader(PdEntry::BatchUpdateNodeState(
+                    BatchUpdateNodeStateEntry {
+                        op_ms: now,
+                        entries,
+                    },
+                )) {
+                    warn!(
+                        "propose Lost->Offline BatchUpdateNodeState failed batch_size={}, err={}",
+                        chunk.len(),
+                        e
+                    );
+                    continue;
+                }
+                for node in chunk {
+                    self.emit_state_event_if_current(
+                        node.base.node_id,
+                        node.epoch,
+                        Some(NodeState::Lost),
+                        NodeState::Offline,
+                        NodeEventType::Offline,
+                        now,
+                    );
+                }
             }
         }
         log::info!("Liveness loop stopped");
     }
 
-    /// Finish decommission: emit event and propose DeleteNode via Raft.
+    fn register_apply_matches(
+        applied: &NodeInfo,
+        expected: &NodeInfo,
+        expected_epoch: u64,
+    ) -> bool {
+        applied.epoch == expected_epoch
+            && applied.state == expected.state
+            && applied.base.node_id == expected.base.node_id
+            && applied.base.node_type == expected.base.node_type
+            && applied.base.address == expected.base.address
+            && applied.base.startup_time_ms == expected.base.startup_time_ms
+    }
+
+    fn payload_matches_node_type(payload: &NodePayload, node_type: NodeType) -> bool {
+        matches!(
+            (payload, node_type),
+            (NodePayload::Worker(_), NodeType::Worker) | (NodePayload::Meta(_), NodeType::Meta)
+        )
+    }
+
+    fn preserve_runtime_fields(target: &mut NodeInfo, source: &NodeInfo) {
+        target.sys_stats = source.sys_stats.clone();
+        match (&mut target.payload, &source.payload) {
+            (NodePayload::Worker(ref mut dst), NodePayload::Worker(ref src)) => {
+                dst.storage_stats = src.storage_stats.clone();
+                dst.bg_epochs = src.bg_epochs.clone();
+                dst.bg_reports = src.bg_reports.clone();
+            }
+            (NodePayload::Meta(ref mut dst), NodePayload::Meta(ref src)) => {
+                dst.stats = src.stats.clone();
+            }
+            _ => {}
+        }
+    }
+
+    fn restore_persistent_payload_fields(current: &mut NodePayload, persisted: &NodePayload) {
+        match (current, persisted) {
+            (NodePayload::Worker(cur), NodePayload::Worker(old)) => {
+                cur.storage_specs = old.storage_specs.clone();
+            }
+            (NodePayload::Meta(cur), NodePayload::Meta(old)) => {
+                cur.group_id = old.group_id;
+                cur.peers = old.peers.clone();
+                cur.rw_policy = old.rw_policy;
+                cur.group_epoch = old.group_epoch;
+            }
+            (cur, old) => {
+                *cur = old.clone();
+            }
+        }
+    }
+
+    fn is_valid_state_transition(from: NodeState, to: NodeState) -> bool {
+        if from == to {
+            return true;
+        }
+        matches!(
+            (from, to),
+            (NodeState::Starting, NodeState::Live)
+                | (NodeState::Starting, NodeState::Lost)
+                | (NodeState::Live, NodeState::Lost)
+                | (NodeState::Lost, NodeState::Live)
+                | (NodeState::Lost, NodeState::Offline)
+                | (NodeState::Starting, NodeState::Decommission)
+                | (NodeState::Live, NodeState::Decommission)
+                | (NodeState::Lost, NodeState::Decommission)
+                | (NodeState::Offline, NodeState::Decommission)
+                | (NodeState::Starting, NodeState::Blacklist)
+                | (NodeState::Live, NodeState::Blacklist)
+                | (NodeState::Lost, NodeState::Blacklist)
+                | (NodeState::Offline, NodeState::Blacklist)
+                | (NodeState::Decommission, NodeState::Blacklist)
+        )
+    }
+
+    fn emit_state_event_if_current(
+        &self,
+        node_id: u32,
+        expected_epoch: u64,
+        old_state: Option<NodeState>,
+        new_state: NodeState,
+        event_type: NodeEventType,
+        event_time_ms: u64,
+    ) -> bool {
+        let Some(current) = self.get_node(node_id) else {
+            warn!(
+                "skip {:?} event for missing node_id={}, expected_epoch={}, target_state={:?}",
+                event_type, node_id, expected_epoch, new_state
+            );
+            return false;
+        };
+        if current.epoch != expected_epoch || current.state != new_state {
+            warn!(
+                "skip {:?} event due to fencing node_id={}, expected_epoch={}, current_epoch={}, current_state={:?}, target_state={:?}",
+                event_type, node_id, expected_epoch, current.epoch, current.state, new_state
+            );
+            return false;
+        }
+        self.emit_event(NodeEvent {
+            event_type,
+            node_id,
+            node_type: current.base.node_type,
+            old_state,
+            new_state: Some(new_state),
+            epoch: current.epoch,
+            event_time_ms,
+        });
+        true
+    }
+
+    /// Finish decommission: propose DeleteNode via Raft and emit after apply.
     pub fn finish_decommission(&self, node_id: u32) -> FsResult<()> {
         let node = self
             .get_node(node_id)
@@ -484,29 +902,75 @@ impl NodeManager {
             )));
         }
 
+        let now = LocalTime::mills();
         log::info!(
             "Node {} decommission complete, deleting from cluster",
             node_id
         );
 
-        self.emit_event(NodeEvent {
-            event_type: NodeEventType::DecommissionFinished,
-            node_id,
-            node_type: node.base.node_type,
-            old_state: Some(NodeState::Decommission),
-            new_state: None,
-            epoch: node.epoch,
-            event_time_ms: LocalTime::mills(),
-        });
+        self.journal_client
+            .propose_as_leader(PdEntry::DeleteNode(DeleteNodeEntry {
+                op_ms: now,
+                node_id,
+                expected_epoch: node.epoch,
+                expected_state: Some(NodeState::Decommission),
+            }))?;
 
-        self.journal_client.propose(PdEntry::DeleteNode(node_id))
+        if self.get_node(node_id).is_none() {
+            self.emit_event(NodeEvent {
+                event_type: NodeEventType::DecommissionFinished,
+                node_id,
+                node_type: node.base.node_type,
+                old_state: Some(NodeState::Decommission),
+                new_state: None,
+                epoch: node.epoch,
+                event_time_ms: now,
+            });
+            info!(
+                "Node {} decommission finished epoch {}",
+                node_id, node.epoch
+            );
+        } else {
+            warn!(
+                "DeleteNode propose returned but node still exists node_id={}, epoch={}; skip DecommissionFinished event",
+                node_id, node.epoch
+            );
+        }
+        Ok(())
     }
 
     /// Apply DeleteNode entry from Raft — remove from store and in-memory index.
-    pub fn apply_delete_node(&self, node_id: u32) -> FsResult<()> {
-        self.store.delete(node_id)?;
+    pub fn apply_delete_node(&self, entry: &DeleteNodeEntry) -> FsResult<()> {
         let mut index = self.index.write().unwrap();
-        index.remove(node_id);
+        let Some(existing) = index.get_by_id(entry.node_id).cloned() else {
+            warn!(
+                "DeleteNode for missing node_id={}, expected_epoch={}; skip",
+                entry.node_id, entry.expected_epoch
+            );
+            return Ok(());
+        };
+        if existing.epoch != entry.expected_epoch {
+            warn!(
+                "stale DeleteNode epoch node_id={}, expected_epoch={}, current_epoch={}; skip",
+                entry.node_id, entry.expected_epoch, existing.epoch
+            );
+            return Ok(());
+        }
+        if let Some(expected_state) = entry.expected_state {
+            if existing.state != expected_state {
+                warn!(
+                    "DeleteNode rejected node_id={}, expected_state={:?}, current_state={:?}, epoch={}; skip",
+                    entry.node_id, expected_state, existing.state, existing.epoch
+                );
+                return Ok(());
+            }
+        }
+        self.store.delete(entry.node_id)?;
+        index.remove(entry.node_id);
+        info!(
+            "DeleteNode applied node_id={}, epoch={}, old_state={:?}",
+            entry.node_id, existing.epoch, existing.state
+        );
         Ok(())
     }
 }
@@ -660,8 +1124,17 @@ mod tests {
         node.last_heartbeat_ms = 1000;
         insert_node(&mgr, &node);
 
-        let timed_out = mgr.detect_heartbeat_timeout(20_000, 5_000);
-        assert_eq!(timed_out, vec![1]);
+        mgr.apply_update_node_state(&UpdateNodeStateEntry {
+            op_ms: 20_000,
+            node_id: 1,
+            expected_epoch: 1,
+            expected_state: Some(NodeState::Live),
+            new_state: NodeState::Lost,
+            state_since_ms: 20_000,
+            last_heartbeat_ms: None,
+            payload_update: None,
+        })
+        .unwrap();
 
         let updated = mgr.get_node(1).unwrap();
         assert_eq!(updated.state, NodeState::Lost);
@@ -691,9 +1164,25 @@ mod tests {
         // Subscribe before the state change so we capture the event.
         let mut rx = mgr.subscribe();
 
-        // detect_heartbeat_timeout transitions Live -> Lost and emits an event
-        let timed_out = mgr.detect_heartbeat_timeout(20_000, 5_000);
-        assert_eq!(timed_out, vec![1]);
+        mgr.apply_update_node_state(&UpdateNodeStateEntry {
+            op_ms: 20_000,
+            node_id: 1,
+            expected_epoch: 1,
+            expected_state: Some(NodeState::Live),
+            new_state: NodeState::Lost,
+            state_since_ms: 20_000,
+            last_heartbeat_ms: None,
+            payload_update: None,
+        })
+        .unwrap();
+        assert!(mgr.emit_state_event_if_current(
+            1,
+            1,
+            Some(NodeState::Live),
+            NodeState::Lost,
+            NodeEventType::Lost,
+            20_000,
+        ));
 
         let event = rx.try_recv().expect("should have received an event");
         assert_eq!(event.event_type, NodeEventType::Lost);
@@ -701,6 +1190,151 @@ mod tests {
         assert_eq!(event.node_type, NodeType::Worker);
         assert_eq!(event.old_state, Some(NodeState::Live));
         assert_eq!(event.new_state, Some(NodeState::Lost));
+    }
+
+    #[test]
+    fn apply_update_node_state_rejects_stale_epoch() {
+        let mgr = test_manager();
+        let mut node = make_node(1, NodeType::Worker, NodeState::Live);
+        node.epoch = 2;
+        insert_node(&mgr, &node);
+
+        mgr.apply_update_node_state(&UpdateNodeStateEntry {
+            op_ms: 20_000,
+            node_id: 1,
+            expected_epoch: 1,
+            expected_state: Some(NodeState::Live),
+            new_state: NodeState::Lost,
+            state_since_ms: 20_000,
+            last_heartbeat_ms: None,
+            payload_update: None,
+        })
+        .unwrap();
+
+        let updated = mgr.get_node(1).unwrap();
+        assert_eq!(updated.epoch, 2);
+        assert_eq!(updated.state, NodeState::Live);
+    }
+
+    #[test]
+    fn apply_heartbeat_checkpoint_rejects_stale_epoch() {
+        let mgr = test_manager();
+        let mut node = make_node(1, NodeType::Worker, NodeState::Live);
+        node.epoch = 2;
+        node.last_heartbeat_ms = 10;
+        insert_node(&mgr, &node);
+
+        mgr.apply_heartbeat_checkpoint(&HeartbeatCheckpointEntry {
+            op_ms: 20_000,
+            node_id: 1,
+            expected_epoch: 1,
+            expected_state: Some(NodeState::Live),
+            last_heartbeat_ms: 999,
+        })
+        .unwrap();
+
+        let updated = mgr.get_node(1).unwrap();
+        assert_eq!(updated.epoch, 2);
+        assert_eq!(updated.last_heartbeat_ms, 10);
+    }
+
+    #[test]
+    fn apply_delete_node_rejects_stale_epoch() {
+        let mgr = test_manager();
+        let mut node = make_node(1, NodeType::Worker, NodeState::Decommission);
+        node.epoch = 2;
+        insert_node(&mgr, &node);
+
+        mgr.apply_delete_node(&DeleteNodeEntry {
+            op_ms: 20_000,
+            node_id: 1,
+            expected_epoch: 1,
+            expected_state: Some(NodeState::Decommission),
+        })
+        .unwrap();
+
+        assert!(mgr.get_node(1).is_some());
+    }
+
+    #[test]
+    fn apply_update_node_state_payload_update_preserves_meta_runtime_stats() {
+        let mgr = test_manager();
+        let mut node = make_node(1, NodeType::Meta, NodeState::Live);
+        if let NodePayload::Meta(ref mut payload) = node.payload {
+            payload.group_id = 10;
+            payload.group_epoch = 1;
+            payload.stats.inode_count = 42;
+        }
+        insert_node(&mgr, &node);
+
+        let mut new_payload = match node.payload.clone() {
+            NodePayload::Meta(payload) => payload,
+            _ => unreachable!(),
+        };
+        new_payload.group_epoch = 2;
+        new_payload.stats.inode_count = 0;
+
+        mgr.apply_update_node_state(&UpdateNodeStateEntry {
+            op_ms: 20_000,
+            node_id: 1,
+            expected_epoch: 1,
+            expected_state: Some(NodeState::Live),
+            new_state: NodeState::Live,
+            state_since_ms: node.state_since_ms,
+            last_heartbeat_ms: Some(20_000),
+            payload_update: Some(NodePayloadUpdate::Replace(NodePayload::Meta(new_payload))),
+        })
+        .unwrap();
+
+        let updated = mgr.get_node(1).unwrap();
+        assert_eq!(updated.state, NodeState::Live);
+        assert_eq!(updated.last_heartbeat_ms, 20_000);
+        match updated.payload {
+            NodePayload::Meta(payload) => {
+                assert_eq!(payload.group_epoch, 2);
+                assert_eq!(payload.stats.inode_count, 42);
+            }
+            _ => panic!("expected meta payload"),
+        }
+    }
+
+    #[test]
+    fn apply_register_allows_missing_meta_with_non_initial_epoch() {
+        let mgr = test_manager();
+        let mut node = make_node(3, NodeType::Meta, NodeState::Starting);
+        node.epoch = 4;
+
+        mgr.apply_register_node(&NodeEntry {
+            op_ms: 20_000,
+            info: node.clone(),
+        })
+        .unwrap();
+
+        let updated = mgr.get_node(3).unwrap();
+        assert_eq!(updated.base.node_id, 3);
+        assert_eq!(updated.base.node_type, NodeType::Meta);
+        assert_eq!(updated.epoch, 4);
+        assert_eq!(updated.state, NodeState::Starting);
+        assert_eq!(updated.last_persist_ms, 20_000);
+    }
+
+    #[test]
+    fn apply_register_rejects_existing_decommission_node() {
+        let mgr = test_manager();
+        let existing = make_node(1, NodeType::Worker, NodeState::Decommission);
+        insert_node(&mgr, &existing);
+
+        let mut replacement = make_node(1, NodeType::Worker, NodeState::Starting);
+        replacement.epoch = 2;
+        mgr.apply_register_node(&NodeEntry {
+            op_ms: 20_000,
+            info: replacement,
+        })
+        .unwrap();
+
+        let updated = mgr.get_node(1).unwrap();
+        assert_eq!(updated.epoch, 1);
+        assert_eq!(updated.state, NodeState::Decommission);
     }
 
     #[test]

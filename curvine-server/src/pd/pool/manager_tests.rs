@@ -49,7 +49,7 @@ fn test_pool_manager() -> PoolManager {
     mgr
 }
 
-/// Seed default pools via apply_save_pool (bypasses Raft for tests).
+/// Seed default pools via test_install_pool (bypasses Raft, manages epochs).
 fn seed_default_pools(mgr: &PoolManager) {
     use curvine_common::state::{PoolInfo, StorageType};
     let defaults = [
@@ -59,11 +59,7 @@ fn seed_default_pools(mgr: &PoolManager) {
     ];
     for (pool_id, name, media) in defaults {
         let info = PoolInfo::new(pool_id, name.to_string(), media);
-        mgr.apply_save_pool(&crate::pd::journal::entry::PoolEntry {
-            op_ms: 0,
-            info,
-        })
-        .unwrap();
+        mgr.test_install_pool(info).unwrap();
     }
 }
 
@@ -72,9 +68,15 @@ fn restore_loads_seeded_pools() {
     let mgr = test_pool_manager();
     mgr.restore().unwrap();
     // Default pools were seeded via apply in test_pool_manager()
-    assert!(mgr.get_pool_by_media(curvine_common::state::StorageType::Mem).is_ok());
-    assert!(mgr.get_pool_by_media(curvine_common::state::StorageType::Ssd).is_ok());
-    assert!(mgr.get_pool_by_media(curvine_common::state::StorageType::Hdd).is_ok());
+    assert!(mgr
+        .get_pool_by_media(curvine_common::state::StorageType::Mem)
+        .is_ok());
+    assert!(mgr
+        .get_pool_by_media(curvine_common::state::StorageType::Ssd)
+        .is_ok());
+    assert!(mgr
+        .get_pool_by_media(curvine_common::state::StorageType::Hdd)
+        .is_ok());
     assert!(mgr.list_active_pools().is_empty());
 }
 
@@ -82,7 +84,9 @@ fn restore_loads_seeded_pools() {
 fn get_pool_by_media_after_restore() {
     let mgr = test_pool_manager();
     mgr.restore().unwrap();
-    let ssd = mgr.get_pool_by_media(curvine_common::state::StorageType::Ssd).unwrap();
+    let ssd = mgr
+        .get_pool_by_media(curvine_common::state::StorageType::Ssd)
+        .unwrap();
     assert_eq!(ssd.name, "ssd_pool");
     assert_eq!(ssd.pool_id, super::POOL_ID_SSD);
 }
@@ -104,11 +108,7 @@ fn assign_worker_to_pools_with_ssd_spec_adds_to_ssd_pool() {
     let pool = mgr.get_pool(super::POOL_ID_SSD).unwrap();
     let mut updated = pool.clone();
     updated.workers.insert(100);
-    mgr.apply_save_pool(&crate::pd::journal::entry::PoolEntry {
-        op_ms: 1,
-        info: updated,
-    })
-    .unwrap();
+    mgr.test_install_pool(updated).unwrap();
 
     let pool = mgr.get_pool(super::POOL_ID_SSD).unwrap();
     assert!(pool.workers.contains(&100));
@@ -135,11 +135,7 @@ fn remove_worker_from_pools() {
     let pool = mgr.get_pool(super::POOL_ID_SSD).unwrap();
     let mut updated = pool.clone();
     updated.workers.insert(300);
-    mgr.apply_save_pool(&crate::pd::journal::entry::PoolEntry {
-        op_ms: 1,
-        info: updated,
-    })
-    .unwrap();
+    mgr.test_install_pool(updated).unwrap();
 
     let pool = mgr.get_pool(super::POOL_ID_SSD).unwrap();
     assert!(pool.workers.contains(&300));
@@ -147,11 +143,7 @@ fn remove_worker_from_pools() {
     // Simulate remove via apply
     let mut updated = pool.clone();
     updated.workers.remove(&300);
-    mgr.apply_save_pool(&crate::pd::journal::entry::PoolEntry {
-        op_ms: 2,
-        info: updated,
-    })
-    .unwrap();
+    mgr.test_install_pool(updated).unwrap();
 
     let pool = mgr.get_pool(super::POOL_ID_SSD).unwrap();
     assert!(!pool.workers.contains(&300));
@@ -178,11 +170,7 @@ fn restore_rebuilds_worker_to_pools_from_store_only() {
     let pool = mgr1.get_pool(super::POOL_ID_SSD).unwrap();
     let mut updated = pool.clone();
     updated.workers.insert(100);
-    mgr1.apply_save_pool(&crate::pd::journal::entry::PoolEntry {
-        op_ms: 1,
-        info: updated,
-    })
-    .unwrap();
+    mgr1.test_install_pool(updated).unwrap();
 
     // Create fresh manager with same backing store and restore
     let pool_store2 = Arc::new(PoolStore::new(store));
@@ -216,4 +204,191 @@ fn update_pool_stats() {
     let pool = mgr.get_pool(super::POOL_ID_SSD).unwrap();
     assert_eq!(pool.stats.capacity_bytes, 2000);
     assert_eq!(pool.stats.available_bytes, 1000);
+}
+
+fn worker_node_with_storage(
+    id: u32,
+    state: curvine_common::state::NodeState,
+    storage_type: curvine_common::state::StorageType,
+) -> curvine_common::state::NodeInfo {
+    use curvine_common::state::{
+        NodeAddress, NodeBase, NodeInfo, NodePayload, NodeType, StorageSpec, WorkerNodePayload,
+    };
+    let mut payload = WorkerNodePayload::default();
+    payload.storage_specs.insert(
+        "s0".to_string(),
+        StorageSpec {
+            dir_id: 0,
+            storage_id: "s0".to_string(),
+            failed: false,
+            storage_type,
+            dir_path: "/tmp/s0".to_string(),
+        },
+    );
+    NodeInfo {
+        base: NodeBase {
+            node_id: id,
+            node_type: NodeType::Worker,
+            address: NodeAddress {
+                hostname: format!("w-{}", id),
+                ip: format!("10.0.0.{}", id),
+                rpc_port: 8000 + id as u16,
+                web_port: 9000 + id as u16,
+            },
+            ..Default::default()
+        },
+        state,
+        epoch: 1,
+        payload: NodePayload::Worker(payload),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn reconcile_worker_pool_membership_plan_add_only() {
+    let mgr = test_pool_manager();
+    mgr.restore().unwrap();
+    let worker = worker_node_with_storage(
+        100,
+        curvine_common::state::NodeState::Live,
+        curvine_common::state::StorageType::Ssd,
+    );
+
+    let (updates, changed_pool_ids) = mgr.test_worker_pool_reconcile_updates(&[worker]);
+
+    assert_eq!(changed_pool_ids, vec![super::POOL_ID_SSD]);
+    let ssd = updates
+        .iter()
+        .find(|p| p.pool_id == super::POOL_ID_SSD)
+        .expect("ssd pool update");
+    assert_eq!(ssd.workers, std::collections::HashSet::from([100]));
+}
+
+#[test]
+fn reconcile_worker_pool_membership_plan_remove_only() {
+    let mgr = test_pool_manager();
+    mgr.restore().unwrap();
+    let mut pool = mgr.get_pool(super::POOL_ID_SSD).unwrap();
+    pool.workers.insert(100);
+    mgr.test_install_pool(pool).unwrap();
+
+    let (updates, changed_pool_ids) = mgr.test_worker_pool_reconcile_updates(&[]);
+
+    assert_eq!(changed_pool_ids, vec![super::POOL_ID_SSD]);
+    let ssd = updates
+        .iter()
+        .find(|p| p.pool_id == super::POOL_ID_SSD)
+        .expect("ssd pool update");
+    assert!(ssd.workers.is_empty());
+}
+
+#[test]
+fn reconcile_worker_pool_membership_noop_calls_public_method_without_propose() {
+    let mgr = test_pool_manager();
+    mgr.restore().unwrap();
+
+    let result = mgr.reconcile_worker_pool_membership(&[]).unwrap();
+
+    assert!(result.changed_pool_ids.is_empty());
+}
+
+// =============================================================================
+// REGRESSION tests (originally P0.4 baselines, updated for P1.1 CAS).
+//
+// After P1.1 (expected_epoch CAS in apply_save_pool returning ApplyOutcome),
+// SavePool entries built from a stale snapshot are rejected with SkippedStale.
+// These tests verify the new contract.
+// =============================================================================
+
+/// REGRESSION: full-overwrite SavePool no longer drops concurrent worker
+/// updates — the second entry's expected_epoch fails CAS and SkippedStale
+/// is returned. Path A's mutation survives.
+///
+/// Pre-P1.1 (now removed): both writes Applied, last-writer-wins lost W1+W2.
+#[test]
+fn save_pool_concurrent_writes_second_returns_stale() {
+    use crate::pd::journal::ApplyOutcome;
+    use curvine_common::state::PoolInfo;
+
+    let mgr = test_pool_manager();
+
+    // Snapshot at epoch=0 read by both paths.
+    let snapshot = mgr.get_pool(super::POOL_ID_SSD).unwrap();
+    assert_eq!(snapshot.epoch, 0);
+    assert!(snapshot.workers.is_empty());
+
+    // Path A: build entry adding {W1, W2} with bumped epoch.
+    let mut info_a: PoolInfo = snapshot.clone();
+    info_a.workers.insert(1);
+    info_a.workers.insert(2);
+    info_a.epoch = 1; // proposer bumps from 0 to 1
+    let entry_a = crate::pd::journal::entry::PoolEntry {
+        op_ms: 1,
+        info: info_a,
+        expected_epoch: 0, // proposer's snapshot was epoch=0
+    };
+
+    // Path B: build entry adding {W3} with bumped epoch (also based on 0).
+    let mut info_b: PoolInfo = snapshot.clone();
+    info_b.workers.insert(3);
+    info_b.epoch = 1;
+    let entry_b = crate::pd::journal::entry::PoolEntry {
+        op_ms: 2,
+        info: info_b,
+        expected_epoch: 0,
+    };
+
+    // Apply A first → Applied (epoch advances 0 → 1).
+    let outcome_a = mgr.apply_save_pool(&entry_a).unwrap();
+    assert_eq!(outcome_a, ApplyOutcome::Applied);
+
+    // Apply B → SkippedStale: existing.epoch is now 1, B's expected_epoch is 0.
+    let outcome_b = mgr.apply_save_pool(&entry_b).unwrap();
+    assert!(
+        matches!(outcome_b, ApplyOutcome::SkippedStale { .. }),
+        "expected SkippedStale, got {:?}",
+        outcome_b
+    );
+
+    let final_pool = mgr.get_pool(super::POOL_ID_SSD).unwrap();
+    // Path A's mutation survives; W3 from B is rejected.
+    assert_eq!(
+        final_pool.workers,
+        std::collections::HashSet::from([1, 2]),
+        "expected {{1,2}} (A applied, B SkippedStale)"
+    );
+    assert_eq!(final_pool.epoch, 1);
+}
+
+/// REGRESSION: non-monotonic info.epoch is rejected (defense-in-depth against
+/// malformed entries that pass the expected_epoch check but try to overwrite
+/// with the same or older info.epoch).
+#[test]
+fn save_pool_rejects_non_monotonic_info_epoch() {
+    use crate::pd::journal::ApplyOutcome;
+
+    let mgr = test_pool_manager();
+    let snapshot = mgr.get_pool(super::POOL_ID_SSD).unwrap();
+    assert_eq!(snapshot.epoch, 0);
+
+    // expected_epoch matches but info.epoch == existing.epoch (not +1).
+    let mut info = snapshot.clone();
+    info.workers.insert(99);
+    info.epoch = 0; // BUG: should be 1
+    let entry = crate::pd::journal::entry::PoolEntry {
+        op_ms: 1,
+        info,
+        expected_epoch: 0,
+    };
+    let outcome = mgr.apply_save_pool(&entry).unwrap();
+    assert!(
+        matches!(outcome, ApplyOutcome::SkippedStale { .. }),
+        "expected SkippedStale for non-monotonic, got {:?}",
+        outcome
+    );
+
+    // State unchanged.
+    let pool = mgr.get_pool(super::POOL_ID_SSD).unwrap();
+    assert_eq!(pool.workers, std::collections::HashSet::new());
+    assert_eq!(pool.epoch, 0);
 }

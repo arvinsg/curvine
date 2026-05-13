@@ -14,10 +14,16 @@
 
 use curvine_common::state::{PoolInfo, PoolStats, StorageType};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-/// In-memory index for pools and worker->pools mapping
+/// In-memory index for pools and worker->pools mapping.
+///
+/// PoolInfo is stored behind `Arc` (P5.1) to support zero-clone read paths and
+/// future Clone-on-Write mutations. The current external API still returns
+/// `&PoolInfo` for compatibility; new callers can use `get_pool_arc` for an
+/// owned `Arc` they can share without copying.
 pub struct PoolIndex {
-    pools: HashMap<u16, PoolInfo>,
+    pools: HashMap<u16, Arc<PoolInfo>>,
     by_media: HashMap<StorageType, u16>,
     worker_to_pools: HashMap<u32, HashSet<u16>>,
 }
@@ -56,21 +62,24 @@ impl PoolIndex {
             self.worker_to_pools.entry(w).or_default().insert(pool_id);
         }
         self.by_media.insert(info.media, pool_id);
-        self.pools.insert(pool_id, info);
+        self.pools.insert(pool_id, Arc::new(info));
     }
 
     pub fn get_pool(&self, pool_id: u16) -> Option<&PoolInfo> {
-        self.pools.get(&pool_id)
+        self.pools.get(&pool_id).map(|arc| arc.as_ref())
     }
 
-    pub fn get_pool_mut(&mut self, pool_id: u16) -> Option<&mut PoolInfo> {
-        self.pools.get_mut(&pool_id)
+    /// Owned `Arc<PoolInfo>` for callers that want to share without cloning
+    /// the underlying struct. Cheap clone (Arc bump).
+    pub fn get_pool_arc(&self, pool_id: u16) -> Option<Arc<PoolInfo>> {
+        self.pools.get(&pool_id).cloned()
     }
 
     pub fn get_pool_by_media(&self, media: StorageType) -> Option<&PoolInfo> {
         self.by_media
             .get(&media)
-            .and_then(|&id| self.pools.get(&id))
+            .and_then(|id| self.pools.get(id))
+            .map(|arc| arc.as_ref())
     }
 
     pub fn get_pools_by_worker(&self, worker_id: u32) -> Option<&HashSet<u16>> {
@@ -78,13 +87,13 @@ impl PoolIndex {
     }
 
     pub fn list_pools(&self) -> Vec<&PoolInfo> {
-        self.pools.values().collect()
+        self.pools.values().map(|arc| arc.as_ref()).collect()
     }
 
     /// Add worker to pool; updates pool.workers and worker_to_pools.
     pub fn add_worker_to_pool(&mut self, pool_id: u16, worker_id: u32) {
-        if let Some(pool) = self.pools.get_mut(&pool_id) {
-            pool.workers.insert(worker_id);
+        if let Some(arc) = self.pools.get_mut(&pool_id) {
+            Arc::make_mut(arc).workers.insert(worker_id);
         }
         self.worker_to_pools
             .entry(worker_id)
@@ -96,8 +105,8 @@ impl PoolIndex {
     pub fn remove_worker(&mut self, worker_id: u32) -> Option<HashSet<u16>> {
         let pool_ids = self.worker_to_pools.remove(&worker_id)?;
         for pool_id in &pool_ids {
-            if let Some(pool) = self.pools.get_mut(pool_id) {
-                pool.workers.remove(&worker_id);
+            if let Some(arc) = self.pools.get_mut(pool_id) {
+                Arc::make_mut(arc).workers.remove(&worker_id);
             }
         }
         Some(pool_ids)
@@ -116,8 +125,8 @@ impl PoolIndex {
     }
 
     pub fn update_pool_stats(&mut self, pool_id: u16, stats: PoolStats) {
-        if let Some(pool) = self.pools.get_mut(&pool_id) {
-            pool.stats = stats;
+        if let Some(arc) = self.pools.get_mut(&pool_id) {
+            Arc::make_mut(arc).stats = stats;
         }
     }
 

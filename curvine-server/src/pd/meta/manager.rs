@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::pd::journal::{self, PdEntry};
+use crate::pd::journal::{self, ApplyOutcome, PdEntry};
 use crate::pd::meta::RouteStore;
 use crate::pd::node::NodeManager;
 use curvine_common::state::*;
 use curvine_common::{FsError, FsResult};
 use orpc::common::{LocalTime, Utils};
 use std::sync::Arc;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 /// Manages MetaNode mode, path routing (Federation Static/Hash), and meta node info. Proxy/Shard are not supported.
 pub struct MetaManager {
@@ -30,6 +30,9 @@ pub struct MetaManager {
     node_manager: Arc<NodeManager>,
     store: Arc<RouteStore>,
     journal_client: Arc<journal::Client>,
+    /// P4.1: serializes the two propose entry points (add_route / remove_route)
+    /// so expected_table_version stays fresh between read and propose.
+    write_lock: Mutex<()>,
 }
 
 impl MetaManager {
@@ -49,6 +52,7 @@ impl MetaManager {
             node_manager,
             store,
             journal_client,
+            write_lock: Mutex::new(()),
         }
     }
 
@@ -74,15 +78,34 @@ impl MetaManager {
         Ok(())
     }
 
-    pub fn apply_add_route(&self, entry: &PathRouteEntry) -> FsResult<()> {
+    pub fn apply_add_route(&self, entry: &PathRouteEntry) -> FsResult<ApplyOutcome> {
         if self.mode != MetaNodeMode::Federation
             || self.federation_route_mode != Some(FederationRouteMode::Static)
         {
-            return Ok(());
+            return Ok(ApplyOutcome::Applied);
+        }
+        let mut table = self.path_route_table.write().unwrap();
+        // P4.1 + #7: strict CAS — `expected_table_version` must match exactly.
+        // First-time install: table.version == 0, proposer also reads 0 → match.
+        // Stale legacy entry (expected=0 against table.version=N>0): rejected
+        // as Stale, preventing the version-0 bypass that pre-#7 allowed silent
+        // overwrite by replayed entries.
+        if entry.expected_table_version != table.version {
+            log::warn!(
+                "Apply AddPathRoute skipped: path={} stale, current_table_version={}, \
+                 entry_expected_table_version={}",
+                entry.path,
+                table.version,
+                entry.expected_table_version
+            );
+            return Ok(ApplyOutcome::stale(format!(
+                "table_version mismatch: current={}, expected={}",
+                table.version, entry.expected_table_version
+            )));
         }
         self.store.put_path_route(entry)?;
-        let now = LocalTime::mills();
-        let mut table = self.path_route_table.write().unwrap();
+        let now = entry.update_time_ms;
+        let was_replace = table.routes.iter().any(|r| r.path == entry.path);
         if let Some(existing) = table.routes.iter_mut().find(|r| r.path == entry.path) {
             *existing = entry.clone();
         } else {
@@ -90,15 +113,23 @@ impl MetaManager {
         }
         table.version = table.version.saturating_add(1);
         table.last_update_ms = now;
+        table.invalidate_cache();
         self.store.put_path_route_version(table.version)?;
-        Ok(())
+        log::info!(
+            "Apply AddPathRoute path={}, group_id={}, mode={}, table_version={}",
+            entry.path,
+            entry.group_id,
+            if was_replace { "replace" } else { "insert" },
+            table.version
+        );
+        Ok(ApplyOutcome::Applied)
     }
 
-    pub fn apply_remove_route(&self, path: &str) -> FsResult<()> {
+    pub fn apply_remove_route(&self, path: &str) -> FsResult<ApplyOutcome> {
         if self.mode != MetaNodeMode::Federation
             || self.federation_route_mode != Some(FederationRouteMode::Static)
         {
-            return Ok(());
+            return Ok(ApplyOutcome::Applied);
         }
         self.store.delete_path_route(path)?;
         let now = LocalTime::mills();
@@ -108,9 +139,24 @@ impl MetaManager {
         if table.routes.len() < len_before {
             table.version = table.version.saturating_add(1);
             table.last_update_ms = now;
+            table.invalidate_cache();
             self.store.put_path_route_version(table.version)?;
+            log::info!(
+                "Apply RemovePathRoute path={}, table_version={}",
+                path,
+                table.version
+            );
+            Ok(ApplyOutcome::Applied)
+        } else {
+            log::warn!(
+                "Apply RemovePathRoute skipped: path={} not present in route table",
+                path
+            );
+            Ok(ApplyOutcome::not_found(format!(
+                "path {} not present",
+                path
+            )))
         }
-        Ok(())
     }
 
     pub fn route(&self, path: &str) -> FsResult<u64> {
@@ -160,13 +206,28 @@ impl MetaManager {
                 "add_route only in Federation Static mode".to_string(),
             ));
         }
+        let _g = self.write_lock.lock().unwrap();
         let now = LocalTime::mills();
         if entry.create_time_ms == 0 {
             entry.create_time_ms = now;
         }
         entry.update_time_ms = now;
-        self.journal_client.propose(PdEntry::AddPathRoute(entry))?;
-        Ok(())
+        // P4.1: snapshot table version inside write_lock so concurrent admin
+        // routes don't race past us.
+        entry.expected_table_version = self.path_route_table.read().unwrap().version;
+        let path = entry.path.clone();
+        let outcome = self
+            .journal_client
+            .propose_as_leader_with_result(PdEntry::AddPathRoute(entry))?;
+        match outcome {
+            ApplyOutcome::Applied | ApplyOutcome::SkippedNoop => Ok(()),
+            ApplyOutcome::SkippedStale { reason } => Err(FsError::stale_entry(
+                "add_path_route",
+                path,
+                reason,
+            )),
+            ApplyOutcome::NotFound { reason } => Err(FsError::not_found(reason)),
+        }
     }
 
     pub fn remove_route(&self, path: &str) -> FsResult<()> {
@@ -177,9 +238,19 @@ impl MetaManager {
                 "remove_route only in Federation Static mode".to_string(),
             ));
         }
-        self.journal_client
-            .propose(PdEntry::RemovePathRoute(path.to_string()))?;
-        Ok(())
+        let _g = self.write_lock.lock().unwrap();
+        let outcome = self
+            .journal_client
+            .propose_as_leader_with_result(PdEntry::RemovePathRoute(path.to_string()))?;
+        match outcome {
+            ApplyOutcome::Applied | ApplyOutcome::SkippedNoop => Ok(()),
+            ApplyOutcome::SkippedStale { reason } => Err(FsError::stale_entry(
+                "remove_path_route",
+                path,
+                reason,
+            )),
+            ApplyOutcome::NotFound { reason } => Err(FsError::not_found(reason)),
+        }
     }
 
     // ========== Read accessors ==========
@@ -384,6 +455,7 @@ mod tests {
             group_id: 10,
             create_time_ms: 0,
             update_time_ms: 0,
+            expected_table_version: 0,
         })
         .unwrap();
         mgr.apply_add_route(&PathRouteEntry {
@@ -391,6 +463,7 @@ mod tests {
             group_id: 1,
             create_time_ms: 0,
             update_time_ms: 0,
+            expected_table_version: 1, // #7 strict CAS: table.version=1 after first add
         })
         .unwrap();
         assert_eq!(mgr.route("/user").unwrap(), 1);
@@ -408,5 +481,59 @@ mod tests {
         let mgr = MetaManager::new(MetaNodeMode::Proxy, None, 2, nm, path_store, jc);
         assert!(mgr.route("/any").is_err());
         assert!(mgr.build_client_summary().is_err());
+    }
+
+    /// Regression: trie cache must be invalidated after apply_add_route /
+    /// apply_remove_route. Before the fix, lookup populated the trie on the
+    /// first call and never picked up subsequent route mutations.
+    #[test]
+    fn apply_add_then_route_then_add_picks_up_new_route() {
+        let nm = node_manager_with_meta();
+        let store: Arc<dyn crate::pd::store::KvStore> =
+            Arc::new(crate::pd::store::memory_kv_engine::MemoryKvEngine::new());
+        let path_store = Arc::new(RouteStore::new(store));
+        let jc = make_journal_client();
+        let mgr = MetaManager::new(
+            MetaNodeMode::Federation,
+            Some(FederationRouteMode::Static),
+            2,
+            nm,
+            path_store,
+            jc,
+        );
+
+        // Initial route → first lookup populates trie cache. table.version=0
+        // before, will become 1 after this apply.
+        mgr.apply_add_route(&PathRouteEntry {
+            path: "/data".to_string(),
+            group_id: 1,
+            create_time_ms: 0,
+            update_time_ms: 0,
+            expected_table_version: 0,
+        })
+        .unwrap();
+        assert_eq!(mgr.route("/data").unwrap(), 1);
+
+        // Add a new route AFTER the cache is populated. table.version=1 now,
+        // so the second apply must specify expected_table_version=1 (#7
+        // strict CAS — version-0 bypass removed).
+        mgr.apply_add_route(&PathRouteEntry {
+            path: "/extra".to_string(),
+            group_id: 10,
+            create_time_ms: 0,
+            update_time_ms: 0,
+            expected_table_version: 1,
+        })
+        .unwrap();
+        // Without invalidate_cache, this would return the fallback group (min
+        // group_id = 1), masking the newly added route.
+        assert_eq!(mgr.route("/extra").unwrap(), 10);
+
+        // Remove a route AFTER the cache is populated; lookup must reflect the
+        // removal.
+        mgr.apply_remove_route("/data").unwrap();
+        // Fallback to min group_id (1 from the test harness's meta groups).
+        assert_eq!(mgr.route("/data").unwrap(), 1);
+        assert_eq!(mgr.route("/extra").unwrap(), 10);
     }
 }

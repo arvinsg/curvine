@@ -15,11 +15,11 @@
 mod error;
 pub mod http_handler;
 mod http_response;
+pub mod keys;
 mod manager;
 #[cfg(test)]
 mod manager_tests;
 mod store;
-pub mod keys;
 
 pub use curvine_common::state::ConfigInfo;
 pub use error::ConfigError;

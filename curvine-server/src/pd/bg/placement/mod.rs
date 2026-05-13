@@ -23,11 +23,11 @@ use crate::pd::config::keys;
 
 pub use capacity_policy::CapacityPolicy;
 pub use context::{PlacementContext, WorkerLoadSnapshot};
-pub use planner::{build_table, rebuild_table, BuildTableResult, RebuildTableResult};
 pub(crate) use planner::select_with_fallback;
+pub use planner::{build_table, rebuild_table, BuildTableResult, RebuildTableResult};
 pub use policy::{
-    PlacementPolicy, PolicyState, RebuildOptions, ReplicaDecision, ReplicaReplaceReason,
-    is_bg_gap_sufficient, is_lease_gap_sufficient,
+    is_bg_gap_sufficient, is_lease_gap_sufficient, PlacementPolicy, PolicyState, RebuildOptions,
+    ReplicaDecision, ReplicaReplaceReason,
 };
 pub use quota_policy::QuotaPolicy;
 pub use rule::{

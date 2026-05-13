@@ -16,16 +16,16 @@ pub mod event;
 mod heartbeat;
 mod index;
 mod manager;
+mod meta_handler;
 mod registry;
 mod store;
 mod worker_handler;
-mod meta_handler;
 
 pub use event::{NodeEvent, NodeEventType};
 pub use heartbeat::HeartbeatHandler;
 pub use index::NodeIndex;
 pub use manager::NodeManager;
+pub use meta_handler::MetaHeartbeatHandler;
 pub use registry::HandlerRegistry;
 pub use store::NodeStore;
 pub use worker_handler::WorkerHeartbeatHandler;
-pub use meta_handler::MetaHeartbeatHandler;

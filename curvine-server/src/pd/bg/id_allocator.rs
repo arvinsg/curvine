@@ -92,9 +92,15 @@ impl IdAllocator {
             creates: vec![],
             updates: vec![],
             next_bg_id: Some(new_end),
-            new_table_epoch: None,
+            bump_table_epoch: None,
+            expected_table_absent: false,
         };
-        self.journal_client.propose(PdEntry::BatchBG(entry))?;
+        // Fence: only the current raft leader may extend the BG ID range.
+        // Without this guard, an old leader losing leadership could persist
+        // a new range in memory but fail to commit it via Raft, leaving the
+        // new leader with no record of the consumed IDs.
+        self.journal_client
+            .propose_as_leader(PdEntry::BatchBG(entry))?;
 
         self.range.store(pack(base, new_end), Ordering::SeqCst);
         Ok(())

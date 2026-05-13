@@ -143,6 +143,7 @@ pub mod tests_common {
             vec![3],
             location_labels,
         ));
+        bg_mgr.test_disable_route_publish();
         let operator_controller = Arc::new(
             crate::pd::schedule::operator_controller::OperatorController::new(
                 config.clone(),
@@ -203,10 +204,7 @@ pub mod tests_common {
                 (POOL_ID_HDD, "hdd_pool", StorageType::Hdd),
             ] {
                 ctx.pool_manager
-                    .apply_save_pool(&PoolEntry {
-                        op_ms: 0,
-                        info: PoolInfo::new(pool_id, name.to_string(), media),
-                    })
+                    .test_install_pool(PoolInfo::new(pool_id, name.to_string(), media))
                     .unwrap();
             }
             Self { ctx }
@@ -237,13 +235,7 @@ pub mod tests_common {
             });
             let mut pool = self.ctx.pool_manager.get_pool(pool_id).unwrap();
             pool.workers.insert(worker_id);
-            self.ctx
-                .pool_manager
-                .apply_save_pool(&PoolEntry {
-                    op_ms: 0,
-                    info: pool,
-                })
-                .unwrap();
+            self.ctx.pool_manager.test_install_pool(pool).unwrap();
         }
 
         /// Register multiple workers (no labels).
@@ -323,7 +315,7 @@ pub mod tests_common {
         /// Balance schedulers require serving.len() == replica_set.len() to consider a BG.
         pub fn activate_all_replicas(&self, bg_id: u32) {
             let bg = self.ctx.bg_manager.get_bg(bg_id).expect("bg");
-            for wid in bg.replica_set {
+            for wid in bg.replica_set.iter().copied() {
                 self.ctx
                     .bg_manager
                     .set_replica_state(bg_id, wid, ReplicaState::Active);
@@ -331,11 +323,12 @@ pub mod tests_common {
         }
 
         pub fn set_table_buckets(&self, table_id: u32, bg_ids: &[u32]) {
-            let mut table = self
+            let mut table = (*self
                 .ctx
                 .bg_manager
                 .get_table(table_id)
-                .expect("table must exist");
+                .expect("table must exist"))
+            .clone();
             table.buckets = bg_ids.to_vec();
             table.bucket_count = bg_ids.len() as u32;
             self.ctx.bg_manager.test_insert_table(table);

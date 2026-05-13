@@ -194,11 +194,7 @@ pub fn is_bg_overloaded(ctx: &PlacementContext<'_>, st: &PolicyState, worker_id:
     effective > threshold as i64
 }
 
-pub fn is_lease_overloaded(
-    ctx: &PlacementContext<'_>,
-    st: &PolicyState,
-    worker_id: u32,
-) -> bool {
+pub fn is_lease_overloaded(ctx: &PlacementContext<'_>, st: &PolicyState, worker_id: u32) -> bool {
     let effective = st
         .worker_lease_effective
         .get(&worker_id)

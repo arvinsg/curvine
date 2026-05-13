@@ -13,12 +13,18 @@
 // limitations under the License.
 
 pub mod app_storage;
+pub mod apply_outcome;
 pub mod client;
 pub mod entry;
+pub mod leader;
 
 pub use app_storage::PdAppStorage;
+pub use apply_outcome::ApplyOutcome;
 pub use client::Client;
 pub use entry::{
     BGDeleteEntry, BGEntry, BGUpdateEntry, BatchBGEntry, ConfigEntry, MountEntry, NodeEntry,
     PdEntry, PoolEntry, UnMountEntry,
 };
+pub use leader::{LeaderChecker, RaftLeaderChecker};
+#[cfg(test)]
+pub use leader::AlwaysLeader;

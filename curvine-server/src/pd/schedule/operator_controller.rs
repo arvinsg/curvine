@@ -323,9 +323,13 @@ impl OperatorController {
     }
 
     pub fn tick(&self, now_ms: u64) {
+        // #5: stale check BEFORE execute, so a stale operator is cancelled
+        // before its current step gets pushed through propose. Pre-#5 order
+        // (dispatch → execute → check) wasted one Raft round-trip per stale
+        // op cycle.
         self.dispatch_operator(now_ms);
-        self.execute_steps();
         self.check_progress(now_ms);
+        self.execute_steps();
     }
 
     fn get_step_timeout(&self, step: Option<&OpStep>) -> u64 {
@@ -375,28 +379,84 @@ impl OperatorController {
                 continue;
             }
 
-            // Step completion: is_finish first, then epoch stale check
-            if let Some(step) = op.steps.get(op.current_step) {
-                if let Some(bg) = self.bg_manager.get_bg(op.bg_id) {
-                    if step.is_finish(&bg, &self.bg_manager) {
-                        if step.modifies_bg() {
-                            op.bg_epoch += 1;
-                        }
-                        op.current_step += 1;
-                        op.step_start_time_ms = now_ms;
-                    } else if op.bg_epoch > 0 && bg.bg_epoch != op.bg_epoch {
-                        log::warn!(
-                            "Operator {} for bg {} stale: op_epoch={} bg_epoch={}, cancelling",
-                            op.id,
-                            op.bg_id,
-                            op.bg_epoch,
-                            bg.bg_epoch
-                        );
-                        op.status = OpStatus::Cancelled;
-                        to_remove.push(bg_id);
-                        continue;
-                    }
+            // P2.5: ConfVerChanged-style stale detection (TiKV PD §14.2).
+            // - delta = bg.bg_epoch - op.bg_epoch (the origin observed at dispatch)
+            // - consumed = sum of epoch_consumed() for completed steps + the
+            //   current step IF it just finished
+            // - delta > consumed → external mutation has advanced bg_epoch
+            //   beyond what this operator can claim → cancel and let the
+            //   checker re-plan on a fresh snapshot.
+            let Some(step) = op.steps.get(op.current_step).cloned() else {
+                if op.current_step >= op.steps.len() {
+                    op.status = OpStatus::Success;
+                    to_remove.push(bg_id);
                 }
+                continue;
+            };
+            let Some(bg) = self.bg_manager.get_bg(op.bg_id) else {
+                continue;
+            };
+
+            // #3-C: semantic safety check. Some external mutations don't
+            // change bg_epoch by more than our step budget allows, so the
+            // delta-based stale detection misses them — but they still
+            // break the step's precondition. Example: another op did
+            // remove(X) + add(Y), epoch delta = 2 == our step budget for
+            // a 2-step op, but our TransferLease's `to_worker` was X, now
+            // gone from replica_set. Catch these here.
+            if let Err(reason) = op.steps[op.current_step].check_safety(&bg) {
+                log::warn!(
+                    "Operator {} for bg {} failed safety check at step {}: {}; cancelling",
+                    op.id,
+                    op.bg_id,
+                    op.current_step,
+                    reason
+                );
+                op.status = OpStatus::Cancelled;
+                to_remove.push(bg_id);
+                continue;
+            }
+
+            // Then: stale detection. If delta exceeds what completed-or-current
+            // steps could have consumed, somebody else mutated the BG.
+            // Note: op.bg_epoch is the origin from dispatch and never advances.
+            //
+            // #3-A fix: condition is `bg.bg_epoch > op.bg_epoch` (delta exists),
+            // not `op.bg_epoch > 0`. The pre-#3-A short-circuit silently
+            // disabled stale detection for any operator whose builder forgot
+            // to call `.bg_epoch(...)` (default 0). Now we always run the
+            // check when the BG has actually moved past the origin; if origin
+            // and current both happen to be 0 the check is a trivial no-op.
+            if bg.bg_epoch > op.bg_epoch {
+                let delta = bg.bg_epoch - op.bg_epoch;
+                let consumed: u64 = op.steps[..=op.current_step]
+                    .iter()
+                    .map(|s| s.epoch_consumed())
+                    .sum();
+                if delta > consumed {
+                    log::warn!(
+                        "Operator {} for bg {} stale via ConfVerChanged: \
+                         origin_epoch={}, current_bg_epoch={}, delta={}, \
+                         consumed_by_steps={}, cancelling for re-plan",
+                        op.id,
+                        op.bg_id,
+                        op.bg_epoch,
+                        bg.bg_epoch,
+                        delta,
+                        consumed
+                    );
+                    op.status = OpStatus::Cancelled;
+                    to_remove.push(bg_id);
+                    continue;
+                }
+            }
+
+            // Then: step completion. NO MORE in-place op.bg_epoch += 1
+            // (P2.5 removes the "white-stealing" assignment that made stale
+            // detection slip past one step).
+            if step.is_finish(&bg, &self.bg_manager) {
+                op.current_step += 1;
+                op.step_start_time_ms = now_ms;
             }
 
             if op.current_step >= op.steps.len() {
@@ -559,9 +619,10 @@ impl OperatorController {
         let expected_ids: HashSet<u32> = expected_bgs.iter().map(|bg| bg.bg_id).collect();
         let reported_ids: HashSet<u32> = reported_bg_epochs.keys().copied().collect();
 
+        // Wire format expects Vec<BlockGroupInfo>; deref-clone Arc-wrapped values.
         let add_bgs: Vec<curvine_common::state::BlockGroupInfo> = expected_ids
             .difference(&reported_ids)
-            .filter_map(|&bg_id| self.bg_manager.get_bg(bg_id))
+            .filter_map(|&bg_id| self.bg_manager.get_bg(bg_id).map(|arc| (*arc).clone()))
             .collect();
 
         let remove_bgs: Vec<u32> = reported_ids.difference(&expected_ids).copied().collect();
@@ -573,6 +634,7 @@ impl OperatorController {
                 self.bg_manager
                     .get_bg(bg_id)
                     .filter(|bg| bg.bg_epoch > worker_epoch)
+                    .map(|arc| (*arc).clone())
             })
             .collect();
 
@@ -773,6 +835,7 @@ mod tests {
             vec![3],
             vec![],
         ));
+        bg_mgr.test_disable_route_publish();
         let ctrl = OperatorController::new(config.clone(), bg_mgr.clone());
         (ctrl, config, bg_mgr)
     }
@@ -1092,8 +1155,9 @@ mod tests {
                 replica_set: Some(vec![1, 2, 3]),
                 state: None,
                 lease_owner: None,
+                expected_bg_epoch: 1,
                 new_bg_epoch: 2,
-                new_table_epoch: None,
+                bump_table_epoch: None,
             })
             .unwrap();
         // bg_epoch should now be 2
@@ -1167,5 +1231,225 @@ mod tests {
         assert_eq!(dispatched.len(), 1);
         assert_eq!(dispatched[0].bg_id, 10); // higher priority
         assert_eq!(ctrl.waiting_count(), 1); // op2 deferred
+    }
+
+    /// #3-C: check_safety catches cases the epoch-delta check misses.
+    /// Setup: a TransferLease operator whose target worker is silently
+    /// removed from replica_set by an external actor. Epoch advance matches
+    /// the operator's step budget (delta == consumed), so delta-based stale
+    /// detection says "within budget, keep going" — but the step's
+    /// precondition (target ∈ replica_set) is now violated. check_safety
+    /// must fire and cancel.
+    #[test]
+    fn check_progress_cancels_on_safety_violation() {
+        let (ctrl, _config, bg_mgr) = test_controller();
+
+        use curvine_common::state::{BGLease, BGState};
+        let bg = curvine_common::state::BlockGroupInfo {
+            bg_id: 300,
+            table_id: 1,
+            bg_epoch: 1,
+            replica_set: vec![1, 2],
+            state: BGState::Active,
+            op_state: Default::default(),
+            lease_owner: Some(BGLease {
+                node_id: 1,
+                epoch: 1,
+                grant_time_ms: 0,
+            }),
+            stats: Default::default(),
+        };
+        bg_mgr
+            .apply_create_bg(&BGEntry { op_ms: 0, info: bg })
+            .unwrap();
+
+        // Operator: transfer lease 1 → 2. Budget = 1 epoch.
+        let mut op = make_op(
+            2000,
+            300,
+            vec![OpStep::TransferLease {
+                from_worker: 1,
+                to_worker: 2,
+            }],
+            1,
+        );
+        op.bg_epoch = 1;
+        assert!(ctrl.add_operator(op));
+        ctrl.dispatch_next();
+        assert_eq!(ctrl.running_count(), 1);
+
+        // External actor removes worker 2 (our intended lease target) and
+        // advances bg_epoch by exactly 1 — within our budget, so delta-based
+        // stale detection would let us pass. But `to_worker` is gone from
+        // replica_set now, so check_safety must catch it.
+        bg_mgr
+            .apply_update_bg(&BGUpdateEntry {
+                op_ms: 1,
+                bg_id: 300,
+                state: None,
+                replica_set: Some(vec![1]),
+                lease_owner: None,
+                expected_bg_epoch: 1,
+                new_bg_epoch: 2,
+                bump_table_epoch: None,
+            })
+            .unwrap();
+
+        ctrl.check_progress(1);
+        assert_eq!(
+            ctrl.running_count(),
+            0,
+            "#3-C: safety check must cancel when target worker is gone even if epoch delta is within budget"
+        );
+    }
+
+    // =========================================================================
+    // REGRESSION-BASELINE tests (P0.4 from docs/pd-raft-consistency.md §15).
+    //
+    // After P2.5 lands (ConfVerChanged 差量法 — see §14.2 + §15 Phase 2.5),
+    // this test must be UPDATED to reflect the new contract: when an external
+    // mutation advances bg_epoch beyond what the operator's accumulated
+    // step.epoch_consumed() can explain, check_progress cancels the operator
+    // immediately instead of "white-stealing" the epoch advance.
+    // =========================================================================
+
+    /// REGRESSION (post-P2.5): ConfVerChanged-style stale detection.
+    /// When external mutations advance bg_epoch by MORE than the operator's
+    /// completed-or-current steps could have consumed, check_progress cancels
+    /// the operator and the checker can re-plan on a fresh snapshot.
+    ///
+    /// Pre-P2.5 (now removed): op.bg_epoch += 1 on is_finish caused
+    /// "white-stealing" — the operator silently absorbed external advances
+    /// up to one step's worth, hiding the conflict for one extra tick.
+    #[test]
+    fn check_progress_cancels_when_external_delta_exceeds_consumed() {
+        let (ctrl, _config, bg_mgr) = test_controller();
+
+        use crate::pd::journal::BGUpdateEntry;
+        use curvine_common::state::{BGLease, BGState};
+        let bg = curvine_common::state::BlockGroupInfo {
+            bg_id: 200,
+            table_id: 1,
+            bg_epoch: 1,
+            replica_set: vec![1],
+            state: BGState::Active,
+            op_state: Default::default(),
+            lease_owner: Some(BGLease {
+                node_id: 1,
+                epoch: 1,
+                grant_time_ms: 0,
+            }),
+            stats: Default::default(),
+        };
+        bg_mgr
+            .apply_create_bg(&BGEntry { op_ms: 0, info: bg })
+            .unwrap();
+
+        // Operator wants AddReplica 99 — one step that consumes 1 epoch.
+        let mut op = make_op(
+            1000,
+            200,
+            vec![OpStep::AddReplica { worker_id: 99 }],
+            1,
+        );
+        op.bg_epoch = 1;
+        assert!(ctrl.add_operator(op));
+        ctrl.dispatch_next();
+        assert_eq!(ctrl.running_count(), 1);
+
+        // External path advances bg_epoch by TWO (e.g. another op did
+        // add+remove). This exceeds what step[0] could possibly consume (1).
+        bg_mgr
+            .apply_update_bg(&BGUpdateEntry {
+                op_ms: 1,
+                bg_id: 200,
+                state: None,
+                replica_set: Some(vec![1, 77]),
+                lease_owner: None,
+                expected_bg_epoch: 1,
+                new_bg_epoch: 2,
+                bump_table_epoch: None,
+            })
+            .unwrap();
+        bg_mgr
+            .apply_update_bg(&BGUpdateEntry {
+                op_ms: 2,
+                bg_id: 200,
+                state: None,
+                replica_set: Some(vec![1]),
+                lease_owner: None,
+                expected_bg_epoch: 2,
+                new_bg_epoch: 3,
+                bump_table_epoch: None,
+            })
+            .unwrap();
+        assert_eq!(bg_mgr.get_bg(200).unwrap().bg_epoch, 3);
+
+        // P2.5: delta = 3-1 = 2, consumed = step[0].epoch_consumed() = 1.
+        // delta > consumed → cancel.
+        ctrl.check_progress(1);
+        assert_eq!(
+            ctrl.running_count(),
+            0,
+            "P2.5: external delta (2) exceeded operator consumed (1) → must cancel"
+        );
+    }
+
+    /// Negative case: external delta == consumed → operator continues (we
+    /// can't distinguish "we did it" from "they did it" within a single step).
+    /// This is the correct design tradeoff (§14.2 TiKV PD spec).
+    #[test]
+    fn check_progress_keeps_running_when_delta_within_consumed_budget() {
+        let (ctrl, _config, bg_mgr) = test_controller();
+
+        use crate::pd::journal::BGUpdateEntry;
+        use curvine_common::state::{BGLease, BGState};
+        let bg = curvine_common::state::BlockGroupInfo {
+            bg_id: 201,
+            table_id: 1,
+            bg_epoch: 1,
+            replica_set: vec![1],
+            state: BGState::Active,
+            op_state: Default::default(),
+            lease_owner: Some(BGLease {
+                node_id: 1,
+                epoch: 1,
+                grant_time_ms: 0,
+            }),
+            stats: Default::default(),
+        };
+        bg_mgr
+            .apply_create_bg(&BGEntry { op_ms: 0, info: bg })
+            .unwrap();
+
+        let mut op = make_op(
+            1001,
+            201,
+            vec![OpStep::AddReplica { worker_id: 99 }],
+            1,
+        );
+        op.bg_epoch = 1;
+        assert!(ctrl.add_operator(op));
+        ctrl.dispatch_next();
+
+        // External path adds worker 99 (so step also looks finished). Epoch
+        // advances by exactly 1, matching step[0]'s budget.
+        bg_mgr
+            .apply_update_bg(&BGUpdateEntry {
+                op_ms: 1,
+                bg_id: 201,
+                state: None,
+                replica_set: Some(vec![1, 99]),
+                lease_owner: None,
+                expected_bg_epoch: 1,
+                new_bg_epoch: 2,
+                bump_table_epoch: None,
+            })
+            .unwrap();
+
+        // delta=1, consumed=1 → not cancelled. Step is is_finish → advance.
+        ctrl.check_progress(1);
+        // Operator finished its only step → status Success → removed.
+        assert_eq!(ctrl.running_count(), 0);
     }
 }

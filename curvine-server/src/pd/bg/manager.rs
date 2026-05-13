@@ -19,25 +19,44 @@ use super::placement::{
 use super::state_machine;
 use super::{BGStore, BGTable, BGTableStats};
 use crate::pd::config::{keys, ConfigManager};
-use crate::pd::journal::entry::{BGDeleteEntry, BGEntry, BGUpdateEntry, BatchBGEntry};
-use crate::pd::journal::{self, PdEntry};
+use crate::pd::journal::entry::{
+    BGDeleteEntry, BGEntry, BGUpdateEntry, BatchBGEntry, BumpTableEpochEntry, TableEpochUpdate,
+};
+use crate::pd::journal::{self, ApplyOutcome, PdEntry};
 use crate::pd::pool::PoolManager;
 use curvine_common::state::{
     gen_table_id, BGLease, BGOpState, BGState, BGStats, BGTableSummary, BlockGroupInfo,
-    BlockGroupInfoView, ReplicaInfo, ReplicaState, StorageType, WorkerBGReport,
+    BlockGroupInfoView, NodeState, ReplicaInfo, ReplicaState, StorageType, WorkerBGReport,
 };
 use curvine_common::{FsError, FsResult};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 pub struct BGManager {
-    tables: RwLock<HashMap<u32, BGTable>>,
-    bgs: RwLock<HashMap<u32, BlockGroupInfo>>,
+    /// P5.2: tables stored as `Arc<BGTable>` so `get_table()` and route-
+    /// publish paths return cheap shared references instead of cloning ~hundred-
+    /// bucket structs on every read.
+    tables: RwLock<HashMap<u32, Arc<BGTable>>>,
+    /// P5.2: BGs stored as `Arc<BlockGroupInfo>` so scheduler / checker /
+    /// operator hot-paths share read references without copying. Mutation
+    /// paths construct a new `BlockGroupInfo`, wrap with `Arc::new`, and
+    /// insert — readers holding old `Arc`s see the previous snapshot until
+    /// they refresh.
+    bgs: RwLock<HashMap<u32, Arc<BlockGroupInfo>>>,
     worker_to_bgs: RwLock<HashMap<u32, HashSet<u32>>>,
-    replica_states: RwLock<HashMap<u32, HashMap<u32, ReplicaState>>>,
-    epoch_dirty: AtomicBool,
+    /// Latest leader-observed lifecycle states, used by scheduler/operator.
+    observed_replica_states: RwLock<HashMap<u32, HashMap<u32, ReplicaState>>>,
+    /// Full client route view published by a committed table_epoch bump.
+    published_routes: RwLock<HashMap<u32, BGTableSummary>>,
+    dirty_route_tables: RwLock<HashSet<u32>>,
+    route_ready: AtomicBool,
+    /// Test-only: when true, apply_*_bg paths skip `try_flush_dirty_route_tables`
+    /// to avoid blocking on a Raft propose when the journal client has no
+    /// real cluster behind it. Production code must leave this false so that
+    /// BumpTableEpoch entries are proposed (P4.2 requires the entry path to
+    /// be the single source of truth for table.epoch).
+    route_publish_disabled: AtomicBool,
     store: Arc<BGStore>,
     pool_manager: Arc<PoolManager>,
     journal_client: Arc<journal::Client>,
@@ -63,8 +82,11 @@ impl BGManager {
             tables: RwLock::new(HashMap::new()),
             bgs: RwLock::new(HashMap::new()),
             worker_to_bgs: RwLock::new(HashMap::new()),
-            replica_states: RwLock::new(HashMap::new()),
-            epoch_dirty: AtomicBool::new(false),
+            observed_replica_states: RwLock::new(HashMap::new()),
+            published_routes: RwLock::new(HashMap::new()),
+            dirty_route_tables: RwLock::new(HashSet::new()),
+            route_ready: AtomicBool::new(false),
+            route_publish_disabled: AtomicBool::new(false),
             store,
             pool_manager,
             journal_client,
@@ -95,25 +117,42 @@ impl BGManager {
         t.clear();
         b.clear();
         w2b.clear();
+        self.reset_runtime_route_state();
         for table in tables {
-            t.insert(table.table_id, table);
+            t.insert(table.table_id, Arc::new(table));
         }
         for bg in bgs {
             for &wid in &bg.replica_set {
                 w2b.entry(wid).or_default().insert(bg.bg_id);
             }
-            b.insert(bg.bg_id, bg);
+            b.insert(bg.bg_id, Arc::new(bg));
         }
         self.id_allocator.restore()?;
         Ok(())
     }
 
+    pub fn reset_runtime_route_state_after_snapshot(&self) {
+        self.reset_runtime_route_state();
+        log::info!("BG runtime route state reset after snapshot restore");
+    }
+
+    fn reset_runtime_route_state(&self) {
+        self.observed_replica_states.write().unwrap().clear();
+        self.published_routes.write().unwrap().clear();
+        self.dirty_route_tables.write().unwrap().clear();
+        self.route_ready.store(false, Ordering::Release);
+    }
+
+    /// Scheduler/lifecycle view: missing runtime state is conservative Pending.
     pub fn get_replica_state(&self, bg_id: u32, worker_id: u32) -> ReplicaState {
-        replica_state_in(self.replica_states.read().unwrap().get(&bg_id), worker_id)
+        replica_state_in(
+            self.observed_replica_states.read().unwrap().get(&bg_id),
+            worker_id,
+        )
     }
 
     pub fn set_replica_state(&self, bg_id: u32, worker_id: u32, state: ReplicaState) {
-        self.replica_states
+        self.observed_replica_states
             .write()
             .unwrap()
             .entry(bg_id)
@@ -121,80 +160,427 @@ impl BGManager {
             .insert(worker_id, state);
     }
 
-    /// Apply detailed replica reports from a worker heartbeat. Each report
-    /// carries the worker's authoritative `ReplicaState`
-    pub fn apply_replica_reports(&self, worker_id: u32, reports: &[WorkerBGReport]) {
-        let mut rs = self.replica_states.write().unwrap();
-        for report in reports {
-            let bg_states = rs.entry(report.bg_id).or_default();
-            let old = bg_states
-                .insert(worker_id, report.state)
-                .unwrap_or(ReplicaState::Pending);
-            if old.shifts_client_view(report.state) {
-                self.epoch_dirty.store(true, Ordering::Relaxed);
-            }
+    /// Called when this PD becomes leader. Runtime state is discarded, then a
+    /// table_epoch bump publishes the failover route view (Live replica_set default Active).
+    ///
+    /// P4.2: do NOT fail-fast on incomplete route publish. Some tables may
+    /// remain dirty if the BumpTableEpoch entry is racing with concurrent BG
+    /// updates; the next try_flush will pick them up. route_ready is still
+    /// set so the leader can serve client RPCs against whatever subset of
+    /// tables successfully published.
+    pub fn on_leader_start(&self) -> FsResult<()> {
+        let table_ids: HashSet<u32> = self.tables.read().unwrap().keys().copied().collect();
+        self.reset_runtime_route_state();
+        if table_ids.is_empty() {
+            self.route_ready.store(true, Ordering::Release);
+            log::info!("BG runtime route state reset on leader start, no tables to publish");
+            return Ok(());
         }
+        self.mark_route_tables_dirty(&table_ids);
+        if let Err(e) = self.flush_dirty_route_tables(Some(&table_ids)) {
+            log::warn!(
+                "leader route epoch bump partial: {}; remaining tables will be \
+                 picked up by next try_flush_dirty_route_tables",
+                e
+            );
+        }
+        let remaining: HashSet<u32> = self.dirty_route_tables.read().unwrap().clone();
+        let still_dirty = remaining.intersection(&table_ids).count();
+        if still_dirty > 0 {
+            log::warn!(
+                "leader start: {} table(s) still dirty after publish attempt; \
+                 client routes for those tables will be served at the next bump",
+                still_dirty
+            );
+        }
+        self.route_ready.store(true, Ordering::Release);
+        log::info!(
+            "BG runtime route state reset on leader start, published table_epochs \
+             for {} tables ({} still dirty)",
+            table_ids.len() - still_dirty,
+            still_dirty
+        );
+        Ok(())
     }
 
-    pub fn promote_pending_replicas(&self, worker_id: u32, bg_ids: &[u32]) {
-        let mut rs = self.replica_states.write().unwrap();
-        for &bg_id in bg_ids {
-            let bg_states = rs.entry(bg_id).or_default();
-            let old = bg_states
-                .get(&worker_id)
-                .copied()
-                .unwrap_or(ReplicaState::Pending);
-            let new = if old == ReplicaState::Pending {
-                ReplicaState::Active
-            } else {
-                old
-            };
-            bg_states.insert(worker_id, new);
-            if old.shifts_client_view(new) {
-                self.epoch_dirty.store(true, Ordering::Relaxed);
-            }
-        }
-    }
-
-    /// Mark all `Active` replicas on a worker as `Lost`.
-    pub fn mark_replicas_lost(&self, worker_id: u32) {
-        let mut rs = self.replica_states.write().unwrap();
-        for states in rs.values_mut() {
-            if let Some(s) = states.get_mut(&worker_id) {
-                if *s == ReplicaState::Active {
-                    *s = ReplicaState::Lost;
-                    self.epoch_dirty.store(true, Ordering::Relaxed);
+    /// Apply detailed replica reports from a worker heartbeat. Observed states are
+    /// leader-runtime only; client-visible changes are published by table_epoch bump.
+    pub fn apply_replica_reports(
+        &self,
+        worker_id: u32,
+        reports: &[WorkerBGReport],
+    ) -> FsResult<usize> {
+        let mut changed_tables = HashSet::new();
+        let mut changed = 0usize;
+        {
+            let bgs = self.bgs.read().unwrap();
+            let mut observed = self.observed_replica_states.write().unwrap();
+            for report in reports {
+                let Some(bg) = bgs.get(&report.bg_id) else {
+                    log::warn!(
+                        "worker {} reported unknown bg_id={}; skip replica report",
+                        worker_id,
+                        report.bg_id
+                    );
+                    continue;
+                };
+                if !bg.replica_set.contains(&worker_id) {
+                    log::warn!(
+                        "worker {} reported bg_id={} but is not in replica_set; skip replica report",
+                        worker_id,
+                        report.bg_id
+                    );
+                    continue;
+                }
+                let states = observed.entry(report.bg_id).or_default();
+                let old = states
+                    .get(&worker_id)
+                    .copied()
+                    .unwrap_or(ReplicaState::Pending);
+                if old == report.state {
+                    continue;
+                }
+                states.insert(worker_id, report.state);
+                changed += 1;
+                if old.shifts_client_view(report.state) {
+                    changed_tables.insert(bg.table_id);
                 }
             }
         }
+        self.mark_route_tables_dirty(&changed_tables);
+        self.try_flush_dirty_route_tables("replica report route publish");
+        if changed > 0 {
+            log::info!(
+                "Applied observed replica reports worker_id={}, changed={}, route_changed_tables={}",
+                worker_id,
+                changed,
+                changed_tables.len()
+            );
+        }
+        Ok(changed)
     }
 
-    /// Mark all replicas on a worker as `Offline`. Called when the node
-    /// transitions to `NodeState::Offline`.
-    pub fn mark_replicas_offline(&self, worker_id: u32) {
-        let mut rs = self.replica_states.write().unwrap();
-        for states in rs.values_mut() {
-            if let Some(s) = states.get_mut(&worker_id) {
-                let old = *s;
-                if old != ReplicaState::Offline {
-                    *s = ReplicaState::Offline;
-                    if old.shifts_client_view(ReplicaState::Offline) {
-                        self.epoch_dirty.store(true, Ordering::Relaxed);
+    pub fn promote_pending_replicas(&self, worker_id: u32, bg_ids: &[u32]) -> FsResult<usize> {
+        let mut changed_tables = HashSet::new();
+        let mut changed = 0usize;
+        {
+            let bgs = self.bgs.read().unwrap();
+            let mut observed = self.observed_replica_states.write().unwrap();
+            for &bg_id in bg_ids {
+                let Some(bg) = bgs.get(&bg_id) else {
+                    log::warn!(
+                        "worker {} requested promote for unknown bg_id={}; skip",
+                        worker_id,
+                        bg_id
+                    );
+                    continue;
+                };
+                if !bg.replica_set.contains(&worker_id) {
+                    log::warn!(
+                        "worker {} requested promote for bg_id={} but is not in replica_set; skip",
+                        worker_id,
+                        bg_id
+                    );
+                    continue;
+                }
+                let states = observed.entry(bg_id).or_default();
+                let old = states
+                    .get(&worker_id)
+                    .copied()
+                    .unwrap_or(ReplicaState::Pending);
+                if old != ReplicaState::Pending {
+                    continue;
+                }
+                states.insert(worker_id, ReplicaState::Active);
+                changed += 1;
+                if old.shifts_client_view(ReplicaState::Active) {
+                    changed_tables.insert(bg.table_id);
+                }
+            }
+        }
+        self.mark_route_tables_dirty(&changed_tables);
+        self.try_flush_dirty_route_tables("replica promote route publish");
+        if changed > 0 {
+            log::info!(
+                "Promoted observed replicas worker_id={}, changed={}, route_changed_tables={}",
+                worker_id,
+                changed,
+                changed_tables.len()
+            );
+        }
+        Ok(changed)
+    }
+
+    pub fn mark_replicas_lost(&self, worker_id: u32) -> FsResult<usize> {
+        self.mark_worker_replicas(worker_id, ReplicaState::Lost)
+    }
+
+    pub fn mark_replicas_offline(&self, worker_id: u32) -> FsResult<usize> {
+        self.mark_worker_replicas(worker_id, ReplicaState::Offline)
+    }
+
+    fn mark_worker_replicas(&self, worker_id: u32, new_state: ReplicaState) -> FsResult<usize> {
+        self.mark_workers_replicas(&[(worker_id, new_state)])
+    }
+
+    pub fn mark_workers_replicas(&self, worker_states: &[(u32, ReplicaState)]) -> FsResult<usize> {
+        let target_states: HashMap<u32, ReplicaState> = worker_states.iter().copied().collect();
+        if target_states.is_empty() {
+            self.try_flush_dirty_route_tables("mark workers replicas noop route publish retry");
+            return Ok(0);
+        }
+
+        let worker_bg_ids: Vec<(u32, ReplicaState, Vec<u32>)> = {
+            let w2b = self.worker_to_bgs.read().unwrap();
+            target_states
+                .iter()
+                .map(|(&worker_id, &new_state)| {
+                    let bg_ids = w2b
+                        .get(&worker_id)
+                        .map(|ids| ids.iter().copied().collect())
+                        .unwrap_or_default();
+                    (worker_id, new_state, bg_ids)
+                })
+                .collect()
+        };
+
+        let mut changed_tables = HashSet::new();
+        let mut changed = 0usize;
+        {
+            let bgs = self.bgs.read().unwrap();
+            let mut observed = self.observed_replica_states.write().unwrap();
+            for (worker_id, new_state, bg_ids) in worker_bg_ids {
+                for bg_id in bg_ids {
+                    let Some(bg) = bgs.get(&bg_id) else {
+                        log::warn!(
+                            "worker_to_bgs contains missing bg_id={} for worker_id={}; skip mark replica",
+                            bg_id,
+                            worker_id
+                        );
+                        continue;
+                    };
+                    if !bg.replica_set.contains(&worker_id) {
+                        log::warn!(
+                            "worker_to_bgs contains stale bg_id={} for worker_id={} not in replica_set; skip mark replica",
+                            bg_id,
+                            worker_id
+                        );
+                        continue;
                     }
+                    let states = observed.entry(bg.bg_id).or_default();
+                    let old = states
+                        .get(&worker_id)
+                        .copied()
+                        .unwrap_or(ReplicaState::Pending);
+                    if old == new_state {
+                        continue;
+                    }
+                    states.insert(worker_id, new_state);
+                    changed += 1;
+                    // NodeState Live->Lost/Offline changes route visibility even when observed state was missing.
+                    changed_tables.insert(bg.table_id);
                 }
             }
         }
+        self.mark_route_tables_dirty(&changed_tables);
+        self.try_flush_dirty_route_tables("mark workers replicas route publish");
+        if changed > 0 || !changed_tables.is_empty() {
+            log::info!(
+                "Marked worker replicas worker_count={}, changed={}, affected_tables={}",
+                target_states.len(),
+                changed,
+                changed_tables.len()
+            );
+        }
+        Ok(changed)
     }
 
-    /// Serving view: only Active replicas in replica_set.
+    fn mark_route_tables_dirty(&self, table_ids: &HashSet<u32>) {
+        if table_ids.is_empty() {
+            return;
+        }
+        self.dirty_route_tables
+            .write()
+            .unwrap()
+            .extend(table_ids.iter().copied());
+    }
+
+    fn flush_dirty_route_tables(&self, only: Option<&HashSet<u32>>) -> FsResult<()> {
+        let mut last_target = HashSet::new();
+        for attempt in 0..3 {
+            let target = self.dirty_route_target(only);
+            if target.is_empty() {
+                return Ok(());
+            }
+            last_target = target.clone();
+
+            let updates = self.build_table_epoch_updates(&target);
+            self.clear_dirty_tables_without_epoch_update(&target, &updates);
+            if updates.is_empty() {
+                return Ok(());
+            }
+
+            self.journal_client
+                .propose(PdEntry::BumpTableEpoch(BumpTableEpochEntry {
+                    op_ms: orpc::common::LocalTime::mills(),
+                    updates,
+                }))?;
+
+            if !self.has_dirty_route_tables(&target) {
+                return Ok(());
+            }
+            log::warn!(
+                "route table epoch bump attempt {} still has dirty tables: {:?}",
+                attempt + 1,
+                self.dirty_route_target(Some(&target))
+            );
+        }
+        let remaining = self.dirty_route_target(Some(&last_target));
+        if remaining.is_empty() {
+            return Ok(());
+        }
+        log::warn!(
+            "route table epoch bump failed to clear dirty tables after retries: {:?}",
+            remaining
+        );
+        Err(FsError::common(format!(
+            "route table epoch bump failed for tables {:?}",
+            remaining
+        )))
+    }
+
+    pub fn retry_dirty_route_publish(&self) -> FsResult<()> {
+        if self.route_publish_disabled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.flush_dirty_route_tables(None)
+    }
+
+    fn try_flush_dirty_route_tables(&self, reason: &str) {
+        if self.route_publish_disabled.load(Ordering::Acquire) {
+            return;
+        }
+        if let Err(e) = self.flush_dirty_route_tables(None) {
+            log::warn!(
+                "{} failed; dirty route tables kept for retry: {}",
+                reason,
+                e
+            );
+        }
+    }
+
+    fn dirty_route_target(&self, only: Option<&HashSet<u32>>) -> HashSet<u32> {
+        let dirty = self.dirty_route_tables.read().unwrap();
+        match only {
+            Some(only) => dirty.intersection(only).copied().collect(),
+            None => dirty.iter().copied().collect(),
+        }
+    }
+
+    fn has_dirty_route_tables(&self, table_ids: &HashSet<u32>) -> bool {
+        let dirty = self.dirty_route_tables.read().unwrap();
+        table_ids.iter().any(|table_id| dirty.contains(table_id))
+    }
+
+    fn clear_dirty_tables_without_epoch_update(
+        &self,
+        target: &HashSet<u32>,
+        updates: &[TableEpochUpdate],
+    ) {
+        let update_table_ids: HashSet<u32> = updates.iter().map(|u| u.table_id).collect();
+        let missing: Vec<u32> = target.difference(&update_table_ids).copied().collect();
+        if missing.is_empty() {
+            return;
+        }
+        log::warn!(
+            "clear dirty route tables without epoch update because tables are missing: {:?}",
+            missing
+        );
+        let mut dirty = self.dirty_route_tables.write().unwrap();
+        let mut published = self.published_routes.write().unwrap();
+        for table_id in missing {
+            dirty.remove(&table_id);
+            published.remove(&table_id);
+        }
+    }
+
+    fn build_table_epoch_updates(&self, table_ids: &HashSet<u32>) -> Vec<TableEpochUpdate> {
+        let tables = self.tables.read().unwrap();
+        table_ids
+            .iter()
+            .filter_map(|table_id| {
+                let Some(table) = tables.get(table_id) else {
+                    log::warn!("skip table_epoch bump for missing table_id={}", table_id);
+                    return None;
+                };
+                Some(TableEpochUpdate {
+                    table_id: *table_id,
+                    expected_epoch: table.epoch,
+                    new_epoch: table.epoch.saturating_add(1),
+                })
+            })
+            .collect()
+    }
+
+    fn publish_observed_route_for_table(&self, table_id: u32) -> bool {
+        let table = match self.tables.read().unwrap().get(&table_id).cloned() {
+            Some(table) => table,
+            None => {
+                log::warn!("publish route for missing table_id={}; skip", table_id);
+                return false;
+            }
+        };
+        let bgs = self.bgs.read().unwrap();
+        let observed = self.observed_replica_states.read().unwrap();
+        let mut buckets = Vec::with_capacity(table.buckets.len());
+        for &bg_id in &table.buckets {
+            let Some(bg) = bgs.get(&bg_id) else {
+                log::warn!(
+                    "publish route for table_id={} skipped because bg_id={} is missing",
+                    table_id,
+                    bg_id
+                );
+                return false;
+            };
+            let states = observed.get(&bg.bg_id);
+            let visible: Vec<u32> = bg
+                .replica_set
+                .iter()
+                .copied()
+                .filter(|&wid| self.route_replica_state(states, wid) == ReplicaState::Active)
+                .collect();
+            let mut filtered_bg: BlockGroupInfo = (**bg).clone();
+            filtered_bg.replica_set = visible;
+            buckets.push(Self::block_group_info_to_view(
+                &filtered_bg,
+                &self.pool_manager,
+            ));
+        }
+
+        let summary = BGTableSummary {
+            table_id: table.table_id,
+            bucket_count: table.bucket_count,
+            epoch: table.epoch,
+            buckets,
+            last_rebuild_ms: table.last_rebuild_ms,
+        };
+        self.published_routes
+            .write()
+            .unwrap()
+            .insert(table_id, summary);
+        self.dirty_route_tables.write().unwrap().remove(&table_id);
+        true
+    }
+
+    /// Serving view for scheduler/operator: only observed Active replicas in replica_set.
     pub fn get_serving_replicas(&self, bg_id: u32) -> Vec<u32> {
         let bgs = self.bgs.read().unwrap();
         let bg = match bgs.get(&bg_id) {
             Some(bg) => bg,
             None => return vec![],
         };
-        let rs = self.replica_states.read().unwrap();
-        let states = rs.get(&bg_id);
+        let observed = self.observed_replica_states.read().unwrap();
+        let states = observed.get(&bg_id);
         bg.replica_set
             .iter()
             .filter(|&&wid| replica_state_in(states, wid) == ReplicaState::Active)
@@ -202,15 +588,15 @@ impl BGManager {
             .collect()
     }
 
-    /// Resident view: non-Offline replicas in replica_set (Active + Syncing + Pending).
+    /// Resident view for scheduler/operator: non-Offline observed replicas in replica_set.
     pub fn get_resident_replicas(&self, bg_id: u32) -> Vec<u32> {
         let bgs = self.bgs.read().unwrap();
         let bg = match bgs.get(&bg_id) {
             Some(bg) => bg,
             None => return vec![],
         };
-        let rs = self.replica_states.read().unwrap();
-        let states = rs.get(&bg_id);
+        let observed = self.observed_replica_states.read().unwrap();
+        let states = observed.get(&bg_id);
         bg.replica_set
             .iter()
             .filter(|&&wid| replica_state_in(states, wid) != ReplicaState::Offline)
@@ -235,10 +621,11 @@ impl BGManager {
             state: None,
             replica_set: Some(new_rs),
             lease_owner: None,
+            expected_bg_epoch: bg.bg_epoch,
             new_bg_epoch: bg.bg_epoch.saturating_add(1),
-            new_table_epoch: None,
+            bump_table_epoch: Some(bg.table_id),
         };
-        self.journal_client.propose(PdEntry::UpdateBG(entry))
+        self.propose_update_bg(entry, "propose_remove_replica")
     }
 
     /// Propose Raft addition of a worker to a BG's replica_set.
@@ -257,10 +644,11 @@ impl BGManager {
             state: None,
             replica_set: Some(new_rs),
             lease_owner: None,
+            expected_bg_epoch: bg.bg_epoch,
             new_bg_epoch: bg.bg_epoch.saturating_add(1),
-            new_table_epoch: None,
+            bump_table_epoch: Some(bg.table_id),
         };
-        self.journal_client.propose(PdEntry::UpdateBG(entry))
+        self.propose_update_bg(entry, "propose_add_replica")
     }
 
     /// Propose Raft transfer of lease owner.
@@ -293,160 +681,226 @@ impl BGManager {
             state: None,
             replica_set: None,
             lease_owner: Some(lease),
+            expected_bg_epoch: bg.bg_epoch,
             new_bg_epoch: bg.bg_epoch.saturating_add(1),
-            new_table_epoch: None,
+            bump_table_epoch: Some(bg.table_id),
         };
-        self.journal_client.propose(PdEntry::UpdateBG(entry))
+        self.propose_update_bg(entry, "propose_transfer_lease")
     }
 
-    /// If any replica entered or left the client-visible set since the last
-    /// flush, bump table epochs and persist an Active snapshot.
-    pub fn flush_table_epoch_if_dirty(&self) {
-        if !self.epoch_dirty.swap(false, Ordering::Relaxed) {
-            return;
-        }
-        self.bump_dirty_table_epochs();
-        self.persist_active_snapshot();
-    }
-
-    /// Bump epoch for every table that has a dirty BG.
-    fn bump_dirty_table_epochs(&self) {
-        let tables: Vec<BGTable> = self.tables.read().unwrap().values().cloned().collect();
-        for table in &tables {
-            let new_epoch = table.epoch.saturating_add(1);
-            if let Err(e) = self.set_table_epoch(table.table_id, new_epoch) {
-                log::error!(
-                    "Failed to bump table_epoch for table {}: {}",
-                    table.table_id,
-                    e
+    /// Common BG update propose path: leader-fenced + ApplyOutcome dispatch.
+    /// Per §17 contract, propose path does NOT retry on stale; the upper-layer
+    /// scheduler (operator/checker) is responsible for re-planning on a fresh
+    /// snapshot.
+    fn propose_update_bg(&self, entry: BGUpdateEntry, kind: &str) -> FsResult<()> {
+        let expected_epoch = entry.expected_bg_epoch;
+        let bg_id = entry.bg_id;
+        let outcome = self
+            .journal_client
+            .propose_as_leader_with_result(PdEntry::UpdateBG(entry))?;
+        match outcome {
+            ApplyOutcome::Applied | ApplyOutcome::SkippedNoop => Ok(()),
+            ApplyOutcome::SkippedStale { reason } => {
+                log::warn!(
+                    "{} bg_id={} returned Stale (expected_bg_epoch={}): {}",
+                    kind,
+                    bg_id,
+                    expected_epoch,
+                    reason
                 );
+                Err(FsError::stale_entry(
+                    "update_bg",
+                    expected_epoch,
+                    reason,
+                ))
             }
+            ApplyOutcome::NotFound { reason } => Err(FsError::not_found(reason)),
         }
     }
 
-    /// Persist current Active replica set for each table.
-    /// Snapshot key: bg:active_snapshot:{table_id}
-    fn persist_active_snapshot(&self) {
-        let rs = self.replica_states.read().unwrap();
-        let tables = self.tables.read().unwrap();
-        let bgs = self.bgs.read().unwrap();
-        for table in tables.values() {
-            let mut snapshot: HashMap<u32, Vec<u32>> = HashMap::new();
-            for &bg_id in &table.buckets {
-                if let Some(bg) = bgs.get(&bg_id) {
-                    let active: Vec<u32> = bg
-                        .replica_set
-                        .iter()
-                        .filter(|&&wid| {
-                            replica_state_in(rs.get(&bg_id), wid) == ReplicaState::Active
-                        })
-                        .copied()
-                        .collect();
-                    if !active.is_empty() {
-                        snapshot.insert(bg_id, active);
-                    }
-                }
-            }
-            let key = BGStore::active_snapshot_suffix(table.table_id);
-            let value = serde_json::to_vec(&snapshot).unwrap_or_default();
-            if let Err(e) = self.store.put_raw(&key, &value) {
-                log::error!(
-                    "Failed to persist Active snapshot for table {}: {}",
-                    table.table_id,
-                    e
-                );
-            }
-        }
+    pub fn apply_bump_table_epoch(&self, entry: &BumpTableEpochEntry) -> FsResult<()> {
+        self.apply_bump_table_epoch_with_role(entry, true)
     }
 
-    /// Restore Active snapshot after leader switch.
-    /// Called after restore() to initialize replica_states from persisted snapshot.
-    pub fn restore_active_snapshot(&self) {
-        let tables = self.tables.read().unwrap();
-        let bgs = self.bgs.read().unwrap();
-        let mut rs = self.replica_states.write().unwrap();
-        for table in tables.values() {
-            let key = BGStore::active_snapshot_suffix(table.table_id);
-            let snapshot: HashMap<u32, Vec<u32>> = match self.store.get_raw(&key) {
-                Ok(Some(data)) => serde_json::from_slice(&data).unwrap_or_default(),
-                _ => continue,
-            };
-            for &bg_id in &table.buckets {
-                if let Some(bg) = bgs.get(&bg_id) {
-                    let active_set: HashSet<u32> = snapshot
-                        .get(&bg_id)
-                        .map(|v| v.iter().copied().collect())
-                        .unwrap_or_default();
-                    let states = rs.entry(bg_id).or_default();
-                    for &wid in &bg.replica_set {
-                        if active_set.contains(&wid) {
-                            states.insert(wid, ReplicaState::Active);
-                        } else {
-                            states.entry(wid).or_insert(ReplicaState::Pending);
-                        }
-                    }
+    pub fn apply_bump_table_epoch_with_role(
+        &self,
+        entry: &BumpTableEpochEntry,
+        is_leader: bool,
+    ) -> FsResult<()> {
+        let mut applied_tables = Vec::new();
+        for update in &entry.updates {
+            if self.apply_table_epoch_update(update)? {
+                applied_tables.push(update.table_id);
+            }
+        }
+        if is_leader {
+            for table_id in &applied_tables {
+                if !self.publish_observed_route_for_table(*table_id) {
+                    log::warn!(
+                        "BumpTableEpoch applied but failed to publish route table_id={}",
+                        table_id
+                    );
                 }
             }
         }
+        log::info!(
+            "BumpTableEpoch applied updates={}, changed_tables={}, is_leader={}",
+            entry.updates.len(),
+            applied_tables.len(),
+            is_leader
+        );
+        Ok(())
     }
 
     pub fn apply_create_bg(&self, entry: &BGEntry) -> FsResult<()> {
-        let info = &entry.info;
-        self.store.put(&info)?;
-        self.bgs.write().unwrap().insert(info.bg_id, info.clone());
-        let mut w2b = self.worker_to_bgs.write().unwrap();
-        for &wid in &info.replica_set {
-            w2b.entry(wid).or_default().insert(info.bg_id);
-        }
-        // Initialize replica states to Pending
-        let mut rs = self.replica_states.write().unwrap();
-        let entry_states = rs.entry(info.bg_id).or_default();
-        for &wid in &info.replica_set {
-            entry_states.entry(wid).or_insert(ReplicaState::Pending);
-        }
-        Ok(())
+        self.apply_create_bg_with_role(entry, true)
     }
 
-    pub fn apply_update_bg(&self, entry: &BGUpdateEntry) -> FsResult<()> {
-        let table_id = {
+    pub fn apply_create_bg_with_role(&self, entry: &BGEntry, is_leader: bool) -> FsResult<()> {
+        let info = &entry.info;
+        let table_exists = {
+            let tables = self.tables.read().unwrap();
             let mut bgs = self.bgs.write().unwrap();
             let mut w2b = self.worker_to_bgs.write().unwrap();
-            let mut rs = self.replica_states.write().unwrap();
-            match self.apply_single_update(entry, &mut bgs, &mut w2b, &mut rs)? {
-                Some(tid) => tid,
-                None => return Ok(()),
+
+            self.store.put(info)?;
+            if is_leader {
+                self.seed_runtime_pending_for_bg(info);
             }
+            bgs.insert(info.bg_id, Arc::new(info.clone()));
+            for &wid in &info.replica_set {
+                w2b.entry(wid).or_default().insert(info.bg_id);
+            }
+
+            tables.contains_key(&info.table_id)
         };
 
-        if let Some(new_epoch) = entry.new_table_epoch {
-            self.set_table_epoch(table_id, new_epoch)?;
+        // P4.2: do NOT bump table.epoch in-place. Mark the table dirty so the
+        // leader's next heartbeat-driven try_flush proposes a BumpTableEpoch
+        // entry through Raft.
+        //
+        // Critical (#1 fix): apply_*_bg runs inside the Raft state-machine
+        // apply path. Calling try_flush_dirty_route_tables here would
+        // synchronously block_on_send_propose into the same runtime → panic /
+        // deadlock. The flush is driven by heartbeat handlers
+        // (apply_replica_reports / mark_workers_replicas / etc.) and the stats
+        // scheduler's retry_dirty_route_publish.
+        if is_leader && table_exists {
+            let mut dirty = HashSet::new();
+            dirty.insert(info.table_id);
+            self.mark_route_tables_dirty(&dirty);
         }
         Ok(())
     }
 
-    /// Apply one `BGUpdateEntry` to the in-memory indexes and persist the
-    /// updated `BlockGroupInfo`. Returns `Some(table_id)` if mutation
-    /// happened, `None` for the idempotent-skip case (epoch already past).
+    pub fn apply_update_bg(&self, entry: &BGUpdateEntry) -> FsResult<ApplyOutcome> {
+        self.apply_update_bg_with_role(entry, true)
+    }
+
+    pub fn apply_update_bg_with_role(
+        &self,
+        entry: &BGUpdateEntry,
+        is_leader: bool,
+    ) -> FsResult<ApplyOutcome> {
+        let (outcome, mutation) = {
+            let mut bgs = self.bgs.write().unwrap();
+            let mut w2b = self.worker_to_bgs.write().unwrap();
+            self.apply_single_update(entry, is_leader, &mut bgs, &mut w2b)?
+        };
+
+        let Some((table_id, _old, _new)) = mutation else {
+            return Ok(outcome);
+        };
+
+        // P4.2 + #1: do NOT bump in-place AND do NOT propose synchronously
+        // from apply path. Just mark dirty; heartbeat / stats path drives flush.
+        if is_leader && entry.bump_table_epoch.is_some() {
+            let mut dirty = HashSet::new();
+            dirty.insert(table_id);
+            self.mark_route_tables_dirty(&dirty);
+        }
+        Ok(outcome)
+    }
+
+    /// Apply one `BGUpdateEntry` to persisted metadata and indexes.
     ///
-    /// Caller holds the three write locks.
+    /// Returns `(ApplyOutcome, Option<(table_id, old_replica_set, new_replica_set)>)`:
+    /// the mutation tuple is `Some` only when `outcome == Applied`.
+    /// CAS contract (P2.1):
+    ///   - bg not found → returned as Err (state machine corruption)
+    ///   - existing.bg_epoch != entry.expected_bg_epoch → SkippedStale
+    ///   - entry.new_bg_epoch <= existing.bg_epoch → SkippedNoop (idempotent)
+    ///   - otherwise → Applied + mutation tuple
     fn apply_single_update(
         &self,
         entry: &BGUpdateEntry,
-        bgs: &mut HashMap<u32, BlockGroupInfo>,
+        is_leader_runtime: bool,
+        bgs: &mut HashMap<u32, Arc<BlockGroupInfo>>,
         w2b: &mut HashMap<u32, HashSet<u32>>,
-        rs: &mut HashMap<u32, HashMap<u32, ReplicaState>>,
-    ) -> FsResult<Option<u32>> {
-        let mut info = bgs
+    ) -> FsResult<(ApplyOutcome, Option<(u32, Vec<u32>, Vec<u32>)>)> {
+        let existing_arc = bgs
             .get(&entry.bg_id)
             .cloned()
             .ok_or_else(|| FsError::common(format!("bg {} not found for update", entry.bg_id)))?;
+        let mut info: BlockGroupInfo = (*existing_arc).clone();
 
-        if info.bg_epoch >= entry.new_bg_epoch {
-            return Ok(None); // idempotent skip
+        if info.bg_epoch != entry.expected_bg_epoch {
+            log::warn!(
+                "Apply UpdateBG skipped: bg_id={} stale, current_epoch={}, \
+                 entry_expected_epoch={}, entry_new_epoch={}",
+                entry.bg_id,
+                info.bg_epoch,
+                entry.expected_bg_epoch,
+                entry.new_bg_epoch
+            );
+            return Ok((
+                ApplyOutcome::stale(format!(
+                    "bg_epoch mismatch: current={}, expected={}",
+                    info.bg_epoch, entry.expected_bg_epoch
+                )),
+                None,
+            ));
+        }
+
+        if entry.new_bg_epoch <= info.bg_epoch {
+            log::warn!(
+                "Apply UpdateBG noop: bg_id={} non-monotonic, current_epoch={}, \
+                 entry_new_epoch={}",
+                entry.bg_id,
+                info.bg_epoch,
+                entry.new_bg_epoch
+            );
+            return Ok((ApplyOutcome::SkippedNoop, None));
         }
 
         if let Some(s) = entry.state {
             state_machine::validate_transition(info.state, s)?;
+        }
+
+        // P2.4: lease.epoch must be strictly monotonic. Even though bg_epoch
+        // CAS already protects most paths, lease epoch is also a per-BG version
+        // counter that scheduler/operator depend on for correct lease lifecycle
+        // tracking. Reject malformed entries that try to install an older or
+        // equal lease.epoch under a higher bg_epoch.
+        if let Some(ref new_lease) = entry.lease_owner {
+            if let Some(ref old_lease) = info.lease_owner {
+                if new_lease.epoch <= old_lease.epoch {
+                    log::warn!(
+                        "Apply UpdateBG skipped: bg_id={} non-monotonic lease epoch, \
+                         current_lease_epoch={}, entry_lease_epoch={}",
+                        entry.bg_id,
+                        old_lease.epoch,
+                        new_lease.epoch
+                    );
+                    return Ok((
+                        ApplyOutcome::stale(format!(
+                            "lease.epoch non-monotonic: current={}, entry={}",
+                            old_lease.epoch, new_lease.epoch
+                        )),
+                        None,
+                    ));
+                }
+            }
         }
 
         let old_replica_set = info.replica_set.clone();
@@ -464,11 +918,19 @@ impl BGManager {
 
         self.store.put(&info)?;
         let table_id = info.table_id;
-        bgs.insert(entry.bg_id, info.clone());
+        let new_replica_set = info.replica_set.clone();
+        if is_leader_runtime && entry.replica_set.is_some() {
+            self.sync_runtime_for_replica_set_change(
+                entry.bg_id,
+                &old_replica_set,
+                &new_replica_set,
+            );
+        }
+        bgs.insert(entry.bg_id, Arc::new(info));
 
         if entry.replica_set.is_some() {
             let old_set: HashSet<u32> = old_replica_set.iter().copied().collect();
-            let new_set: HashSet<u32> = info.replica_set.iter().copied().collect();
+            let new_set: HashSet<u32> = new_replica_set.iter().copied().collect();
             for &removed in old_set.difference(&new_set) {
                 if let Some(set) = w2b.get_mut(&removed) {
                     set.remove(&entry.bg_id);
@@ -480,82 +942,251 @@ impl BGManager {
             for &added in new_set.difference(&old_set) {
                 w2b.entry(added).or_default().insert(entry.bg_id);
             }
-            // Sync replica_states: Pending for new workers, drop departed workers.
-            let states = rs.entry(entry.bg_id).or_default();
-            for &added in new_set.difference(&old_set) {
-                states.entry(added).or_insert(ReplicaState::Pending);
-            }
-            for &removed in old_set.difference(&new_set) {
-                states.remove(&removed);
-            }
         }
 
-        Ok(Some(table_id))
+        Ok((
+            ApplyOutcome::Applied,
+            Some((table_id, old_replica_set, new_replica_set)),
+        ))
     }
 
-    pub fn apply_delete_bg(&self, entry: &BGDeleteEntry) -> FsResult<()> {
+    pub fn apply_delete_bg(&self, entry: &BGDeleteEntry) -> FsResult<ApplyOutcome> {
+        self.apply_delete_bg_with_role(entry, true)
+    }
+
+    /// Apply DeleteBG with CAS guard (P2.2).
+    ///
+    /// - bg not found → `NotFound`
+    /// - existing.bg_epoch != entry.expected_bg_epoch → `SkippedStale`
+    /// - otherwise → delete + Applied; uses `info.table_id` (the BG's actual
+    ///   table) for `bump_table_epoch_for_publish`, ignoring the
+    ///   potentially stale `entry.table_id`.
+    pub fn apply_delete_bg_with_role(
+        &self,
+        entry: &BGDeleteEntry,
+        is_leader: bool,
+    ) -> FsResult<ApplyOutcome> {
+        // Read-then-CAS under write lock to avoid TOCTOU.
+        let bg_to_delete = {
+            let mut bgs_write = self.bgs.write().unwrap();
+            let Some(existing) = bgs_write.get(&entry.bg_id).cloned() else {
+                log::warn!(
+                    "Apply DeleteBG skipped: bg_id={} not present",
+                    entry.bg_id
+                );
+                return Ok(ApplyOutcome::not_found(format!(
+                    "bg {} not present",
+                    entry.bg_id
+                )));
+            };
+            if existing.bg_epoch != entry.expected_bg_epoch {
+                log::warn!(
+                    "Apply DeleteBG skipped: bg_id={} stale, current_epoch={}, \
+                     entry_expected_epoch={}",
+                    entry.bg_id,
+                    existing.bg_epoch,
+                    entry.expected_bg_epoch
+                );
+                return Ok(ApplyOutcome::stale(format!(
+                    "bg_epoch mismatch: current={}, expected={}",
+                    existing.bg_epoch, entry.expected_bg_epoch
+                )));
+            }
+            // CAS passed — actually remove from in-memory index.
+            bgs_write.remove(&entry.bg_id);
+            existing
+        };
+        // Persist deletion to store.
         self.store.delete(entry.bg_id)?;
-        let removed = self.bgs.write().unwrap().remove(&entry.bg_id);
-        if let Some(bg) = removed {
-            let mut w2b = self.worker_to_bgs.write().unwrap();
-            for &wid in &bg.replica_set {
-                if let Some(set) = w2b.get_mut(&wid) {
-                    set.remove(&entry.bg_id);
-                    if set.is_empty() {
-                        w2b.remove(&wid);
-                    }
+
+        // Use the BG's authoritative table_id, not entry.table_id (which may
+        // be stale if the BG moved between tables — guards against §4.6 bug).
+        let table_id = bg_to_delete.table_id;
+
+        let mut w2b = self.worker_to_bgs.write().unwrap();
+        for &wid in &bg_to_delete.replica_set {
+            if let Some(set) = w2b.get_mut(&wid) {
+                set.remove(&entry.bg_id);
+                if set.is_empty() {
+                    w2b.remove(&wid);
                 }
             }
         }
-        self.replica_states.write().unwrap().remove(&entry.bg_id);
-        self.set_table_epoch(entry.table_id, entry.new_table_epoch)?;
-        Ok(())
+        drop(w2b);
+
+        // P4.2 + #1: mark dirty only; heartbeat / stats path drives the flush.
+        if is_leader {
+            self.observed_replica_states
+                .write()
+                .unwrap()
+                .remove(&entry.bg_id);
+            let mut dirty = HashSet::new();
+            dirty.insert(table_id);
+            self.mark_route_tables_dirty(&dirty);
+        }
+        Ok(ApplyOutcome::Applied)
     }
 
-    /// Apply a batch of BG operations atomically (from Raft).
-    /// Table (if any) is created/updated first, then creates, then updates.
-    /// All epochs (BG, table, lease) come from the entry — apply never mints.
-    pub fn apply_batch_bg(&self, entry: &BatchBGEntry) -> FsResult<()> {
+    pub fn apply_batch_bg(&self, entry: &BatchBGEntry) -> FsResult<ApplyOutcome> {
+        self.apply_batch_bg_with_role(entry, true)
+    }
+
+    /// Apply a batch of BG operations from Raft.
+    ///
+    /// **Best-effort batch, NOT atomic** (#4 doc fix). Each entry is applied
+    /// independently with its own CAS:
+    ///   - `creates` whose `bg_id` already exists are skipped (warn).
+    ///   - `updates` go through `apply_single_update` per-entry CAS; some may
+    ///     `SkippedStale` while others apply.
+    ///   - If `expected_table_absent` is set and the table already exists,
+    ///     the **whole batch** is rejected as `SkippedStale` (the only group-
+    ///     level guard, used by `create_table` to prevent table_id collisions).
+    ///
+    /// Why this is acceptable for our usage:
+    ///   - `create_table`: `expected_table_absent=true` rejects the whole
+    ///     batch on collision; on success all `creates` insert (no `bg_id`
+    ///     collisions because the IdAllocator hands out fresh ids).
+    ///   - `rebuild_table`: per-update CAS may partially apply. The BG
+    ///     scheduler/checker is convergent — operators retry uncovered BGs
+    ///     on the next patrol with a fresh snapshot.
+    ///
+    /// `ApplyOutcome::Applied` is returned with mutation counts in the log,
+    /// not in the outcome payload (callers don't currently need them). If
+    /// future code needs per-batch detail, extend `ApplyOutcome` with a new
+    /// variant.
+    ///
+    /// P2.3 + P4.2 + #1: only mark route table dirty when at least one
+    /// mutation actually landed (no phantom publish). Mark dirty only — do
+    /// NOT propose `BumpTableEpoch` from inside apply (would deadlock; #1).
+    pub fn apply_batch_bg_with_role(
+        &self,
+        entry: &BatchBGEntry,
+        is_leader: bool,
+    ) -> FsResult<ApplyOutcome> {
+        let initial_publish_table_id = entry.table.as_ref().map(|table| table.table_id);
+
+        // P2.3: table-create existence guard. Reject the whole batch if a
+        // concurrent create already installed the table — prevents both the
+        // table overwrite AND the orphan BG creation that pre-P2.3 produced.
         if let Some(ref table) = entry.table {
+            if entry.expected_table_absent
+                && self.tables.read().unwrap().contains_key(&table.table_id)
+            {
+                log::warn!(
+                    "Apply BatchBG rejected: table_id={} already exists; \
+                     `expected_table_absent` set, treating creates+updates as Stale",
+                    table.table_id
+                );
+                return Ok(ApplyOutcome::stale(format!(
+                    "table {} already exists",
+                    table.table_id
+                )));
+            }
             self.store.put_table(table)?;
             self.tables
                 .write()
                 .unwrap()
-                .insert(table.table_id, table.clone());
+                .insert(table.table_id, Arc::new(table.clone()));
         }
 
+        // P2.3: count actual mutations to drive the route-publish decision.
+        let mut applied_creates = 0usize;
+        let mut applied_updates = 0usize;
+        let table_created = entry.table.is_some();
         {
             let mut bgs = self.bgs.write().unwrap();
             let mut w2b = self.worker_to_bgs.write().unwrap();
-            let mut rs = self.replica_states.write().unwrap();
 
             for bg in &entry.creates {
+                if bgs.contains_key(&bg.bg_id) {
+                    log::warn!(
+                        "Apply BatchBG create skipped: bg_id={} already exists",
+                        bg.bg_id
+                    );
+                    continue;
+                }
                 self.store.put(bg)?;
-                bgs.insert(bg.bg_id, bg.clone());
+                if is_leader {
+                    self.seed_runtime_pending_for_bg(bg);
+                }
+                bgs.insert(bg.bg_id, Arc::new(bg.clone()));
                 for &wid in &bg.replica_set {
                     w2b.entry(wid).or_default().insert(bg.bg_id);
                 }
+                applied_creates += 1;
             }
 
             for update in &entry.updates {
-                self.apply_single_update(update, &mut bgs, &mut w2b, &mut rs)?;
+                let (outcome, mutation) =
+                    self.apply_single_update(update, is_leader, &mut bgs, &mut w2b)?;
+                if matches!(outcome, ApplyOutcome::Applied) && mutation.is_some() {
+                    applied_updates += 1;
+                }
             }
-        }
-
-        if let Some((tid, new_epoch)) = entry.new_table_epoch {
-            self.set_table_epoch(tid, new_epoch)?;
         }
 
         if let Some(next_id) = entry.next_bg_id {
             self.store.set_next_bg_id(next_id)?;
         }
 
-        Ok(())
+        // P2.3 + P4.2 + #1: only mark dirty when at least one mutation actually
+        // landed (no phantom publish). table_created counts as a route change.
+        // Do NOT try_flush from apply path — heartbeat / stats path drives flush.
+        let any_mutation = table_created || applied_creates > 0 || applied_updates > 0;
+        if is_leader && any_mutation {
+            let mut dirty: HashSet<u32> = HashSet::new();
+            if let Some(table_id) = entry.bump_table_epoch {
+                dirty.insert(table_id);
+            }
+            if let Some(table_id) = initial_publish_table_id {
+                dirty.insert(table_id);
+            }
+            if !dirty.is_empty() {
+                self.mark_route_tables_dirty(&dirty);
+            }
+        }
+
+        log::info!(
+            "Apply BatchBG completed: table_created={}, applied_creates={}, \
+             applied_updates={}, total_creates={}, total_updates={}",
+            table_created,
+            applied_creates,
+            applied_updates,
+            entry.creates.len(),
+            entry.updates.len()
+        );
+        Ok(ApplyOutcome::Applied)
     }
 
-    /// Propose a batch BG operation via Raft.
+    /// Propose a batch BG operation via Raft, with leader fence + ApplyOutcome
+    /// translation (#3 fix). Pre-#3 used plain `propose()` which discarded the
+    /// outcome — concurrent `create_table` would silently SkippedStale and
+    /// callers thought their table-create succeeded.
     pub fn propose_batch_bg(&self, entry: BatchBGEntry) -> FsResult<()> {
-        self.journal_client.propose(PdEntry::BatchBG(entry))
+        let table_id_for_log = entry
+            .table
+            .as_ref()
+            .map(|t| t.table_id)
+            .or(entry.bump_table_epoch);
+        let outcome = self
+            .journal_client
+            .propose_as_leader_with_result(PdEntry::BatchBG(entry))?;
+        match outcome {
+            ApplyOutcome::Applied | ApplyOutcome::SkippedNoop => Ok(()),
+            ApplyOutcome::SkippedStale { reason } => {
+                log::warn!(
+                    "BatchBG returned Stale (table_id={:?}): {}",
+                    table_id_for_log,
+                    reason
+                );
+                Err(FsError::stale_entry(
+                    "batch_bg",
+                    format!("table_id={:?}", table_id_for_log),
+                    reason,
+                ))
+            }
+            ApplyOutcome::NotFound { reason } => Err(FsError::not_found(reason)),
+        }
     }
 
     /// Create a new BGTable for a pool. Uses the placement algorithm to assign BGs
@@ -615,8 +1246,10 @@ impl BGManager {
             table: Some(result.table),
             creates: result.bgs,
             updates: vec![],
-            next_bg_id: None,      // ID already advanced by IdAllocator's realloc
-            new_table_epoch: None, // new table carries its initial epoch
+            next_bg_id: None,       // ID already advanced by IdAllocator's realloc
+            bump_table_epoch: None, // new table carries its initial epoch
+            // P2.3: refuse to overwrite a concurrently-created table.
+            expected_table_absent: true,
         };
         self.propose_batch_bg(entry)
     }
@@ -630,30 +1263,96 @@ impl BGManager {
             .any(|t| t.pool_id() == pool_id)
     }
 
-    fn set_table_epoch(&self, table_id: u32, new_epoch: u64) -> FsResult<()> {
-        let mut table = match self.tables.read().unwrap().get(&table_id).cloned() {
+    // P4.2 (removed): `bump_table_epoch_for_publish` and
+    // `bump_table_epoch_for_publish_locked` previously bumped table.epoch
+    // in-place inside `apply_*_bg`. They are gone — all table.epoch bumps
+    // now go through the `BumpTableEpoch` Raft entry (single source of
+    // truth, with explicit CAS in `apply_table_epoch_update`). apply_*_bg
+    // only marks the table dirty + try_flush.
+
+    fn apply_table_epoch_update(&self, update: &TableEpochUpdate) -> FsResult<bool> {
+        let table_arc = match self.tables.read().unwrap().get(&update.table_id).cloned() {
             Some(t) => t,
-            None => return Ok(()),
+            None => {
+                log::warn!(
+                    "BumpTableEpoch for missing table_id={}, expected_epoch={}, new_epoch={}; skip",
+                    update.table_id,
+                    update.expected_epoch,
+                    update.new_epoch
+                );
+                return Ok(false);
+            }
         };
-        if table.epoch >= new_epoch {
-            return Ok(());
+        if table_arc.epoch != update.expected_epoch {
+            log::warn!(
+                "stale BumpTableEpoch table_id={}, expected_epoch={}, current_epoch={}, new_epoch={}; skip",
+                update.table_id,
+                update.expected_epoch,
+                table_arc.epoch,
+                update.new_epoch
+            );
+            return Ok(false);
         }
-        table.epoch = new_epoch;
+        if update.new_epoch <= table_arc.epoch {
+            log::warn!(
+                "non-increasing BumpTableEpoch table_id={}, current_epoch={}, new_epoch={}; skip",
+                update.table_id,
+                table_arc.epoch,
+                update.new_epoch
+            );
+            return Ok(false);
+        }
+        let mut table: BGTable = (*table_arc).clone();
+        table.epoch = update.new_epoch;
         self.store.put_table(&table)?;
-        self.tables.write().unwrap().insert(table_id, table);
-        Ok(())
+        self.tables
+            .write()
+            .unwrap()
+            .insert(update.table_id, Arc::new(table));
+        Ok(true)
     }
 
-    pub fn get_bg(&self, bg_id: u32) -> Option<BlockGroupInfo> {
+    fn seed_runtime_pending_for_bg(&self, bg: &BlockGroupInfo) {
+        let mut observed = self.observed_replica_states.write().unwrap();
+        let observed_states = observed.entry(bg.bg_id).or_default();
+        for &wid in &bg.replica_set {
+            observed_states.entry(wid).or_insert(ReplicaState::Pending);
+        }
+    }
+
+    fn sync_runtime_for_replica_set_change(
+        &self,
+        bg_id: u32,
+        old_replica_set: &[u32],
+        new_replica_set: &[u32],
+    ) {
+        let old_set: HashSet<u32> = old_replica_set.iter().copied().collect();
+        let new_set: HashSet<u32> = new_replica_set.iter().copied().collect();
+        let mut observed = self.observed_replica_states.write().unwrap();
+        let observed_states = observed.entry(bg_id).or_default();
+        for &added in new_set.difference(&old_set) {
+            observed_states
+                .entry(added)
+                .or_insert(ReplicaState::Pending);
+        }
+        for &removed in old_set.difference(&new_set) {
+            observed_states.remove(&removed);
+        }
+        if observed_states.is_empty() {
+            observed.remove(&bg_id);
+        }
+    }
+
+    pub fn get_bg(&self, bg_id: u32) -> Option<Arc<BlockGroupInfo>> {
         self.bgs.read().unwrap().get(&bg_id).cloned()
     }
 
-    pub fn get_table(&self, table_id: u32) -> Option<BGTable> {
+    pub fn get_table(&self, table_id: u32) -> Option<Arc<BGTable>> {
         self.tables.read().unwrap().get(&table_id).cloned()
     }
 
     /// Lookup bg_id by table_id and key, then return BlockGroupInfo if present.
-    pub fn lookup_bg(&self, table_id: u32, key: &[u8]) -> Option<BlockGroupInfo> {
+    pub fn lookup_bg(&self, table_id: u32, key: &[u8]) -> Option<Arc<BlockGroupInfo>> {
         let tables = self.tables.read().unwrap();
         let table = tables.get(&table_id)?;
         let bg_id = table.lookup(key);
@@ -661,28 +1360,34 @@ impl BGManager {
         self.bgs.read().unwrap().get(&bg_id).cloned()
     }
 
-    pub fn list_tables(&self) -> Vec<BGTable> {
+    pub fn list_tables(&self) -> Vec<Arc<BGTable>> {
         self.tables.read().unwrap().values().cloned().collect()
     }
 
-    /// Per-table epoch map: table_id -> epoch. Used in heartbeat responses.
+    /// Per-table published route epoch map: table_id -> epoch. Used in heartbeat responses.
+    /// Keep this in sync with `build_table_summary()`: both expose only the
+    /// last published route snapshot, never a newer in-flight table epoch.
     pub fn get_table_epochs(&self) -> HashMap<u32, u64> {
-        self.tables
+        if !self.route_ready.load(Ordering::Acquire) {
+            return HashMap::new();
+        }
+        self.published_routes
             .read()
             .unwrap()
             .iter()
-            .map(|(&id, t)| (id, t.epoch))
+            .map(|(&id, summary)| (id, summary.epoch))
             .collect()
     }
 
-    pub fn list_bgs(&self) -> Vec<BlockGroupInfo> {
+    pub fn list_bgs(&self) -> Vec<Arc<BlockGroupInfo>> {
         self.bgs.read().unwrap().values().cloned().collect()
     }
 
     /// Set BG operation state (runtime-only).
     pub fn set_op_state(&self, bg_id: u32, op_state: BGOpState) {
-        if let Some(bg) = self.bgs.write().unwrap().get_mut(&bg_id) {
-            bg.op_state = op_state;
+        let mut bgs = self.bgs.write().unwrap();
+        if let Some(bg) = bgs.get_mut(&bg_id) {
+            Arc::make_mut(bg).op_state = op_state;
         }
     }
 
@@ -692,8 +1397,9 @@ impl BGManager {
         let mut bgs = self.bgs.write().unwrap();
         for (bg_id, stats) in bg_stats {
             if let Some(bg) = bgs.get_mut(bg_id) {
-                bg.stats = stats.clone();
-                bg.stats.last_report_ms = now;
+                let bg_mut = Arc::make_mut(bg);
+                bg_mut.stats = stats.clone();
+                bg_mut.stats.last_report_ms = now;
             }
         }
     }
@@ -730,13 +1436,13 @@ impl BGManager {
         let mut tables = self.tables.write().unwrap();
         for (table_id, agg) in aggregates {
             if let Some(t) = tables.get_mut(&table_id) {
-                t.stats = agg;
+                Arc::make_mut(t).stats = agg;
             }
         }
     }
 
     /// BGs that have this worker in replica_set (uses worker_to_bgs index).
-    pub fn get_bgs_on_worker(&self, worker_id: u32) -> Vec<BlockGroupInfo> {
+    pub fn get_bgs_on_worker(&self, worker_id: u32) -> Vec<Arc<BlockGroupInfo>> {
         let w2b = self.worker_to_bgs.read().unwrap();
         let Some(bg_ids) = w2b.get(&worker_id) else {
             return Vec::new();
@@ -749,7 +1455,7 @@ impl BGManager {
     }
 
     /// BGs in the given state.
-    pub fn get_bgs_by_state(&self, state: BGState) -> Vec<BlockGroupInfo> {
+    pub fn get_bgs_by_state(&self, state: BGState) -> Vec<Arc<BlockGroupInfo>> {
         self.bgs
             .read()
             .unwrap()
@@ -788,47 +1494,38 @@ impl BGManager {
         }
     }
 
-    /// Build client-facing summary (buckets as BlockGroupInfoView) for the given table.
+    fn route_replica_state(
+        &self,
+        states: Option<&HashMap<u32, ReplicaState>>,
+        worker_id: u32,
+    ) -> ReplicaState {
+        if let Some(state) = states.and_then(|m| m.get(&worker_id)).copied() {
+            return state;
+        }
+        match self
+            .pool_manager
+            .get_worker_node(worker_id)
+            .map(|n| n.state)
+        {
+            Some(NodeState::Live) => ReplicaState::Active,
+            _ => ReplicaState::Pending,
+        }
+    }
+
+    /// Build client-facing summary for the given table.
+    ///
+    /// Client route reads only a published full-route snapshot. Live `tables`/`bgs`
+    /// may already contain newer Raft-applied metadata, but clients keep seeing
+    /// the last published table_epoch view until a publish atomically replaces it.
     pub fn build_table_summary(&self, table_id: u32) -> Option<BGTableSummary> {
-        let table = self.tables.read().unwrap().get(&table_id).cloned()?;
-        let bgs = self.bgs.read().unwrap();
-        let rs = self.replica_states.read().unwrap();
-        let buckets: Vec<_> = table
-            .buckets
-            .iter()
-            .filter_map(|&bg_id| bgs.get(&bg_id).cloned())
-            .map(|bg| {
-                let states = rs.get(&bg.bg_id);
-                let mut visible: Vec<(u32, u8)> = bg
-                    .replica_set
-                    .iter()
-                    .filter_map(|&wid| {
-                        let state = replica_state_in(states, wid);
-                        match state {
-                            ReplicaState::Active => Some((wid, 0u8)),
-                            ReplicaState::Lost => Some((wid, 1u8)),
-                            _ => None, // Pending/Syncing/Offline hidden
-                        }
-                    })
-                    .collect();
-                visible.sort_by_key(|&(_, prio)| prio);
-                let mut filtered_bg = bg.clone();
-                filtered_bg.replica_set = visible.into_iter().map(|(w, _)| w).collect();
-                Self::block_group_info_to_view(&filtered_bg, &self.pool_manager)
-            })
-            .collect();
-        drop(rs);
-        drop(bgs);
-        if buckets.len() != table.buckets.len() {
+        if !self.route_ready.load(Ordering::Acquire) {
             return None;
         }
-        Some(BGTableSummary {
-            table_id: table.table_id,
-            bucket_count: table.bucket_count,
-            epoch: table.epoch,
-            buckets,
-            last_rebuild_ms: table.last_rebuild_ms,
-        })
+        self.published_routes
+            .read()
+            .unwrap()
+            .get(&table_id)
+            .cloned()
     }
 
     /// Build per-table WorkerLoadSnapshot map for the given table.
@@ -844,7 +1541,7 @@ impl BGManager {
         let pool_id = table.pool_id();
         let live_workers = self.pool_manager.get_live_workers(pool_id);
 
-        let table_bgs: Vec<BlockGroupInfo> = if init {
+        let table_bgs: Vec<Arc<BlockGroupInfo>> = if init {
             vec![]
         } else {
             let bgs = self.bgs.read().unwrap();
@@ -987,13 +1684,14 @@ impl BGManager {
     /// run the placement algorithm, return the diff.
     /// Returns `None` if the table has no existing BGs to rebuild.
     fn plan_rebuild(&self, table_id: u32) -> FsResult<Option<RebuildPlan>> {
-        let table = {
+        let table_arc = {
             let tables = self.tables.read().unwrap();
             tables
                 .get(&table_id)
                 .cloned()
                 .ok_or_else(|| FsError::common(format!("table {} not found", table_id)))?
         };
+        let table: BGTable = (*table_arc).clone();
 
         let existing_bgs: Vec<BlockGroupInfo> = {
             let bgs = self.bgs.read().unwrap();
@@ -1001,7 +1699,7 @@ impl BGManager {
                 .buckets
                 .iter()
                 .filter(|&&id| id != 0)
-                .filter_map(|id| bgs.get(id).cloned())
+                .filter_map(|id| bgs.get(id).map(|arc| (**arc).clone()))
                 .collect()
         };
         if existing_bgs.is_empty() {
@@ -1051,14 +1749,21 @@ impl BGManager {
         let updates = plan
             .changes
             .iter()
-            .map(|(bg, _old)| BGUpdateEntry {
-                op_ms: now,
-                bg_id: bg.bg_id,
-                state: None,
-                replica_set: Some(bg.replica_set.clone()),
-                lease_owner: bg.lease_owner.clone(),
-                new_bg_epoch: bg.bg_epoch,
-                new_table_epoch: None,
+            .map(|(new_bg, _old)| {
+                // The placement planner produced new BG state with bg_epoch
+                // already bumped (= current + 1). expected_bg_epoch must point
+                // to the version we read at plan time.
+                let expected = new_bg.bg_epoch.saturating_sub(1);
+                BGUpdateEntry {
+                    op_ms: now,
+                    bg_id: new_bg.bg_id,
+                    state: None,
+                    replica_set: Some(new_bg.replica_set.clone()),
+                    lease_owner: new_bg.lease_owner.clone(),
+                    expected_bg_epoch: expected,
+                    new_bg_epoch: new_bg.bg_epoch,
+                    bump_table_epoch: None,
+                }
             })
             .collect();
         BatchBGEntry {
@@ -1067,7 +1772,8 @@ impl BGManager {
             creates: vec![],
             updates,
             next_bg_id: None,
-            new_table_epoch: Some((plan.table.table_id, plan.table.epoch.saturating_add(1))),
+            bump_table_epoch: Some(plan.table.table_id),
+            expected_table_absent: false,
         }
     }
 
@@ -1178,17 +1884,30 @@ struct RebuildPlan {
 impl BGManager {
     /// Insert a BGTable directly into the in-memory index, bypassing Raft propose.
     pub fn test_insert_table(&self, table: super::BGTable) {
-        self.tables.write().unwrap().insert(table.table_id, table);
+        self.tables
+            .write()
+            .unwrap()
+            .insert(table.table_id, Arc::new(table));
     }
 
-    /// Read `epoch_dirty` without clearing it (unlike `flush_table_epoch_if_dirty`).
-    pub fn test_epoch_dirty(&self) -> bool {
-        self.epoch_dirty.load(Ordering::Relaxed)
+    pub fn test_insert_node(&self, node: curvine_common::state::NodeInfo) {
+        self.pool_manager.test_insert_node(node);
     }
 
-    /// Reset `epoch_dirty` to false (used by tests to isolate transitions).
-    pub fn test_clear_epoch_dirty(&self) {
-        self.epoch_dirty.store(false, Ordering::Relaxed);
+    pub fn test_clear_observed_replica_states(&self) {
+        self.reset_runtime_route_state();
+    }
+
+    pub fn test_publish_table(&self, table_id: u32) {
+        self.publish_observed_route_for_table(table_id);
+        self.route_ready.store(true, Ordering::Release);
+    }
+
+    /// Test-only: skip the leader-side `try_flush_dirty_route_tables` propose.
+    /// Set this in tests that have no real Raft cluster behind `journal_client`,
+    /// so apply_*_bg paths don't block on a propose timeout.
+    pub fn test_disable_route_publish(&self) {
+        self.route_publish_disabled.store(true, Ordering::Release);
     }
 }
 
@@ -1224,7 +1943,7 @@ mod tests {
             jc.clone(),
         ));
         let pool_manager = Arc::new(PoolManager::new(pool_store, node_manager, jc.clone()));
-        BGManager::new(
+        let mgr = BGManager::new(
             bg_store,
             pool_manager,
             jc,
@@ -1232,7 +1951,11 @@ mod tests {
             1024,
             vec![3],
             vec![],
-        )
+        );
+        // Tests have no real Raft cluster — disable route publish so apply
+        // paths don't block on a propose timeout (P4.2).
+        mgr.test_disable_route_publish();
+        mgr
     }
 
     fn make_bg(bg_id: u32, table_id: u32, replica_set: Vec<u32>) -> BlockGroupInfo {
@@ -1278,8 +2001,9 @@ mod tests {
             state: Some(BGState::Degraded),
             replica_set: None,
             lease_owner: None,
+            expected_bg_epoch: 1,
             new_bg_epoch: 2,
-            new_table_epoch: None,
+            bump_table_epoch: None,
         })
         .unwrap();
         let got = mgr.get_bg(2).unwrap();
@@ -1297,8 +2021,9 @@ mod tests {
             state: None,
             replica_set: Some(vec![301, 302]),
             lease_owner: None,
+            expected_bg_epoch: 1,
             new_bg_epoch: 2,
-            new_table_epoch: None,
+            bump_table_epoch: None,
         })
         .unwrap();
         let got = mgr.get_bg(3).unwrap();
@@ -1320,8 +2045,9 @@ mod tests {
                 epoch: 2,
                 grant_time_ms: 99_000,
             }),
+            expected_bg_epoch: 1,
             new_bg_epoch: 2,
-            new_table_epoch: None,
+            bump_table_epoch: None,
         })
         .unwrap();
         let got = mgr.get_bg(5).unwrap();
@@ -1333,13 +2059,22 @@ mod tests {
     fn apply_delete_bg() {
         let mgr = test_manager();
         let info = make_bg(4, 10, vec![400]);
+        mgr.test_insert_table(BGTable {
+            table_id: 10,
+            bucket_count: 1,
+            buckets: vec![4],
+            epoch: 0,
+            create_time_ms: 0,
+            last_rebuild_ms: 0,
+            stats: BGTableStats::default(),
+        });
         mgr.apply_create_bg(&BGEntry { op_ms: 0, info }).unwrap();
         assert!(mgr.get_bg(4).is_some());
         mgr.apply_delete_bg(&BGDeleteEntry {
             op_ms: 0,
             bg_id: 4,
             table_id: 10,
-            new_table_epoch: 1,
+            expected_bg_epoch: 1,
         })
         .unwrap();
         assert!(mgr.get_bg(4).is_none());
@@ -1377,8 +2112,9 @@ mod tests {
             state: None,
             replica_set: Some(vec![1, 2, 4]),
             lease_owner: None,
+            expected_bg_epoch: 1,
             new_bg_epoch: 2,
-            new_table_epoch: None,
+            bump_table_epoch: None,
         })
         .unwrap();
         assert_eq!(mgr.get_bg(10).unwrap().bg_epoch, 2);
@@ -1390,8 +2126,9 @@ mod tests {
             state: None,
             replica_set: Some(vec![1, 5, 4]),
             lease_owner: None,
+            expected_bg_epoch: 2,
             new_bg_epoch: 3,
-            new_table_epoch: None,
+            bump_table_epoch: None,
         })
         .unwrap();
         assert_eq!(mgr.get_bg(10).unwrap().bg_epoch, 3);
@@ -1421,8 +2158,9 @@ mod tests {
                 epoch: 2,
                 grant_time_ms: 100_000,
             }),
+            expected_bg_epoch: 1,
             new_bg_epoch: 2,
-            new_table_epoch: None,
+            bump_table_epoch: None,
         })
         .unwrap();
         assert_eq!(
@@ -1444,8 +2182,9 @@ mod tests {
             state: Some(BGState::Degraded),
             replica_set: None,
             lease_owner: None,
+            expected_bg_epoch: before.bg_epoch,
             new_bg_epoch: before.bg_epoch + 1,
-            new_table_epoch: None,
+            bump_table_epoch: None,
         })
         .unwrap();
         let after = mgr.get_bg(12).unwrap();
@@ -1471,8 +2210,9 @@ mod tests {
             state: Some(BGState::Recovering),
             replica_set: None,
             lease_owner: None,
+            expected_bg_epoch: 1,
             new_bg_epoch: 2,
-            new_table_epoch: None,
+            bump_table_epoch: None,
         });
         assert!(result.is_err());
     }
@@ -1497,8 +2237,9 @@ mod tests {
             state: None,
             replica_set: Some(vec![1, 3]),
             lease_owner: None,
+            expected_bg_epoch: 1,
             new_bg_epoch: 2,
-            new_table_epoch: None,
+            bump_table_epoch: None,
         })
         .unwrap();
 
@@ -1511,6 +2252,15 @@ mod tests {
     fn worker_to_bg_index_cleaned_on_delete() {
         let mgr = test_manager();
         let info = make_bg(21, 1, vec![1, 2]);
+        mgr.test_insert_table(BGTable {
+            table_id: 1,
+            bucket_count: 1,
+            buckets: vec![21],
+            epoch: 0,
+            create_time_ms: 0,
+            last_rebuild_ms: 0,
+            stats: BGTableStats::default(),
+        });
         mgr.apply_create_bg(&BGEntry { op_ms: 0, info }).unwrap();
         assert_eq!(mgr.get_bgs_on_worker(1).len(), 1);
 
@@ -1518,7 +2268,7 @@ mod tests {
             op_ms: 0,
             bg_id: 21,
             table_id: 1,
-            new_table_epoch: 1,
+            expected_bg_epoch: 1,
         })
         .unwrap();
         assert_eq!(mgr.get_bgs_on_worker(1).len(), 0);
@@ -1555,97 +2305,210 @@ mod tests {
         })
         .unwrap();
         mgr.set_replica_state(bg_id, worker_id, ReplicaState::Active);
-        mgr.test_clear_epoch_dirty();
+    }
+
+    fn make_worker_node(id: u32, state: NodeState) -> curvine_common::state::NodeInfo {
+        curvine_common::state::NodeInfo {
+            base: curvine_common::state::NodeBase {
+                node_id: id,
+                node_type: curvine_common::state::NodeType::Worker,
+                address: curvine_common::state::NodeAddress {
+                    hostname: format!("worker-{}", id),
+                    ip: format!("10.0.0.{}", id),
+                    rpc_port: 8000 + id as u16,
+                    web_port: 9000 + id as u16,
+                },
+                ..Default::default()
+            },
+            state,
+            epoch: 1,
+            last_heartbeat_ms: 0,
+            state_since_ms: 0,
+            last_persist_ms: 0,
+            sys_stats: Default::default(),
+            payload: curvine_common::state::NodePayload::Worker(Default::default()),
+        }
     }
 
     #[test]
-    fn mark_replicas_lost_bumps_epoch_dirty_once() {
+    fn route_view_hides_explicit_pending_live_replica() {
         let mgr = test_manager();
-        seed_active_replica(&mgr, 1, 100);
+        mgr.test_insert_node(make_worker_node(100, NodeState::Live));
+        mgr.test_insert_table(BGTable {
+            table_id: 10,
+            bucket_count: 1,
+            buckets: vec![1],
+            epoch: 1,
+            create_time_ms: 0,
+            last_rebuild_ms: 0,
+            stats: BGTableStats::default(),
+        });
+        mgr.apply_create_bg(&BGEntry {
+            op_ms: 0,
+            info: make_bg(1, 10, vec![100]),
+        })
+        .unwrap();
+        mgr.test_publish_table(10);
 
-        mgr.mark_replicas_lost(100);
-        assert!(
-            mgr.test_epoch_dirty(),
-            "Active→Lost reorders client view → bump"
-        );
-
-        mgr.test_clear_epoch_dirty();
-        mgr.mark_replicas_lost(100);
-        assert!(
-            !mgr.test_epoch_dirty(),
-            "Lost→Lost (idempotent) should not bump"
-        );
+        let summary = mgr.build_table_summary(10).unwrap();
+        assert!(summary.buckets[0].replica_set.is_empty());
     }
 
     #[test]
-    fn mark_replicas_offline_from_active_bumps() {
+    fn route_view_defaults_missing_live_replica_to_active_after_failover() {
         let mgr = test_manager();
-        seed_active_replica(&mgr, 1, 100);
+        mgr.test_insert_node(make_worker_node(100, NodeState::Live));
+        mgr.test_insert_table(BGTable {
+            table_id: 10,
+            bucket_count: 1,
+            buckets: vec![1],
+            epoch: 1,
+            create_time_ms: 0,
+            last_rebuild_ms: 0,
+            stats: BGTableStats::default(),
+        });
+        mgr.apply_create_bg(&BGEntry {
+            op_ms: 0,
+            info: make_bg(1, 10, vec![100]),
+        })
+        .unwrap();
+        mgr.test_clear_observed_replica_states();
+        mgr.test_publish_table(10);
 
-        mgr.mark_replicas_offline(100);
-        assert!(mgr.test_epoch_dirty(), "Active→Offline removes from view");
+        let summary = mgr.build_table_summary(10).unwrap();
+        assert_eq!(summary.buckets[0].replica_set.len(), 1);
+        assert_eq!(summary.buckets[0].replica_set[0].node_id, 100);
     }
 
     #[test]
-    fn mark_replicas_offline_from_lost_bumps() {
+    fn scheduler_view_defaults_missing_replica_state_to_pending() {
         let mgr = test_manager();
-        seed_active_replica(&mgr, 1, 100);
-        mgr.mark_replicas_lost(100);
-        mgr.test_clear_epoch_dirty();
+        mgr.test_insert_node(make_worker_node(100, NodeState::Live));
+        mgr.apply_create_bg(&BGEntry {
+            op_ms: 0,
+            info: make_bg(1, 10, vec![100]),
+        })
+        .unwrap();
+        mgr.test_clear_observed_replica_states();
 
-        mgr.mark_replicas_offline(100);
-        assert!(mgr.test_epoch_dirty(), "Lost→Offline removes from view");
+        assert_eq!(mgr.get_replica_state(1, 100), ReplicaState::Pending);
     }
 
     #[test]
-    fn pending_to_syncing_does_not_bump() {
+    fn runtime_replica_state_defaults_pending_and_can_be_set() {
+        let mgr = test_manager();
+        assert_eq!(mgr.get_replica_state(1, 100), ReplicaState::Pending);
+        seed_active_replica(&mgr, 1, 100);
+        assert_eq!(mgr.get_replica_state(1, 100), ReplicaState::Active);
+        mgr.set_replica_state(1, 100, ReplicaState::Lost);
+        assert_eq!(mgr.get_replica_state(1, 100), ReplicaState::Lost);
+    }
+
+    #[test]
+    fn apply_bump_table_epoch_updates_epoch() {
+        let mgr = test_manager();
+        let table = BGTable {
+            table_id: 10,
+            bucket_count: 1,
+            buckets: vec![1],
+            epoch: 1,
+            create_time_ms: 0,
+            last_rebuild_ms: 0,
+            stats: BGTableStats::default(),
+        };
+        mgr.test_insert_table(table);
+        mgr.apply_bump_table_epoch(&BumpTableEpochEntry {
+            op_ms: 10,
+            updates: vec![TableEpochUpdate {
+                table_id: 10,
+                expected_epoch: 1,
+                new_epoch: 2,
+            }],
+        })
+        .unwrap();
+        assert_eq!(mgr.get_table(10).unwrap().epoch, 2);
+
+        // Idempotent/stale bumps do not move the epoch backwards.
+        mgr.apply_bump_table_epoch(&BumpTableEpochEntry {
+            op_ms: 11,
+            updates: vec![TableEpochUpdate {
+                table_id: 10,
+                expected_epoch: 1,
+                new_epoch: 2,
+            }],
+        })
+        .unwrap();
+        assert_eq!(mgr.get_table(10).unwrap().epoch, 2);
+    }
+
+    #[test]
+    fn hidden_report_updates_runtime_without_epoch_bump() {
         let mgr = test_manager();
         mgr.apply_create_bg(&BGEntry {
             op_ms: 0,
             info: make_bg(1, 0x0001_0003, vec![100]),
         })
         .unwrap();
-        mgr.test_clear_epoch_dirty();
 
-        mgr.apply_replica_reports(
-            100,
-            &[WorkerBGReport {
-                bg_id: 1,
-                state: ReplicaState::Syncing,
-                stats: BGStats::default(),
-            }],
-        );
-        assert!(
-            !mgr.test_epoch_dirty(),
-            "Pending→Syncing (both hidden) should not bump"
-        );
+        let changed = mgr
+            .apply_replica_reports(
+                100,
+                &[WorkerBGReport {
+                    bg_id: 1,
+                    state: ReplicaState::Syncing,
+                    stats: BGStats::default(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        assert_eq!(mgr.get_replica_state(1, 100), ReplicaState::Syncing);
     }
 
     #[test]
-    fn report_transition_to_active_bumps() {
+    fn report_transition_to_active_updates_runtime() {
         let mgr = test_manager();
         mgr.apply_create_bg(&BGEntry {
             op_ms: 0,
             info: make_bg(1, 0x0001_0003, vec![100]),
         })
         .unwrap();
-        mgr.test_clear_epoch_dirty();
 
-        mgr.apply_replica_reports(
-            100,
-            &[WorkerBGReport {
-                bg_id: 1,
-                state: ReplicaState::Active,
-                stats: BGStats::default(),
-            }],
-        );
-        assert!(mgr.test_epoch_dirty(), "Pending→Active enters view");
+        let changed = mgr
+            .apply_replica_reports(
+                100,
+                &[WorkerBGReport {
+                    bg_id: 1,
+                    state: ReplicaState::Active,
+                    stats: BGStats::default(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        assert_eq!(mgr.get_replica_state(1, 100), ReplicaState::Active);
     }
 
     /// Regression: the batch path used to update `worker_to_bgs` but skipped
-    /// `replica_states`, leaking stale states for removed workers.
+    /// `observed_replica_states`, leaking stale states for removed workers.
+
     #[test]
-    fn apply_batch_bg_syncs_replica_states_on_replica_change() {
+    fn mark_workers_replicas_marks_only_target_worker_lost() {
+        let mgr = test_manager();
+        let info = make_bg(30_000, 10, vec![100, 101]);
+        mgr.apply_create_bg(&BGEntry { op_ms: 0, info }).unwrap();
+        mgr.set_replica_state(30_000, 100, ReplicaState::Active);
+        mgr.set_replica_state(30_000, 101, ReplicaState::Active);
+
+        let changed = mgr
+            .mark_workers_replicas(&[(100, ReplicaState::Lost)])
+            .unwrap();
+
+        assert_eq!(changed, 1);
+        assert_eq!(mgr.get_replica_state(30_000, 100), ReplicaState::Lost);
+        assert_eq!(mgr.get_replica_state(30_000, 101), ReplicaState::Active);
+    }
+
+    #[test]
+    fn apply_batch_bg_syncs_observed_replica_states_on_replica_change() {
         let mgr = test_manager();
         let info = make_bg(20, 10, vec![100, 101, 102]);
         mgr.apply_create_bg(&BGEntry { op_ms: 0, info }).unwrap();
@@ -1666,11 +2529,13 @@ mod tests {
                 state: None,
                 replica_set: Some(vec![100, 101, 103]),
                 lease_owner: None,
+                expected_bg_epoch: 1,
                 new_bg_epoch: 2,
-                new_table_epoch: None,
+                bump_table_epoch: None,
             }],
             next_bg_id: None,
-            new_table_epoch: None,
+            bump_table_epoch: None,
+            expected_table_absent: false,
         };
         mgr.apply_batch_bg(&batch).unwrap();
 
@@ -1681,5 +2546,243 @@ mod tests {
         assert_eq!(mgr.get_replica_state(20, 102), ReplicaState::Pending);
         // New replica is seeded Pending.
         assert_eq!(mgr.get_replica_state(20, 103), ReplicaState::Pending);
+    }
+
+    // =========================================================================
+    // REGRESSION-BASELINE tests (P0.4 from docs/pd-raft-consistency.md §15).
+    //
+    // These tests fix the CURRENT (buggy) behavior in writing so that the bugs
+    // are visible on every test run. After P2 (BG CAS化), these tests must be
+    // UPDATED to reflect the new contracts:
+    //   - apply_batch_bg refuses to overwrite an existing table (P2.3)
+    //   - apply_batch_bg only bumps table_epoch when at least one update was
+    //     actually Applied (no假发布) (P2.3)
+    //   - apply_update_bg with stale expected_bg_epoch returns SkippedStale
+    //     (instead of silent skip on `bg_epoch >= new_bg_epoch`) (P2.1)
+    // =========================================================================
+
+    /// REGRESSION-BASELINE: concurrent create_table for the same (pool,
+    /// replica_count) key produces a table_id collision in apply: the second
+    /// BatchBG silently overwrites the table mapping but does NOT remove the
+    /// first batch's BGs from `bgs` / `worker_to_bgs`, leaving them as orphans.
+    ///
+    /// Expected post-P2.3: BatchBG with `table_create.expected_table_absent=true`
+    /// must SkippedStale when the table already exists; orphan BGs cannot occur.
+    #[test]
+    fn baseline_concurrent_batch_create_same_table_orphans_first_bgs() {
+        use crate::pd::bg::BGTable;
+        let mgr = test_manager();
+        let table_id = curvine_common::state::gen_table_id(1, 3);
+
+        // Path A: build table with bg_id range 100..103.
+        let table_a = BGTable {
+            table_id,
+            bucket_count: 3,
+            buckets: vec![100, 101, 102],
+            epoch: 0,
+            create_time_ms: 0,
+            last_rebuild_ms: 0,
+            stats: BGTableStats::default(),
+        };
+        let creates_a: Vec<BlockGroupInfo> = (100..103)
+            .map(|id| make_bg(id, table_id, vec![1, 2, 3]))
+            .collect();
+
+        // Path B: build same table with disjoint bg_id range 200..203.
+        let table_b = BGTable {
+            table_id,
+            bucket_count: 3,
+            buckets: vec![200, 201, 202],
+            epoch: 0,
+            create_time_ms: 0,
+            last_rebuild_ms: 0,
+            stats: BGTableStats::default(),
+        };
+        let creates_b: Vec<BlockGroupInfo> = (200..203)
+            .map(|id| make_bg(id, table_id, vec![4, 5, 6]))
+            .collect();
+
+        // Apply A first, then B.
+        mgr.apply_batch_bg(&BatchBGEntry {
+            op_ms: 1,
+            table: Some(table_a.clone()),
+            creates: creates_a,
+            updates: vec![],
+            next_bg_id: None,
+            bump_table_epoch: None,
+            expected_table_absent: false,
+        })
+        .unwrap();
+        mgr.apply_batch_bg(&BatchBGEntry {
+            op_ms: 2,
+            table: Some(table_b.clone()),
+            creates: creates_b,
+            updates: vec![],
+            next_bg_id: None,
+            bump_table_epoch: None,
+            expected_table_absent: false,
+        })
+        .unwrap();
+
+        // BUG: table now points to range 200..203 (B won), but range 100..103
+        // is still in `bgs` map → orphan BGs.
+        let table = mgr.get_table(table_id).unwrap();
+        assert_eq!(table.buckets, vec![200, 201, 202]);
+
+        for orphan_id in 100..103 {
+            assert!(
+                mgr.get_bg(orphan_id).is_some(),
+                "BASELINE: bg_id={} should be orphaned in current code; \
+                 after P2.3, table_already_exists guard rejects path B and no orphan exists.",
+                orphan_id
+            );
+        }
+
+        // Worker indexes from path A also leak: workers 1/2/3 still appear to
+        // own BGs that the table no longer references.
+        for orphan_worker in [1, 2, 3] {
+            let bgs_on_worker = mgr.get_bgs_on_worker(orphan_worker);
+            assert!(
+                !bgs_on_worker.is_empty(),
+                "BASELINE: worker {} should still index orphan BGs",
+                orphan_worker
+            );
+        }
+    }
+
+    /// REGRESSION (post-P4.2): batch updates that are all stale no longer
+    /// silently bump table.epoch via the in-place path. The batch marks the
+    /// table dirty and tries to flush a `BumpTableEpoch` entry; in this test
+    /// env the journal_client has no real Raft cluster, so try_flush fails
+    /// silently and table.epoch stays put.
+    ///
+    /// In production (real Raft), the BumpTableEpoch entry WILL still apply,
+    /// advancing the epoch even if no BG was mutated. P2.3 mutation counting
+    /// would prevent that "phantom publish" — it's still pending. For now,
+    /// this test verifies that P4.2 unblocks the in-place bug at least in
+    /// the no-Raft path.
+    #[test]
+    fn batch_bg_stale_updates_no_inplace_bump() {
+        use crate::pd::bg::BGTable;
+        let mgr = test_manager();
+        let table_id = 42;
+        mgr.test_insert_table(BGTable {
+            table_id,
+            bucket_count: 1,
+            buckets: vec![1],
+            epoch: 5,
+            create_time_ms: 0,
+            last_rebuild_ms: 0,
+            stats: BGTableStats::default(),
+        });
+        let mut bg = make_bg(1, table_id, vec![100, 101]);
+        bg.bg_epoch = 7;
+        mgr.apply_create_bg(&BGEntry {
+            op_ms: 0,
+            info: bg,
+        })
+        .unwrap();
+        let initial_table_epoch = mgr.get_table(table_id).unwrap().epoch;
+
+        let batch = BatchBGEntry {
+            op_ms: 1,
+            table: None,
+            creates: vec![],
+            updates: vec![BGUpdateEntry {
+                op_ms: 1,
+                bg_id: 1,
+                state: None,
+                replica_set: Some(vec![999]),
+                lease_owner: None,
+                expected_bg_epoch: 6,
+                new_bg_epoch: 8,
+                bump_table_epoch: None,
+            }],
+            next_bg_id: None,
+            bump_table_epoch: Some(table_id),
+            expected_table_absent: false,
+        };
+        mgr.apply_batch_bg(&batch).unwrap();
+
+        // P4.2 fix: no more in-place bump. table.epoch unchanged in test env.
+        let final_epoch = mgr.get_table(table_id).unwrap().epoch;
+        assert_eq!(
+            final_epoch, initial_table_epoch,
+            "P4.2: table.epoch must not be bumped in-place; BumpTableEpoch entry \
+             would have done so via Raft, but here the journal client has no cluster."
+        );
+        // BG itself unchanged.
+        let bg_after = mgr.get_bg(1).unwrap();
+        assert_eq!(bg_after.replica_set, vec![100, 101]);
+        assert_eq!(bg_after.bg_epoch, 7);
+    }
+
+    /// REGRESSION (post-P2.1): apply_update_bg with mismatching expected_bg_epoch
+    /// now returns `Ok(ApplyOutcome::SkippedStale { reason })` instead of
+    /// silent Ok(()). Pre-P2.1 (now removed): apply skipped without surfacing.
+    #[test]
+    fn apply_update_bg_returns_stale_on_epoch_mismatch() {
+        let mgr = test_manager();
+        let mut bg = make_bg(50, 1, vec![100]);
+        bg.bg_epoch = 5;
+        mgr.apply_create_bg(&BGEntry {
+            op_ms: 0,
+            info: bg,
+        })
+        .unwrap();
+
+        // Stale entry: proposer thought bg_epoch was 4, but it's 5.
+        let entry = BGUpdateEntry {
+            op_ms: 1,
+            bg_id: 50,
+            state: None,
+            replica_set: Some(vec![200]),
+            lease_owner: None,
+            expected_bg_epoch: 4, // STALE: doesn't match current 5
+            new_bg_epoch: 5,
+            bump_table_epoch: None,
+        };
+        let outcome = mgr.apply_update_bg(&entry).unwrap();
+        assert!(
+            matches!(outcome, ApplyOutcome::SkippedStale { .. }),
+            "expected SkippedStale, got {:?}",
+            outcome
+        );
+        // BG was not mutated.
+        let bg_after = mgr.get_bg(50).unwrap();
+        assert_eq!(bg_after.replica_set, vec![100]);
+        assert_eq!(bg_after.bg_epoch, 5);
+    }
+
+    /// REGRESSION (post-P2.1): apply_update_bg with non-monotonic new_bg_epoch
+    /// returns SkippedNoop (idempotent skip). expected_bg_epoch matches but
+    /// new_bg_epoch <= current.
+    #[test]
+    fn apply_update_bg_returns_noop_on_non_monotonic_new_epoch() {
+        let mgr = test_manager();
+        let mut bg = make_bg(51, 1, vec![100]);
+        bg.bg_epoch = 5;
+        mgr.apply_create_bg(&BGEntry {
+            op_ms: 0,
+            info: bg,
+        })
+        .unwrap();
+
+        let entry = BGUpdateEntry {
+            op_ms: 1,
+            bg_id: 51,
+            state: None,
+            replica_set: Some(vec![200]),
+            lease_owner: None,
+            expected_bg_epoch: 5, // matches current
+            new_bg_epoch: 5,      // not greater than current
+            bump_table_epoch: None,
+        };
+        let outcome = mgr.apply_update_bg(&entry).unwrap();
+        assert_eq!(outcome, ApplyOutcome::SkippedNoop);
+        // BG was not mutated.
+        let bg_after = mgr.get_bg(51).unwrap();
+        assert_eq!(bg_after.replica_set, vec![100]);
+        assert_eq!(bg_after.bg_epoch, 5);
     }
 }

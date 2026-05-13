@@ -562,9 +562,12 @@ where
     }
 
     fn apply_propose(&mut self, entry: &Entry) -> RaftResult<ProposeResponse> {
-        self.storage
+        let result = self
+            .storage
             .apply_propose(self.is_leader(), entry.get_data())?;
-        Ok(ProposeResponse::default())
+        Ok(ProposeResponse {
+            apply_result: Some(result),
+        })
     }
 
     // Whether you need to create a new snapshot.

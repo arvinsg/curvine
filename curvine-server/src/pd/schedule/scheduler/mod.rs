@@ -19,9 +19,44 @@ pub mod lease_balance;
 pub mod stats;
 
 use crate::pd::bg::placement::context::PendingInfluence;
-use crate::pd::node::NodeEvent;
 use crate::pd::schedule::{BGOperator, ManagerContext, OperatorController};
 use std::time::Duration;
+
+#[derive(Debug, Clone)]
+pub enum ScheduleEvent {
+    WorkerJoinedPools {
+        worker_id: u32,
+        node_epoch: u64,
+        target_pool_ids: Vec<u16>,
+        changed_pool_ids: Vec<u16>,
+        event_time_ms: u64,
+    },
+    WorkerLost {
+        worker_id: u32,
+        node_epoch: u64,
+        event_time_ms: u64,
+    },
+    WorkerOffline {
+        worker_id: u32,
+        node_epoch: u64,
+        event_time_ms: u64,
+    },
+    WorkerDecommissionStarted {
+        worker_id: u32,
+        node_epoch: u64,
+        event_time_ms: u64,
+    },
+    WorkerDecommissionFinished {
+        worker_id: u32,
+        node_epoch: u64,
+        event_time_ms: u64,
+    },
+    WorkerHeartbeatResumed {
+        worker_id: u32,
+        node_epoch: u64,
+        event_time_ms: u64,
+    },
+}
 
 /// Scheduler trait: proactive, optimization-driven scheduling.
 ///
@@ -39,7 +74,9 @@ pub trait Scheduler: Send + Sync {
 
     fn next_interval(&self, current: Duration) -> Duration;
 
-    fn on_event(&self, _event: &NodeEvent) {}
+    fn on_event(&self, _event: &ScheduleEvent) {}
+
+    fn on_leader_start(&self) {}
 }
 
 /// Default adaptive interval logic.

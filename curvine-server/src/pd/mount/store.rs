@@ -35,12 +35,11 @@ impl MountStore {
     pub fn get_version(&self) -> CommonResult<u64> {
         match self.store.get(NS, &VERSION_KEY)? {
             Some(v) => {
-                let bytes: [u8; 8] = v
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                let bytes: [u8; 8] = v.as_slice().try_into().map_err(
+                    |_| -> Box<dyn std::error::Error + Send + Sync> {
                         "invalid mount version bytes".into()
-                    })?;
+                    },
+                )?;
                 Ok(u64::from_be_bytes(bytes))
             }
             None => Ok(0),
@@ -70,17 +69,6 @@ impl MountStore {
         let key = self.make_key(mount_id);
         self.store.delete(NS, &key)?;
         Ok(())
-    }
-
-    pub fn get_mount(&self, mount_id: u32) -> CommonResult<Option<MountInfo>> {
-        let key = self.make_key(mount_id);
-        match self.store.get(NS, &key)? {
-            Some(v) => {
-                let info: MountInfo = Serde::deserialize(&v)?;
-                Ok(Some(info))
-            }
-            None => Ok(None),
-        }
     }
 
     pub fn list_all_mounts(&self) -> CommonResult<Vec<MountInfo>> {

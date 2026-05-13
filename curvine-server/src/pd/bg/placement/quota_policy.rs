@@ -14,9 +14,9 @@
 
 use super::context::PlacementContext;
 use super::policy::{
-    build_effective_counts, classify_replica, compute_equal_quota, select_by_hunger,
-    select_lease_by_hunger, is_bg_overloaded, is_lease_overloaded, PlacementPolicy,
-    PolicyState, ReplicaDecision,
+    build_effective_counts, classify_replica, compute_equal_quota, is_bg_overloaded,
+    is_lease_overloaded, select_by_hunger, select_lease_by_hunger, PlacementPolicy, PolicyState,
+    ReplicaDecision,
 };
 use curvine_common::state::BlockGroupInfo;
 use curvine_common::{FsError, FsResult};

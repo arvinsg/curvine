@@ -130,13 +130,18 @@ pub fn build_table_snapshot(
 
     live_workers
         .iter()
-        .map(|&wid| (wid, build_worker_snapshot(wid, &table_bgs, pool_manager, influence, media)))
+        .map(|&wid| {
+            (
+                wid,
+                build_worker_snapshot(wid, &table_bgs, pool_manager, influence, media),
+            )
+        })
         .collect()
 }
 
 fn build_worker_snapshot(
     wid: u32,
-    table_bgs: &[BlockGroupInfo],
+    table_bgs: &[std::sync::Arc<BlockGroupInfo>],
     pool_manager: &PoolManager,
     influence: &PendingInfluence,
     media: StorageType,
