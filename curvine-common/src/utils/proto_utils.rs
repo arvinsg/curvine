@@ -14,6 +14,7 @@
 
 use crate::proto::*;
 use crate::state::*;
+use crate::{FsError, FsResult};
 use orpc::{try_err, CommonResult};
 use prost::bytes::BytesMut;
 use prost::Message;
@@ -700,5 +701,1226 @@ impl ProtoUtils {
 
     pub fn set_config_request_from_http(key: String, value: Vec<u8>) -> SetConfigRequest {
         SetConfigRequest { key, value }
+    }
+
+    fn invalid_proto(msg: impl Into<String>) -> FsError {
+        FsError::common(format!("invalid proto: {}", msg.into()))
+    }
+
+    pub fn node_type_to_pb(t: NodeType) -> i32 {
+        match t {
+            NodeType::Worker => 0,
+            NodeType::Meta => 1,
+        }
+    }
+
+    pub fn node_type_from_pb(v: i32) -> FsResult<NodeType> {
+        match v {
+            0 => Ok(NodeType::Worker),
+            1 => Ok(NodeType::Meta),
+            _ => Err(Self::invalid_proto(format!("unknown node_type={}", v))),
+        }
+    }
+
+    pub fn node_state_to_pb(s: NodeState) -> i32 {
+        match s {
+            NodeState::Starting => 0,
+            NodeState::Live => 1,
+            NodeState::Lost => 2,
+            NodeState::Offline => 3,
+            NodeState::Decommission => 4,
+            NodeState::Blacklist => 5,
+        }
+    }
+
+    pub fn node_state_from_pb(v: i32) -> FsResult<NodeState> {
+        match v {
+            0 => Ok(NodeState::Starting),
+            1 => Ok(NodeState::Live),
+            2 => Ok(NodeState::Lost),
+            3 => Ok(NodeState::Offline),
+            4 => Ok(NodeState::Decommission),
+            5 => Ok(NodeState::Blacklist),
+            _ => Err(Self::invalid_proto(format!("unknown node_state={}", v))),
+        }
+    }
+
+    pub fn replica_state_to_pb(s: ReplicaState) -> i32 {
+        match s {
+            ReplicaState::Pending => 0,
+            ReplicaState::Syncing => 1,
+            ReplicaState::Active => 2,
+            ReplicaState::Lost => 3,
+            ReplicaState::Offline => 4,
+        }
+    }
+
+    pub fn replica_state_from_pb(v: i32) -> FsResult<ReplicaState> {
+        match v {
+            0 => Ok(ReplicaState::Pending),
+            1 => Ok(ReplicaState::Syncing),
+            2 => Ok(ReplicaState::Active),
+            3 => Ok(ReplicaState::Lost),
+            4 => Ok(ReplicaState::Offline),
+            _ => Err(Self::invalid_proto(format!("unknown replica_state={}", v))),
+        }
+    }
+
+    pub fn bg_state_to_pb(s: BGState) -> i32 {
+        match s {
+            BGState::Init => 0,
+            BGState::Assigned => 1,
+            BGState::Active => 2,
+            BGState::Degraded => 3,
+            BGState::Recovering => 4,
+            BGState::Rebalancing => 5,
+            BGState::Deleting => 6,
+        }
+    }
+
+    pub fn bg_state_from_pb(v: i32) -> FsResult<BGState> {
+        match v {
+            0 => Ok(BGState::Init),
+            1 => Ok(BGState::Assigned),
+            2 => Ok(BGState::Active),
+            3 => Ok(BGState::Degraded),
+            4 => Ok(BGState::Recovering),
+            5 => Ok(BGState::Rebalancing),
+            6 => Ok(BGState::Deleting),
+            _ => Err(Self::invalid_proto(format!("unknown bg_state={}", v))),
+        }
+    }
+
+    pub fn bg_op_state_to_pb(s: BGOpState) -> i32 {
+        match s {
+            BGOpState::Idle => 0,
+            BGOpState::Recovering => 1,
+            BGOpState::Rebalancing => 2,
+            BGOpState::LeaseBalancing => 3,
+            BGOpState::Deleting => 4,
+        }
+    }
+
+    pub fn bg_op_state_from_pb(v: i32) -> FsResult<BGOpState> {
+        match v {
+            0 => Ok(BGOpState::Idle),
+            1 => Ok(BGOpState::Recovering),
+            2 => Ok(BGOpState::Rebalancing),
+            3 => Ok(BGOpState::LeaseBalancing),
+            4 => Ok(BGOpState::Deleting),
+            _ => Err(Self::invalid_proto(format!("unknown bg_op_state={}", v))),
+        }
+    }
+
+    pub fn rw_policy_to_pb(p: RwPolicy) -> i32 {
+        match p {
+            RwPolicy::LeaderOnly => 0,
+            RwPolicy::LeaderWriteFollowerRead => 1,
+        }
+    }
+
+    pub fn rw_policy_from_pb(v: i32) -> FsResult<RwPolicy> {
+        match v {
+            0 => Ok(RwPolicy::LeaderOnly),
+            1 => Ok(RwPolicy::LeaderWriteFollowerRead),
+            _ => Err(Self::invalid_proto(format!("unknown rw_policy={}", v))),
+        }
+    }
+
+    pub fn meta_node_mode_to_pb(m: MetaNodeMode) -> i32 {
+        match m {
+            MetaNodeMode::Proxy => 0,
+            MetaNodeMode::Shard => 1,
+            MetaNodeMode::Federation => 2,
+        }
+    }
+
+    pub fn meta_node_mode_from_pb(v: i32) -> FsResult<MetaNodeMode> {
+        match v {
+            0 => Ok(MetaNodeMode::Proxy),
+            1 => Ok(MetaNodeMode::Shard),
+            2 => Ok(MetaNodeMode::Federation),
+            _ => Err(Self::invalid_proto(format!("unknown meta_node_mode={}", v))),
+        }
+    }
+
+    pub fn federation_route_mode_to_pb(m: FederationRouteMode) -> i32 {
+        match m {
+            FederationRouteMode::Static => 0,
+            FederationRouteMode::Hash => 1,
+        }
+    }
+
+    pub fn federation_route_mode_from_pb(v: i32) -> FsResult<FederationRouteMode> {
+        match v {
+            0 => Ok(FederationRouteMode::Static),
+            1 => Ok(FederationRouteMode::Hash),
+            _ => Err(Self::invalid_proto(format!(
+                "unknown federation_route_mode={}",
+                v
+            ))),
+        }
+    }
+
+    pub fn node_address_to_pb(addr: &NodeAddress) -> NodeAddressProto {
+        NodeAddressProto {
+            hostname: addr.hostname.clone(),
+            ip: addr.ip.clone(),
+            rpc_port: addr.rpc_port as u32,
+            web_port: addr.web_port as u32,
+        }
+    }
+
+    pub fn node_address_from_pb(addr: NodeAddressProto) -> FsResult<NodeAddress> {
+        if addr.rpc_port > u16::MAX as u32 || addr.web_port > u16::MAX as u32 {
+            return Err(Self::invalid_proto(format!(
+                "node address port out of range rpc_port={} web_port={}",
+                addr.rpc_port, addr.web_port
+            )));
+        }
+        Ok(NodeAddress {
+            hostname: addr.hostname,
+            ip: addr.ip,
+            rpc_port: addr.rpc_port as u16,
+            web_port: addr.web_port as u16,
+        })
+    }
+
+    pub fn system_stats_to_pb(stats: &SystemStats) -> SystemStatsProto {
+        SystemStatsProto {
+            cpu_usage: stats.cpu_usage,
+            memory_usage: stats.memory_usage,
+        }
+    }
+
+    pub fn system_stats_from_pb(stats: SystemStatsProto) -> SystemStats {
+        SystemStats {
+            cpu_usage: stats.cpu_usage,
+            memory_usage: stats.memory_usage,
+        }
+    }
+
+    pub fn node_base_to_pb(base: &NodeBase) -> NodeBaseProto {
+        NodeBaseProto {
+            node_id: base.node_id,
+            node_type: Self::node_type_to_pb(base.node_type),
+            address: Self::node_address_to_pb(&base.address),
+            labels: base.labels.clone(),
+            software_version: base.software_version.clone(),
+            startup_time_ms: base.startup_time_ms,
+        }
+    }
+
+    pub fn node_base_from_pb(base: NodeBaseProto) -> FsResult<NodeBase> {
+        if base.node_id == 0 {
+            return Err(Self::invalid_proto("node_id must not be 0"));
+        }
+        Ok(NodeBase {
+            node_id: base.node_id,
+            node_type: Self::node_type_from_pb(base.node_type)?,
+            address: Self::node_address_from_pb(base.address)?,
+            labels: base.labels,
+            software_version: base.software_version,
+            startup_time_ms: base.startup_time_ms,
+        })
+    }
+
+    pub fn storage_spec_to_pb(spec: &StorageSpec) -> StorageSpecProto {
+        StorageSpecProto {
+            dir_id: spec.dir_id,
+            storage_id: spec.storage_id.clone(),
+            failed: spec.failed,
+            storage_type: spec.storage_type.into(),
+            dir_path: spec.dir_path.clone(),
+        }
+    }
+
+    pub fn storage_spec_from_pb(spec: StorageSpecProto) -> StorageSpec {
+        StorageSpec {
+            dir_id: spec.dir_id,
+            storage_id: spec.storage_id,
+            failed: spec.failed,
+            storage_type: StorageType::from(spec.storage_type),
+            dir_path: spec.dir_path,
+        }
+    }
+
+    pub fn storage_stats_to_pb(stats: &StorageStats) -> StorageStatsProto {
+        StorageStatsProto {
+            capacity: stats.capacity,
+            fs_used: stats.fs_used,
+            non_fs_used: stats.non_fs_used,
+            available: stats.available,
+            reserved_bytes: stats.reserved_bytes,
+            block_num: stats.block_num,
+            dir_path: stats.dir_path.clone(),
+        }
+    }
+
+    pub fn storage_stats_from_pb(stats: StorageStatsProto) -> StorageStats {
+        StorageStats {
+            capacity: stats.capacity,
+            fs_used: stats.fs_used,
+            non_fs_used: stats.non_fs_used,
+            available: stats.available,
+            reserved_bytes: stats.reserved_bytes,
+            block_num: stats.block_num,
+            dir_path: stats.dir_path,
+        }
+    }
+
+    pub fn bg_stats_to_pb(stats: &BGStats) -> BgStatsProto {
+        BgStatsProto {
+            used_bytes: stats.used_bytes,
+            free_bytes: stats.free_bytes,
+            block_count: stats.block_count,
+            last_report_ms: stats.last_report_ms,
+        }
+    }
+
+    pub fn bg_stats_from_pb(stats: BgStatsProto) -> BGStats {
+        BGStats {
+            used_bytes: stats.used_bytes,
+            free_bytes: stats.free_bytes,
+            block_count: stats.block_count,
+            last_report_ms: stats.last_report_ms,
+        }
+    }
+
+    pub fn worker_bg_report_to_pb(report: &WorkerBGReport) -> WorkerBgReportProto {
+        WorkerBgReportProto {
+            bg_id: report.bg_id,
+            state: Self::replica_state_to_pb(report.state),
+            stats: Some(Self::bg_stats_to_pb(&report.stats)),
+        }
+    }
+
+    pub fn worker_bg_report_from_pb(report: WorkerBgReportProto) -> FsResult<WorkerBGReport> {
+        Ok(WorkerBGReport {
+            bg_id: report.bg_id,
+            state: Self::replica_state_from_pb(report.state)?,
+            stats: report.stats.map(Self::bg_stats_from_pb).unwrap_or_default(),
+        })
+    }
+
+    pub fn worker_register_payload_to_pb(
+        payload: &WorkerNodePayload,
+    ) -> WorkerRegisterPayloadProto {
+        WorkerRegisterPayloadProto {
+            storage_specs: payload
+                .storage_specs
+                .iter()
+                .map(|(k, v)| (k.clone(), Self::storage_spec_to_pb(v)))
+                .collect(),
+        }
+    }
+
+    pub fn worker_register_payload_from_pb(
+        payload: WorkerRegisterPayloadProto,
+    ) -> WorkerNodePayload {
+        WorkerNodePayload {
+            storage_specs: payload
+                .storage_specs
+                .into_iter()
+                .map(|(k, v)| (k, Self::storage_spec_from_pb(v)))
+                .collect(),
+            bg_epochs: Default::default(),
+            storage_stats: Default::default(),
+            bg_reports: Default::default(),
+        }
+    }
+
+    pub fn worker_heartbeat_payload_to_pb(
+        payload: &WorkerHeartbeatPayload,
+    ) -> WorkerHeartbeatPayloadProto {
+        WorkerHeartbeatPayloadProto {
+            storage_stats: payload
+                .storage_stats
+                .iter()
+                .map(|(k, v)| (k.clone(), Self::storage_stats_to_pb(v)))
+                .collect(),
+            sys_stats: Self::system_stats_to_pb(&payload.sys_stats),
+            bg_epochs: payload.bg_epochs.clone(),
+            bg_reports: payload
+                .bg_reports
+                .iter()
+                .map(Self::worker_bg_report_to_pb)
+                .collect(),
+        }
+    }
+
+    pub fn worker_heartbeat_payload_from_pb(
+        payload: WorkerHeartbeatPayloadProto,
+    ) -> FsResult<WorkerHeartbeatPayload> {
+        let mut bg_reports = Vec::with_capacity(payload.bg_reports.len());
+        for report in payload.bg_reports {
+            bg_reports.push(Self::worker_bg_report_from_pb(report)?);
+        }
+        Ok(WorkerHeartbeatPayload {
+            storage_stats: payload
+                .storage_stats
+                .into_iter()
+                .map(|(k, v)| (k, Self::storage_stats_from_pb(v)))
+                .collect(),
+            sys_stats: Self::system_stats_from_pb(payload.sys_stats),
+            bg_epochs: payload.bg_epochs,
+            bg_reports,
+        })
+    }
+
+    pub fn peer_info_to_pb(peer: &PeerInfo) -> PeerInfoProto {
+        PeerInfoProto {
+            node_id: peer.node_id,
+            address: Self::node_address_to_pb(&peer.address),
+            is_leader: peer.is_leader,
+        }
+    }
+
+    pub fn peer_info_from_pb(peer: PeerInfoProto) -> FsResult<PeerInfo> {
+        Ok(PeerInfo {
+            node_id: peer.node_id,
+            address: Self::node_address_from_pb(peer.address)?,
+            is_leader: peer.is_leader,
+        })
+    }
+
+    pub fn node_group_info_to_pb(group: &NodeGroupInfo) -> NodeGroupInfoProto {
+        NodeGroupInfoProto {
+            group_id: group.group_id,
+            peers: group.peers.iter().map(Self::peer_info_to_pb).collect(),
+        }
+    }
+
+    pub fn node_group_info_from_pb(group: NodeGroupInfoProto) -> FsResult<NodeGroupInfo> {
+        let mut peers = Vec::with_capacity(group.peers.len());
+        for peer in group.peers {
+            peers.push(Self::peer_info_from_pb(peer)?);
+        }
+        Ok(NodeGroupInfo {
+            group_id: group.group_id,
+            peers,
+        })
+    }
+
+    pub fn inodes_stats_to_pb(stats: &InodesStats) -> InodesStatsProto {
+        InodesStatsProto {
+            inode_count: stats.inode_count,
+            dir_count: stats.dir_count,
+            file_count: stats.file_count,
+            total_size: stats.total_size,
+        }
+    }
+
+    pub fn inodes_stats_from_pb(stats: InodesStatsProto) -> InodesStats {
+        InodesStats {
+            inode_count: stats.inode_count,
+            dir_count: stats.dir_count,
+            file_count: stats.file_count,
+            total_size: stats.total_size,
+        }
+    }
+
+    pub fn meta_register_payload_to_pb(payload: &MetaNodePayload) -> MetaRegisterPayloadProto {
+        MetaRegisterPayloadProto {
+            group_id: payload.group_id,
+            peers: payload.peers.iter().map(Self::peer_info_to_pb).collect(),
+            rw_policy: Self::rw_policy_to_pb(payload.rw_policy),
+            group_epoch: payload.group_epoch,
+        }
+    }
+
+    pub fn meta_register_payload_from_pb(
+        payload: MetaRegisterPayloadProto,
+    ) -> FsResult<MetaNodePayload> {
+        let mut peers = Vec::with_capacity(payload.peers.len());
+        for peer in payload.peers {
+            peers.push(Self::peer_info_from_pb(peer)?);
+        }
+        Ok(MetaNodePayload {
+            group_id: payload.group_id,
+            peers,
+            rw_policy: Self::rw_policy_from_pb(payload.rw_policy)?,
+            group_epoch: payload.group_epoch,
+            stats: Default::default(),
+        })
+    }
+
+    pub fn meta_heartbeat_payload_to_pb(
+        payload: &MetaHeartbeatPayload,
+    ) -> MetaHeartbeatPayloadProto {
+        MetaHeartbeatPayloadProto {
+            group_id: payload.group_id,
+            group_epoch: payload.group_epoch,
+            is_leader: payload.is_leader,
+            peers: payload.peers.iter().map(Self::peer_info_to_pb).collect(),
+            rw_policy: Self::rw_policy_to_pb(payload.rw_policy),
+            inodes_stats: Self::inodes_stats_to_pb(&payload.inodes_stats),
+            sys_stats: Self::system_stats_to_pb(&payload.sys_stats),
+        }
+    }
+
+    pub fn meta_heartbeat_payload_from_pb(
+        payload: MetaHeartbeatPayloadProto,
+    ) -> FsResult<MetaHeartbeatPayload> {
+        let mut peers = Vec::with_capacity(payload.peers.len());
+        for peer in payload.peers {
+            peers.push(Self::peer_info_from_pb(peer)?);
+        }
+        Ok(MetaHeartbeatPayload {
+            group_id: payload.group_id,
+            group_epoch: payload.group_epoch,
+            is_leader: payload.is_leader,
+            peers,
+            rw_policy: Self::rw_policy_from_pb(payload.rw_policy)?,
+            inodes_stats: Self::inodes_stats_from_pb(payload.inodes_stats),
+            sys_stats: Self::system_stats_from_pb(payload.sys_stats),
+        })
+    }
+
+    pub fn register_request_to_pb(req: &RegisterRequest) -> NodeRegisterRequest {
+        let (worker, meta) = match &req.payload {
+            NodePayload::Worker(p) => (Some(Self::worker_register_payload_to_pb(p)), None),
+            NodePayload::Meta(p) => (None, Some(Self::meta_register_payload_to_pb(p))),
+        };
+        NodeRegisterRequest {
+            cluster_id: req.cluster_id.clone(),
+            base: Self::node_base_to_pb(&req.base),
+            worker,
+            meta,
+        }
+    }
+
+    pub fn register_request_from_pb(req: NodeRegisterRequest) -> FsResult<RegisterRequest> {
+        let base = Self::node_base_from_pb(req.base)?;
+        let payload = match (base.node_type, req.worker, req.meta) {
+            (NodeType::Worker, Some(worker), None) => {
+                NodePayload::Worker(Self::worker_register_payload_from_pb(worker))
+            }
+            (NodeType::Meta, None, Some(meta)) => {
+                NodePayload::Meta(Self::meta_register_payload_from_pb(meta)?)
+            }
+            (node_type, worker, meta) => {
+                return Err(Self::invalid_proto(format!(
+                    "register payload mismatch node_type={:?}, worker_set={}, meta_set={}",
+                    node_type,
+                    worker.is_some(),
+                    meta.is_some()
+                )));
+            }
+        };
+        Ok(RegisterRequest {
+            cluster_id: req.cluster_id,
+            base,
+            payload,
+        })
+    }
+
+    pub fn heartbeat_request_to_pb(req: &HeartbeatRequest) -> NodeHeartbeatRequest {
+        let (worker, meta) = match &req.payload {
+            HeartbeatPayload::Worker(p) => (Some(Self::worker_heartbeat_payload_to_pb(p)), None),
+            HeartbeatPayload::Meta(p) => (None, Some(Self::meta_heartbeat_payload_to_pb(p))),
+        };
+        NodeHeartbeatRequest {
+            cluster_id: req.cluster_id.clone(),
+            node_id: req.node_id,
+            node_type: Self::node_type_to_pb(req.node_type),
+            epoch: req.epoch,
+            timestamp_ms: req.timestamp_ms,
+            address: Self::node_address_to_pb(&req.address),
+            worker,
+            meta,
+        }
+    }
+
+    pub fn heartbeat_request_from_pb(req: NodeHeartbeatRequest) -> FsResult<HeartbeatRequest> {
+        if req.node_id == 0 {
+            return Err(Self::invalid_proto("node_id must not be 0"));
+        }
+        let node_type = Self::node_type_from_pb(req.node_type)?;
+        let payload = match (node_type, req.worker, req.meta) {
+            (NodeType::Worker, Some(worker), None) => {
+                HeartbeatPayload::Worker(Self::worker_heartbeat_payload_from_pb(worker)?)
+            }
+            (NodeType::Meta, None, Some(meta)) => {
+                HeartbeatPayload::Meta(Self::meta_heartbeat_payload_from_pb(meta)?)
+            }
+            (node_type, worker, meta) => {
+                return Err(Self::invalid_proto(format!(
+                    "heartbeat payload mismatch node_type={:?}, worker_set={}, meta_set={}",
+                    node_type,
+                    worker.is_some(),
+                    meta.is_some()
+                )));
+            }
+        };
+        Ok(HeartbeatRequest {
+            cluster_id: req.cluster_id,
+            node_id: req.node_id,
+            node_type,
+            epoch: req.epoch,
+            timestamp_ms: req.timestamp_ms,
+            address: Self::node_address_from_pb(req.address)?,
+            payload,
+        })
+    }
+
+    pub fn bg_lease_to_pb(lease: &BGLease) -> BgLeaseProto {
+        BgLeaseProto {
+            node_id: lease.node_id,
+            epoch: lease.epoch,
+            grant_time_ms: lease.grant_time_ms,
+        }
+    }
+
+    pub fn bg_lease_from_pb(lease: BgLeaseProto) -> BGLease {
+        BGLease {
+            node_id: lease.node_id,
+            epoch: lease.epoch,
+            grant_time_ms: lease.grant_time_ms,
+        }
+    }
+
+    pub fn replica_info_to_pb(replica: &ReplicaInfo) -> ReplicaInfoProto {
+        ReplicaInfoProto {
+            node_id: replica.node_id,
+            address: Self::node_address_to_pb(&replica.address),
+            state: Self::node_state_to_pb(replica.state),
+            labels: replica.labels.clone(),
+        }
+    }
+
+    pub fn replica_info_from_pb(replica: ReplicaInfoProto) -> FsResult<ReplicaInfo> {
+        Ok(ReplicaInfo {
+            node_id: replica.node_id,
+            address: Self::node_address_from_pb(replica.address)?,
+            state: Self::node_state_from_pb(replica.state)?,
+            labels: replica.labels,
+        })
+    }
+
+    pub fn block_group_info_to_pb(bg: &BlockGroupInfo) -> BlockGroupInfoProto {
+        BlockGroupInfoProto {
+            bg_id: bg.bg_id,
+            table_id: bg.table_id,
+            bg_epoch: bg.bg_epoch,
+            replica_set: bg.replica_set.clone(),
+            state: Self::bg_state_to_pb(bg.state),
+            op_state: Self::bg_op_state_to_pb(bg.op_state),
+            lease_owner: bg.lease_owner.as_ref().map(Self::bg_lease_to_pb),
+        }
+    }
+
+    pub fn block_group_info_from_pb(bg: BlockGroupInfoProto) -> FsResult<BlockGroupInfo> {
+        Ok(BlockGroupInfo {
+            bg_id: bg.bg_id,
+            table_id: bg.table_id,
+            bg_epoch: bg.bg_epoch,
+            replica_set: bg.replica_set,
+            state: Self::bg_state_from_pb(bg.state)?,
+            op_state: Self::bg_op_state_from_pb(bg.op_state)?,
+            lease_owner: bg.lease_owner.map(Self::bg_lease_from_pb),
+            stats: Default::default(),
+        })
+    }
+
+    pub fn block_group_info_view_to_pb(bg: &BlockGroupInfoView) -> BlockGroupInfoViewProto {
+        BlockGroupInfoViewProto {
+            bg_id: bg.bg_id,
+            table_id: bg.table_id,
+            bg_epoch: bg.bg_epoch,
+            replica_set: bg
+                .replica_set
+                .iter()
+                .map(Self::replica_info_to_pb)
+                .collect(),
+            state: Self::bg_state_to_pb(bg.state),
+            op_state: Self::bg_op_state_to_pb(bg.op_state),
+            lease_owner: bg.lease_owner.as_ref().map(Self::bg_lease_to_pb),
+        }
+    }
+
+    pub fn block_group_info_view_from_pb(
+        bg: BlockGroupInfoViewProto,
+    ) -> FsResult<BlockGroupInfoView> {
+        let mut replicas = Vec::with_capacity(bg.replica_set.len());
+        for replica in bg.replica_set {
+            replicas.push(Self::replica_info_from_pb(replica)?);
+        }
+        Ok(BlockGroupInfoView {
+            bg_id: bg.bg_id,
+            table_id: bg.table_id,
+            bg_epoch: bg.bg_epoch,
+            replica_set: replicas,
+            state: Self::bg_state_from_pb(bg.state)?,
+            op_state: Self::bg_op_state_from_pb(bg.op_state)?,
+            lease_owner: bg.lease_owner.map(Self::bg_lease_from_pb),
+        })
+    }
+
+    pub fn bg_table_summary_to_pb(summary: &BGTableSummary) -> BgTableSummaryProto {
+        BgTableSummaryProto {
+            table_id: summary.table_id,
+            bucket_count: summary.bucket_count,
+            epoch: summary.epoch,
+            last_rebuild_ms: summary.last_rebuild_ms,
+            buckets: summary
+                .buckets
+                .iter()
+                .map(Self::block_group_info_view_to_pb)
+                .collect(),
+        }
+    }
+
+    pub fn bg_table_summary_from_pb(summary: BgTableSummaryProto) -> FsResult<BGTableSummary> {
+        let mut buckets = Vec::with_capacity(summary.buckets.len());
+        for bucket in summary.buckets {
+            buckets.push(Self::block_group_info_view_from_pb(bucket)?);
+        }
+        Ok(BGTableSummary {
+            table_id: summary.table_id,
+            bucket_count: summary.bucket_count,
+            epoch: summary.epoch,
+            last_rebuild_ms: summary.last_rebuild_ms,
+            buckets,
+        })
+    }
+
+    pub fn worker_heartbeat_response_to_pb(
+        resp: &crate::state::WorkerHeartbeatResponse,
+    ) -> WorkerHeartbeatResponseProto {
+        WorkerHeartbeatResponseProto {
+            add_bgs: resp
+                .add_bgs
+                .iter()
+                .map(Self::block_group_info_to_pb)
+                .collect(),
+            remove_bgs: resp.remove_bgs.clone(),
+            update_bgs: resp
+                .update_bgs
+                .iter()
+                .map(Self::block_group_info_to_pb)
+                .collect(),
+        }
+    }
+
+    pub fn worker_heartbeat_response_from_pb(
+        resp: WorkerHeartbeatResponseProto,
+    ) -> FsResult<crate::state::WorkerHeartbeatResponse> {
+        let mut add_bgs = Vec::with_capacity(resp.add_bgs.len());
+        for bg in resp.add_bgs {
+            add_bgs.push(Self::block_group_info_from_pb(bg)?);
+        }
+        let mut update_bgs = Vec::with_capacity(resp.update_bgs.len());
+        for bg in resp.update_bgs {
+            update_bgs.push(Self::block_group_info_from_pb(bg)?);
+        }
+        Ok(crate::state::WorkerHeartbeatResponse {
+            add_bgs,
+            remove_bgs: resp.remove_bgs,
+            update_bgs,
+        })
+    }
+
+    pub fn path_route_entry_to_pb(entry: &PathRouteEntry) -> PathRouteEntryProto {
+        PathRouteEntryProto {
+            path: entry.path.clone(),
+            group_id: entry.group_id,
+            create_time_ms: entry.create_time_ms,
+            update_time_ms: entry.update_time_ms,
+        }
+    }
+
+    pub fn path_route_entry_from_pb(entry: PathRouteEntryProto) -> PathRouteEntry {
+        PathRouteEntry {
+            path: entry.path,
+            group_id: entry.group_id,
+            create_time_ms: entry.create_time_ms,
+            update_time_ms: entry.update_time_ms,
+            expected_table_version: 0,
+        }
+    }
+
+    pub fn path_route_table_to_pb(table: &PathRouteTable) -> PathRouteTableProto {
+        PathRouteTableProto {
+            version: table.version,
+            routes: table
+                .routes
+                .iter()
+                .map(Self::path_route_entry_to_pb)
+                .collect(),
+            last_update_ms: table.last_update_ms,
+        }
+    }
+
+    pub fn path_route_table_from_pb(table: PathRouteTableProto) -> PathRouteTable {
+        let mut out = PathRouteTable::default();
+        out.version = table.version;
+        out.routes = table
+            .routes
+            .into_iter()
+            .map(Self::path_route_entry_from_pb)
+            .collect();
+        out.last_update_ms = table.last_update_ms;
+        out
+    }
+
+    pub fn path_route_update_to_pb(update: &PathRouteUpdate) -> PathRouteUpdateProto {
+        match &update.action {
+            RouteUpdateAction::FullSync { routes } => PathRouteUpdateProto {
+                version: update.version,
+                action_type: 0,
+                routes: routes.iter().map(Self::path_route_entry_to_pb).collect(),
+                added: vec![],
+                removed: vec![],
+            },
+            RouteUpdateAction::Incremental { added, removed } => PathRouteUpdateProto {
+                version: update.version,
+                action_type: 1,
+                routes: vec![],
+                added: added.iter().map(Self::path_route_entry_to_pb).collect(),
+                removed: removed.clone(),
+            },
+        }
+    }
+
+    pub fn path_route_update_from_pb(update: PathRouteUpdateProto) -> FsResult<PathRouteUpdate> {
+        let action = match update.action_type {
+            0 => RouteUpdateAction::FullSync {
+                routes: update
+                    .routes
+                    .into_iter()
+                    .map(Self::path_route_entry_from_pb)
+                    .collect(),
+            },
+            1 => RouteUpdateAction::Incremental {
+                added: update
+                    .added
+                    .into_iter()
+                    .map(Self::path_route_entry_from_pb)
+                    .collect(),
+                removed: update.removed,
+            },
+            v => {
+                return Err(Self::invalid_proto(format!(
+                    "unknown route_update_action={}",
+                    v
+                )))
+            }
+        };
+        Ok(PathRouteUpdate {
+            version: update.version,
+            action,
+        })
+    }
+
+    pub fn node_group_update_to_pb(update: &NodeGroupUpdate) -> NodeGroupUpdateProto {
+        match &update.action {
+            NodeGroupUpdateAction::AddGroup { groups } => NodeGroupUpdateProto {
+                version: update.version,
+                action_type: 0,
+                groups: groups.iter().map(Self::node_group_info_to_pb).collect(),
+                group_ids: vec![],
+            },
+            NodeGroupUpdateAction::RemoveGroup { group_ids } => NodeGroupUpdateProto {
+                version: update.version,
+                action_type: 1,
+                groups: vec![],
+                group_ids: group_ids.clone(),
+            },
+        }
+    }
+
+    pub fn node_group_update_from_pb(update: NodeGroupUpdateProto) -> FsResult<NodeGroupUpdate> {
+        let action = match update.action_type {
+            0 => {
+                let mut groups = Vec::with_capacity(update.groups.len());
+                for group in update.groups {
+                    groups.push(Self::node_group_info_from_pb(group)?);
+                }
+                NodeGroupUpdateAction::AddGroup { groups }
+            }
+            1 => NodeGroupUpdateAction::RemoveGroup {
+                group_ids: update.group_ids,
+            },
+            v => {
+                return Err(Self::invalid_proto(format!(
+                    "unknown node_group_update_action={}",
+                    v
+                )))
+            }
+        };
+        Ok(NodeGroupUpdate {
+            version: update.version,
+            action,
+        })
+    }
+
+    pub fn meta_heartbeat_response_to_pb(
+        resp: &MetaHeartbeatResponse,
+    ) -> MetaHeartbeatResponseProto {
+        MetaHeartbeatResponseProto {
+            path_route_update: resp
+                .path_route_update
+                .as_ref()
+                .map(Self::path_route_update_to_pb),
+            node_group_update: resp
+                .node_group_update
+                .as_ref()
+                .map(Self::node_group_update_to_pb),
+        }
+    }
+
+    pub fn meta_heartbeat_response_from_pb(
+        resp: MetaHeartbeatResponseProto,
+    ) -> FsResult<MetaHeartbeatResponse> {
+        Ok(MetaHeartbeatResponse {
+            path_route_update: resp
+                .path_route_update
+                .map(Self::path_route_update_from_pb)
+                .transpose()?,
+            node_group_update: resp
+                .node_group_update
+                .map(Self::node_group_update_from_pb)
+                .transpose()?,
+        })
+    }
+
+    pub fn heartbeat_response_to_pb(resp: &HeartbeatResponse) -> NodeHeartbeatResponseProto {
+        let (worker, meta) = match &resp.payload {
+            HeartbeatResponsePayload::Worker(w) => {
+                (Some(Self::worker_heartbeat_response_to_pb(w)), None)
+            }
+            HeartbeatResponsePayload::Meta(m) => {
+                (None, Some(Self::meta_heartbeat_response_to_pb(m)))
+            }
+        };
+        NodeHeartbeatResponseProto {
+            error: resp.error.clone(),
+            epoch: resp.epoch,
+            mount_version: resp.mount_version,
+            table_epochs: resp.table_epochs.clone(),
+            worker,
+            meta,
+        }
+    }
+
+    pub fn heartbeat_response_from_pb(
+        resp: NodeHeartbeatResponseProto,
+    ) -> FsResult<HeartbeatResponse> {
+        let payload = match (resp.worker, resp.meta) {
+            (Some(worker), None) => {
+                HeartbeatResponsePayload::Worker(Self::worker_heartbeat_response_from_pb(worker)?)
+            }
+            (None, Some(meta)) => {
+                HeartbeatResponsePayload::Meta(Self::meta_heartbeat_response_from_pb(meta)?)
+            }
+            (worker, meta) => {
+                return Err(Self::invalid_proto(format!(
+                    "heartbeat response payload mismatch worker_set={} meta_set={}",
+                    worker.is_some(),
+                    meta.is_some()
+                )));
+            }
+        };
+        Ok(HeartbeatResponse {
+            error: resp.error,
+            epoch: resp.epoch,
+            mount_version: resp.mount_version,
+            table_epochs: resp.table_epochs,
+            payload,
+        })
+    }
+
+    pub fn register_response_to_pb(resp: &HeartbeatResponse) -> NodeRegisterResponse {
+        NodeRegisterResponse {
+            response: Self::heartbeat_response_to_pb(resp),
+        }
+    }
+
+    pub fn register_response_from_pb(resp: NodeRegisterResponse) -> FsResult<HeartbeatResponse> {
+        Self::heartbeat_response_from_pb(resp.response)
+    }
+
+    pub fn meta_route_summary_to_pb(summary: &MetaRouteSummary) -> MetaRouteSummaryProto {
+        MetaRouteSummaryProto {
+            mode: Self::meta_node_mode_to_pb(summary.mode),
+            version: summary.version,
+            federation_route_mode: summary
+                .federation_route_mode
+                .map(Self::federation_route_mode_to_pb),
+            path_table: summary
+                .path_table
+                .as_ref()
+                .map(Self::path_route_table_to_pb),
+            meta_groups: summary
+                .meta_groups
+                .iter()
+                .map(|(k, v)| (*k, Self::node_group_info_to_pb(v)))
+                .collect(),
+            group_id_order: summary.group_id_order.clone(),
+            federation_hash_level: summary.federation_hash_level.map(|v| v as u32),
+        }
+    }
+
+    pub fn meta_route_summary_from_pb(
+        summary: MetaRouteSummaryProto,
+    ) -> FsResult<MetaRouteSummary> {
+        let mut meta_groups = std::collections::HashMap::new();
+        for (k, v) in summary.meta_groups {
+            meta_groups.insert(k, Self::node_group_info_from_pb(v)?);
+        }
+        Ok(MetaRouteSummary {
+            mode: Self::meta_node_mode_from_pb(summary.mode)?,
+            version: summary.version,
+            federation_route_mode: summary
+                .federation_route_mode
+                .map(Self::federation_route_mode_from_pb)
+                .transpose()?,
+            path_table: summary.path_table.map(Self::path_route_table_from_pb),
+            meta_groups,
+            group_id_order: summary.group_id_order,
+            federation_hash_level: summary.federation_hash_level.map(|v| v as u8),
+        })
+    }
+}
+
+#[cfg(test)]
+mod pd_proto_utils_tests {
+    use super::ProtoUtils;
+    use crate::proto::{MetaHeartbeatResponseProto, MetaRegisterPayloadProto};
+    use crate::state::*;
+    use std::collections::HashMap;
+
+    fn node_addr(id: u32) -> NodeAddress {
+        NodeAddress {
+            hostname: format!("host-{}", id),
+            ip: format!("10.0.0.{}", id),
+            rpc_port: 8000 + id as u16,
+            web_port: 9000 + id as u16,
+        }
+    }
+
+    fn worker_register_request() -> RegisterRequest {
+        let mut specs = HashMap::new();
+        specs.insert(
+            "s1".to_string(),
+            StorageSpec {
+                dir_id: 1,
+                storage_id: "s1".to_string(),
+                failed: false,
+                storage_type: StorageType::Disk,
+                dir_path: "/data1".to_string(),
+            },
+        );
+        RegisterRequest {
+            cluster_id: "curvine".to_string(),
+            base: NodeBase {
+                node_id: 10,
+                node_type: NodeType::Worker,
+                address: node_addr(10),
+                labels: HashMap::from([("rack".to_string(), "r1".to_string())]),
+                software_version: "test".to_string(),
+                startup_time_ms: 123,
+            },
+            payload: NodePayload::Worker(WorkerNodePayload {
+                storage_specs: specs,
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn worker_heartbeat_request() -> HeartbeatRequest {
+        let mut storage_stats = HashMap::new();
+        storage_stats.insert(
+            "s1".to_string(),
+            StorageStats {
+                capacity: 100,
+                fs_used: 10,
+                non_fs_used: 2,
+                available: 88,
+                reserved_bytes: 1,
+                block_num: 3,
+                dir_path: "/data1".to_string(),
+            },
+        );
+        HeartbeatRequest {
+            cluster_id: "curvine".to_string(),
+            node_id: 10,
+            node_type: NodeType::Worker,
+            epoch: 2,
+            timestamp_ms: 456,
+            address: node_addr(10),
+            payload: HeartbeatPayload::Worker(WorkerHeartbeatPayload {
+                storage_stats,
+                sys_stats: SystemStats {
+                    cpu_usage: 0.5,
+                    memory_usage: 0.6,
+                },
+                bg_epochs: HashMap::from([(7, 11)]),
+                bg_reports: vec![WorkerBGReport {
+                    bg_id: 7,
+                    state: ReplicaState::Active,
+                    stats: BGStats {
+                        used_bytes: 1,
+                        free_bytes: 2,
+                        block_count: 3,
+                        last_report_ms: 4,
+                    },
+                }],
+            }),
+        }
+    }
+
+    fn meta_register_payload_pb() -> MetaRegisterPayloadProto {
+        MetaRegisterPayloadProto {
+            group_id: 1,
+            peers: vec![],
+            rw_policy: ProtoUtils::rw_policy_to_pb(RwPolicy::LeaderOnly),
+            group_epoch: 1,
+        }
+    }
+
+    #[test]
+    fn register_request_worker_round_trip() {
+        let req = worker_register_request();
+        let decoded =
+            ProtoUtils::register_request_from_pb(ProtoUtils::register_request_to_pb(&req))
+                .expect("round trip register");
+        assert_eq!(decoded.cluster_id, req.cluster_id);
+        assert_eq!(decoded.base.node_id, req.base.node_id);
+        assert_eq!(decoded.base.node_type, NodeType::Worker);
+        match decoded.payload {
+            NodePayload::Worker(w) => assert!(w.storage_specs.contains_key("s1")),
+            _ => panic!("expected worker payload"),
+        }
+    }
+
+    #[test]
+    fn heartbeat_request_worker_round_trip() {
+        let req = worker_heartbeat_request();
+        let decoded =
+            ProtoUtils::heartbeat_request_from_pb(ProtoUtils::heartbeat_request_to_pb(&req))
+                .expect("round trip heartbeat");
+        assert_eq!(decoded.node_id, req.node_id);
+        assert_eq!(decoded.node_type, NodeType::Worker);
+        assert_eq!(decoded.epoch, req.epoch);
+        match decoded.payload {
+            HeartbeatPayload::Worker(w) => {
+                assert_eq!(w.bg_epochs.get(&7), Some(&11));
+                assert_eq!(w.bg_reports[0].state, ReplicaState::Active);
+            }
+            _ => panic!("expected worker heartbeat payload"),
+        }
+    }
+
+    #[test]
+    fn register_response_round_trip() {
+        let resp = HeartbeatResponse {
+            error: Some("soft".to_string()),
+            epoch: 3,
+            mount_version: 4,
+            table_epochs: HashMap::from([(1, 9)]),
+            payload: HeartbeatResponsePayload::Worker(WorkerHeartbeatResponse {
+                add_bgs: vec![BlockGroupInfo {
+                    bg_id: 7,
+                    table_id: 1,
+                    bg_epoch: 9,
+                    replica_set: vec![10],
+                    state: BGState::Active,
+                    op_state: BGOpState::Idle,
+                    lease_owner: None,
+                    stats: Default::default(),
+                }],
+                remove_bgs: vec![8],
+                update_bgs: vec![],
+            }),
+        };
+        let decoded =
+            ProtoUtils::register_response_from_pb(ProtoUtils::register_response_to_pb(&resp))
+                .expect("round trip register response");
+        assert_eq!(decoded.error, resp.error);
+        assert_eq!(decoded.table_epochs.get(&1), Some(&9));
+        match decoded.payload {
+            HeartbeatResponsePayload::Worker(w) => {
+                assert_eq!(w.add_bgs[0].bg_id, 7);
+                assert_eq!(w.remove_bgs, vec![8]);
+            }
+            _ => panic!("expected worker response"),
+        }
+    }
+
+    #[test]
+    fn meta_route_summary_round_trip() {
+        let summary = MetaRouteSummary {
+            mode: MetaNodeMode::Federation,
+            version: 10,
+            federation_route_mode: Some(FederationRouteMode::Hash),
+            path_table: None,
+            meta_groups: HashMap::from([(
+                1,
+                NodeGroupInfo {
+                    group_id: 1,
+                    peers: vec![PeerInfo {
+                        node_id: 20,
+                        address: node_addr(20),
+                        is_leader: Some(true),
+                    }],
+                },
+            )]),
+            group_id_order: vec![1],
+            federation_hash_level: Some(2),
+        };
+        let decoded =
+            ProtoUtils::meta_route_summary_from_pb(ProtoUtils::meta_route_summary_to_pb(&summary))
+                .expect("round trip meta route summary");
+        assert_eq!(decoded.mode, MetaNodeMode::Federation);
+        assert_eq!(decoded.version, 10);
+        assert_eq!(decoded.federation_hash_level, Some(2));
+        assert!(decoded.meta_groups.contains_key(&1));
+    }
+
+    #[test]
+    fn register_request_rejects_both_payloads() {
+        let mut pb = ProtoUtils::register_request_to_pb(&worker_register_request());
+        pb.meta = Some(meta_register_payload_pb());
+        assert!(ProtoUtils::register_request_from_pb(pb).is_err());
+    }
+
+    #[test]
+    fn register_request_rejects_missing_payload() {
+        let mut pb = ProtoUtils::register_request_to_pb(&worker_register_request());
+        pb.worker = None;
+        assert!(ProtoUtils::register_request_from_pb(pb).is_err());
+    }
+
+    #[test]
+    fn heartbeat_request_rejects_zero_node_id() {
+        let mut pb = ProtoUtils::heartbeat_request_to_pb(&worker_heartbeat_request());
+        pb.node_id = 0;
+        assert!(ProtoUtils::heartbeat_request_from_pb(pb).is_err());
+    }
+
+    #[test]
+    fn heartbeat_request_rejects_invalid_node_type() {
+        let mut pb = ProtoUtils::heartbeat_request_to_pb(&worker_heartbeat_request());
+        pb.node_type = 99;
+        assert!(ProtoUtils::heartbeat_request_from_pb(pb).is_err());
+    }
+
+    #[test]
+    fn heartbeat_response_rejects_both_payloads() {
+        let resp = HeartbeatResponse {
+            error: None,
+            epoch: 1,
+            mount_version: 1,
+            table_epochs: HashMap::new(),
+            payload: HeartbeatResponsePayload::Worker(WorkerHeartbeatResponse::default()),
+        };
+        let mut pb = ProtoUtils::heartbeat_response_to_pb(&resp);
+        pb.meta = Some(MetaHeartbeatResponseProto {
+            path_route_update: None,
+            node_group_update: None,
+        });
+        assert!(ProtoUtils::heartbeat_response_from_pb(pb).is_err());
     }
 }

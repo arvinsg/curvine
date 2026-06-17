@@ -25,6 +25,6 @@ pub use entry::{
     BGDeleteEntry, BGEntry, BGUpdateEntry, BatchBGEntry, ConfigEntry, MountEntry, NodeEntry,
     PdEntry, PoolEntry, UnMountEntry,
 };
-pub use leader::{LeaderChecker, RaftLeaderChecker};
 #[cfg(test)]
 pub use leader::AlwaysLeader;
+pub use leader::{LeaderChecker, RaftLeaderChecker};

@@ -5,10 +5,298 @@ option java_package = "io.curvine.proto";
 option java_multiple_files = true;
 option java_outer_classname = "PdProto";
 
-// Get meta route summary (mode, version, path table, meta groups). 
+import "common.proto";
+
+// Node type in PD.
+enum NodeTypeProto {
+    NODE_TYPE_PROTO_WORKER = 0;
+    NODE_TYPE_PROTO_META = 1;
+}
+
+enum NodeStateProto {
+    NODE_STATE_PROTO_STARTING = 0;
+    NODE_STATE_PROTO_LIVE = 1;
+    NODE_STATE_PROTO_LOST = 2;
+    NODE_STATE_PROTO_OFFLINE = 3;
+    NODE_STATE_PROTO_DECOMMISSION = 4;
+    NODE_STATE_PROTO_BLACKLIST = 5;
+}
+
+message NodeAddressProto {
+    required string hostname = 1;
+    required string ip = 2;
+    required uint32 rpc_port = 3;
+    required uint32 web_port = 4;
+}
+
+message NodeBaseProto {
+    required uint32 node_id = 1;
+    required NodeTypeProto node_type = 2;
+    required NodeAddressProto address = 3;
+    map<string, string> labels = 4;
+    required string software_version = 5;
+    required uint64 startup_time_ms = 6;
+}
+
+message SystemStatsProto {
+    required float cpu_usage = 1;
+    required float memory_usage = 2;
+}
+
+message StorageSpecProto {
+    required uint32 dir_id = 1;
+    required string storage_id = 2;
+    required bool failed = 3 [default = false];
+    required StorageTypeProto storage_type = 4;
+    required string dir_path = 5 [default = ""];
+}
+
+message StorageStatsProto {
+    required int64 capacity = 1;
+    required int64 fs_used = 2;
+    required int64 non_fs_used = 3;
+    required int64 available = 4;
+    required int64 reserved_bytes = 5 [default = 0];
+    required int64 block_num = 6;
+    required string dir_path = 7 [default = ""];
+}
+
+message BGStatsProto {
+    required uint64 used_bytes = 1;
+    required uint64 free_bytes = 2;
+    required uint64 block_count = 3;
+    required uint64 last_report_ms = 4;
+}
+
+enum ReplicaStateProto {
+    REPLICA_STATE_PROTO_PENDING = 0;
+    REPLICA_STATE_PROTO_SYNCING = 1;
+    REPLICA_STATE_PROTO_ACTIVE = 2;
+    REPLICA_STATE_PROTO_LOST = 3;
+    REPLICA_STATE_PROTO_OFFLINE = 4;
+}
+
+message WorkerBGReportProto {
+    required uint32 bg_id = 1;
+    required ReplicaStateProto state = 2;
+    optional BGStatsProto stats = 3;
+}
+
+message WorkerRegisterPayloadProto {
+    map<string, StorageSpecProto> storage_specs = 1;
+}
+
+message WorkerHeartbeatPayloadProto {
+    map<string, StorageStatsProto> storage_stats = 1;
+    required SystemStatsProto sys_stats = 2;
+    map<uint32, uint64> bg_epochs = 3;
+    repeated WorkerBGReportProto bg_reports = 4;
+}
+
+enum BGStateProto {
+    BG_STATE_PROTO_INIT = 0;
+    BG_STATE_PROTO_ASSIGNED = 1;
+    BG_STATE_PROTO_ACTIVE = 2;
+    BG_STATE_PROTO_DEGRADED = 3;
+    BG_STATE_PROTO_RECOVERING = 4;
+    BG_STATE_PROTO_REBALANCING = 5;
+    BG_STATE_PROTO_DELETING = 6;
+}
+
+enum BGOpStateProto {
+    BG_OP_STATE_PROTO_IDLE = 0;
+    BG_OP_STATE_PROTO_RECOVERING = 1;
+    BG_OP_STATE_PROTO_REBALANCING = 2;
+    BG_OP_STATE_PROTO_LEASE_BALANCING = 3;
+    BG_OP_STATE_PROTO_DELETING = 4;
+}
+
+message BGLeaseProto {
+    required uint32 node_id = 1;
+    required uint64 epoch = 2;
+    required uint64 grant_time_ms = 3;
+}
+
+message ReplicaInfoProto {
+    required uint32 node_id = 1;
+    required NodeAddressProto address = 2;
+    required NodeStateProto state = 3;
+    map<string, string> labels = 4;
+}
+
+message BlockGroupInfoProto {
+    required uint32 bg_id = 1;
+    required uint32 table_id = 2;
+    required uint64 bg_epoch = 3;
+    repeated uint32 replica_set = 4;
+    required BGStateProto state = 5;
+    required BGOpStateProto op_state = 6;
+    optional BGLeaseProto lease_owner = 7;
+}
+
+message BlockGroupInfoViewProto {
+    required uint32 bg_id = 1;
+    required uint32 table_id = 2;
+    required uint64 bg_epoch = 3;
+    repeated ReplicaInfoProto replica_set = 4;
+    required BGStateProto state = 5;
+    required BGOpStateProto op_state = 6;
+    optional BGLeaseProto lease_owner = 7;
+}
+
+message BGTableSummaryProto {
+    required uint32 table_id = 1;
+    required uint32 bucket_count = 2;
+    required uint64 epoch = 3;
+    required uint64 last_rebuild_ms = 4;
+    repeated BlockGroupInfoViewProto buckets = 5;
+}
+
+message WorkerHeartbeatResponseProto {
+    repeated BlockGroupInfoProto add_bgs = 1;
+    repeated uint32 remove_bgs = 2;
+    repeated BlockGroupInfoProto update_bgs = 3;
+}
+
+enum RwPolicyProto {
+    RW_POLICY_PROTO_LEADER_ONLY = 0;
+    RW_POLICY_PROTO_LEADER_WRITE_FOLLOWER_READ = 1;
+}
+
+message PeerInfoProto {
+    required uint32 node_id = 1;
+    required NodeAddressProto address = 2;
+    optional bool is_leader = 3;
+}
+
+message InodesStatsProto {
+    required uint64 inode_count = 1;
+    required uint64 dir_count = 2;
+    required uint64 file_count = 3;
+    required uint64 total_size = 4;
+}
+
+message MetaRegisterPayloadProto {
+    required uint32 group_id = 1;
+    repeated PeerInfoProto peers = 2;
+    required RwPolicyProto rw_policy = 3;
+    required uint64 group_epoch = 4;
+}
+
+message MetaHeartbeatPayloadProto {
+    required uint32 group_id = 1;
+    required uint64 group_epoch = 2;
+    required bool is_leader = 3;
+    repeated PeerInfoProto peers = 4;
+    required RwPolicyProto rw_policy = 5;
+    required InodesStatsProto inodes_stats = 6;
+    required SystemStatsProto sys_stats = 7;
+}
+
+message PathRouteEntryProto {
+    required string path = 1;
+    required uint64 group_id = 2;
+    required uint64 create_time_ms = 3;
+    required uint64 update_time_ms = 4;
+}
+
+enum RouteUpdateActionTypeProto {
+    ROUTE_UPDATE_ACTION_TYPE_PROTO_FULL_SYNC = 0;
+    ROUTE_UPDATE_ACTION_TYPE_PROTO_INCREMENTAL = 1;
+}
+
+message PathRouteUpdateProto {
+    required uint64 version = 1;
+    required RouteUpdateActionTypeProto action_type = 2;
+    repeated PathRouteEntryProto routes = 3;
+    repeated PathRouteEntryProto added = 4;
+    repeated string removed = 5;
+}
+
+message NodeGroupInfoProto {
+    required uint64 group_id = 1;
+    repeated PeerInfoProto peers = 2;
+}
+
+enum NodeGroupUpdateActionTypeProto {
+    NODE_GROUP_UPDATE_ACTION_TYPE_PROTO_ADD_GROUP = 0;
+    NODE_GROUP_UPDATE_ACTION_TYPE_PROTO_REMOVE_GROUP = 1;
+}
+
+message NodeGroupUpdateProto {
+    required uint64 version = 1;
+    required NodeGroupUpdateActionTypeProto action_type = 2;
+    repeated NodeGroupInfoProto groups = 3;
+    repeated uint64 group_ids = 4;
+}
+
+message MetaHeartbeatResponseProto {
+    optional PathRouteUpdateProto path_route_update = 1;
+    optional NodeGroupUpdateProto node_group_update = 2;
+}
+
+message NodeHeartbeatResponseProto {
+    optional string error = 1;
+    required uint64 epoch = 2;
+    required uint64 mount_version = 3;
+    map<uint32, uint64> table_epochs = 4;
+    optional WorkerHeartbeatResponseProto worker = 5;
+    optional MetaHeartbeatResponseProto meta = 6;
+}
+
+message NodeRegisterRequest {
+    required string cluster_id = 1;
+    required NodeBaseProto base = 2;
+    optional WorkerRegisterPayloadProto worker = 3;
+    optional MetaRegisterPayloadProto meta = 4;
+}
+
+message NodeRegisterResponse {
+    required NodeHeartbeatResponseProto response = 1;
+}
+
+message NodeHeartbeatRequest {
+    required string cluster_id = 1;
+    required uint32 node_id = 2;
+    required NodeTypeProto node_type = 3;
+    required uint64 epoch = 4;
+    required uint64 timestamp_ms = 5;
+    required NodeAddressProto address = 6;
+    optional WorkerHeartbeatPayloadProto worker = 7;
+    optional MetaHeartbeatPayloadProto meta = 8;
+}
+
+enum MetaNodeModeProto {
+    META_NODE_MODE_PROTO_PROXY = 0;
+    META_NODE_MODE_PROTO_SHARD = 1;
+    META_NODE_MODE_PROTO_FEDERATION = 2;
+}
+
+enum FederationRouteModeProto {
+    FEDERATION_ROUTE_MODE_PROTO_STATIC = 0;
+    FEDERATION_ROUTE_MODE_PROTO_HASH = 1;
+}
+
+message PathRouteTableProto {
+    required uint64 version = 1;
+    repeated PathRouteEntryProto routes = 2;
+    required uint64 last_update_ms = 3;
+}
+
+message MetaRouteSummaryProto {
+    required MetaNodeModeProto mode = 1;
+    required uint64 version = 2;
+    optional FederationRouteModeProto federation_route_mode = 3;
+    optional PathRouteTableProto path_table = 4;
+    map<uint64, NodeGroupInfoProto> meta_groups = 5;
+    repeated uint64 group_id_order = 6;
+    optional uint32 federation_hash_level = 7;
+}
+
+// Get meta route summary (mode, version, path table, meta groups).
 message GetMetaRouteSummaryRequest {
 }
 
 message GetMetaRouteSummaryResponse {
-    optional bytes summary = 1;
+    required MetaRouteSummaryProto summary = 1;
 }

@@ -14,7 +14,7 @@
 
 use crate::pd::bg::placement::{isolation_score, Labels, PlacementRule};
 use crate::pd::schedule::{BGOperator, ManagerContext, OpPriority, OperatorBuilder, OperatorKind};
-use curvine_common::state::{BlockGroupInfo, NodeState};
+use curvine_common::state::{BlockGroupInfo, NodeState, ReplicaState};
 use std::collections::HashMap;
 
 pub struct ReplicaChecker;
@@ -59,7 +59,9 @@ impl ReplicaChecker {
         .priority(OpPriority::UNDER_REPLICA_REPAIR);
 
         for &w in &new_workers {
-            builder = builder.add_replica(w);
+            builder = builder
+                .add_replica(w)
+                .wait_replica_ready(w, ReplicaState::Active);
         }
 
         Some(builder.build())
@@ -398,6 +400,20 @@ mod tests {
                     let op = op.unwrap_or_else(|| panic!("{}: expected Add op", case.name));
                     let (add, remove, _) = decompose(&op);
                     assert_eq!(add.len(), n, "{}: add count", case.name);
+                    let wait_active = op
+                        .steps
+                        .iter()
+                        .filter(|step| {
+                            matches!(
+                                step,
+                                crate::pd::schedule::OpStep::WaitReplicaReady {
+                                    expected_state: ReplicaState::Active,
+                                    ..
+                                }
+                            )
+                        })
+                        .count();
+                    assert_eq!(wait_active, n, "{}: wait active count", case.name);
                     assert!(remove.is_empty(), "{}: unexpected Remove steps", case.name);
                     if let Some(expected_prio) = case.expect_priority {
                         assert_eq!(op.priority, expected_prio, "{}: priority", case.name);

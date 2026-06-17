@@ -263,11 +263,9 @@ impl MountManager {
             .propose_as_leader_with_result(PdEntry::Unmount(mount_id))?;
         match outcome {
             ApplyOutcome::Applied | ApplyOutcome::SkippedNoop => Ok(()),
-            ApplyOutcome::SkippedStale { reason } => Err(FsError::stale_entry(
-                "unmount",
-                cv_path.to_string(),
-                reason,
-            )),
+            ApplyOutcome::SkippedStale { reason } => {
+                Err(FsError::stale_entry("unmount", cv_path.to_string(), reason))
+            }
             ApplyOutcome::NotFound { reason } => Err(FsError::not_found(reason)),
         }
     }
@@ -404,7 +402,10 @@ mod tests {
         let by_cv = mgr
             .get_mount_info(&curvine_common::fs::Path::from_str("/old/cv").unwrap())
             .unwrap();
-        assert!(by_cv.is_some(), "original should be reachable by old cv path");
+        assert!(
+            by_cv.is_some(),
+            "original should be reachable by old cv path"
+        );
 
         // Re-insert same mount_id with completely different paths.
         mgr.apply_mount(replacement).unwrap();

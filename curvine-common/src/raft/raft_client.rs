@@ -101,9 +101,7 @@ impl RaftClient {
         //   runtime's `block_on`, which is safe to call from a non-tokio
         //   thread.
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                tokio::task::block_in_place(|| handle.block_on(self.send_propose(data)))
-            }
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(self.send_propose(data))),
             Err(_) => self.rt.block_on(self.send_propose(data)),
         }
     }

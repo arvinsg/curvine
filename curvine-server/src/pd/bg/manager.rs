@@ -708,11 +708,7 @@ impl BGManager {
                     expected_epoch,
                     reason
                 );
-                Err(FsError::stale_entry(
-                    "update_bg",
-                    expected_epoch,
-                    reason,
-                ))
+                Err(FsError::stale_entry("update_bg", expected_epoch, reason))
             }
             ApplyOutcome::NotFound { reason } => Err(FsError::not_found(reason)),
         }
@@ -970,10 +966,7 @@ impl BGManager {
         let bg_to_delete = {
             let mut bgs_write = self.bgs.write().unwrap();
             let Some(existing) = bgs_write.get(&entry.bg_id).cloned() else {
-                log::warn!(
-                    "Apply DeleteBG skipped: bg_id={} not present",
-                    entry.bg_id
-                );
+                log::warn!("Apply DeleteBG skipped: bg_id={} not present", entry.bg_id);
                 return Ok(ApplyOutcome::not_found(format!(
                     "bg {} not present",
                     entry.bg_id
@@ -1475,11 +1468,12 @@ impl BGManager {
             .iter()
             .filter_map(|&node_id| {
                 pool_manager
-                    .get_worker_address_and_state(node_id)
-                    .map(|(address, state)| ReplicaInfo {
+                    .get_worker_node(node_id)
+                    .map(|node| ReplicaInfo {
                         node_id,
-                        address,
-                        state,
+                        address: node.base.address,
+                        state: node.state,
+                        labels: node.base.labels,
                     })
             })
             .collect();
@@ -2318,6 +2312,10 @@ mod tests {
                     rpc_port: 8000 + id as u16,
                     web_port: 9000 + id as u16,
                 },
+                labels: HashMap::from([
+                    ("az".to_string(), format!("az-{}", id % 2)),
+                    ("rack".to_string(), format!("rack-{}", id % 4)),
+                ]),
                 ..Default::default()
             },
             state,
@@ -2377,7 +2375,10 @@ mod tests {
 
         let summary = mgr.build_table_summary(10).unwrap();
         assert_eq!(summary.buckets[0].replica_set.len(), 1);
-        assert_eq!(summary.buckets[0].replica_set[0].node_id, 100);
+        let replica = &summary.buckets[0].replica_set[0];
+        assert_eq!(replica.node_id, 100);
+        assert_eq!(replica.labels.get("az"), Some(&"az-0".to_string()));
+        assert_eq!(replica.labels.get("rack"), Some(&"rack-0".to_string()));
     }
 
     #[test]
@@ -2677,11 +2678,8 @@ mod tests {
         });
         let mut bg = make_bg(1, table_id, vec![100, 101]);
         bg.bg_epoch = 7;
-        mgr.apply_create_bg(&BGEntry {
-            op_ms: 0,
-            info: bg,
-        })
-        .unwrap();
+        mgr.apply_create_bg(&BGEntry { op_ms: 0, info: bg })
+            .unwrap();
         let initial_table_epoch = mgr.get_table(table_id).unwrap().epoch;
 
         let batch = BatchBGEntry {
@@ -2725,11 +2723,8 @@ mod tests {
         let mgr = test_manager();
         let mut bg = make_bg(50, 1, vec![100]);
         bg.bg_epoch = 5;
-        mgr.apply_create_bg(&BGEntry {
-            op_ms: 0,
-            info: bg,
-        })
-        .unwrap();
+        mgr.apply_create_bg(&BGEntry { op_ms: 0, info: bg })
+            .unwrap();
 
         // Stale entry: proposer thought bg_epoch was 4, but it's 5.
         let entry = BGUpdateEntry {
@@ -2762,11 +2757,8 @@ mod tests {
         let mgr = test_manager();
         let mut bg = make_bg(51, 1, vec![100]);
         bg.bg_epoch = 5;
-        mgr.apply_create_bg(&BGEntry {
-            op_ms: 0,
-            info: bg,
-        })
-        .unwrap();
+        mgr.apply_create_bg(&BGEntry { op_ms: 0, info: bg })
+            .unwrap();
 
         let entry = BGUpdateEntry {
             op_ms: 1,

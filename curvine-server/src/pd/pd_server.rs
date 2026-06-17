@@ -218,6 +218,7 @@ impl Pd {
         ));
 
         let cluster_manager = Arc::new(ClusterManager::new(
+            conf.cluster_id.clone(),
             node_manager,
             pool_manager,
             bg_manager,

@@ -56,7 +56,7 @@ impl<'a> RpcContext<'a> {
     }
 
     pub fn audit_log(&self, succeeded: bool, used_us: u64, conn_state: Option<&ConnState>) {
-        if self.code == RpcCode::WorkerHeartbeat || self.code == RpcCode::WorkerBlockReport {
+        if self.code.is_high_frequency() {
             return;
         }
 

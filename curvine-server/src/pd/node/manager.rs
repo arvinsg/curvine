@@ -100,26 +100,44 @@ impl NodeManager {
                 "register rejected: this PD node is not the raft leader",
             ));
         }
+        if req.base.node_id == 0 {
+            return Err(FsError::common("node_id must not be 0"));
+        }
+        if !Self::payload_matches_node_type(&req.payload, req.base.node_type) {
+            return Err(FsError::common(format!(
+                "register payload type mismatch for node_id={}, node_type={:?}",
+                req.base.node_id, req.base.node_type
+            )));
+        }
         let handler = self.get_handler(req.base.node_type)?;
         let now = LocalTime::mills();
 
         let new_epoch = {
             let index = self.index.read().unwrap();
             if let Some(existing) = index.get_by_id(req.base.node_id) {
-                if existing.state == NodeState::Lost || existing.state == NodeState::Offline {
-                    if existing.base.address != req.base.address {
-                        info!(
-                            "Node {} address changed: {:?} -> {:?}, re-registering",
-                            req.base.node_id, existing.base.address, req.base.address
-                        );
+                let allow_replace = match existing.state {
+                    NodeState::Lost | NodeState::Offline => true,
+                    NodeState::Starting | NodeState::Live => {
+                        req.base.startup_time_ms > existing.base.startup_time_ms
                     }
-                    existing.epoch + 1
-                } else {
+                    NodeState::Decommission | NodeState::Blacklist => false,
+                };
+                if !allow_replace {
                     return Err(FsError::common(format!(
-                        "node {} already registered and state {:?}",
-                        req.base.node_id, existing.state
+                        "node {} already registered and state {:?}, startup_time_ms current={} requested={}",
+                        req.base.node_id,
+                        existing.state,
+                        existing.base.startup_time_ms,
+                        req.base.startup_time_ms
                     )));
                 }
+                if existing.base.address != req.base.address {
+                    info!(
+                        "Node {} address changed: {:?} -> {:?}, re-registering",
+                        req.base.node_id, existing.base.address, req.base.address
+                    );
+                }
+                existing.epoch + 1
             } else {
                 1
             }
@@ -133,7 +151,8 @@ impl NodeManager {
             op_ms: now,
             info: node.clone(),
         };
-        self.journal_client.propose_as_leader(PdEntry::RegisterNode(entry))?;
+        self.journal_client
+            .propose_as_leader(PdEntry::RegisterNode(entry))?;
 
         let Some(applied) = self.get_node(node.base.node_id) else {
             warn!(
@@ -216,6 +235,20 @@ impl NodeManager {
                     "epoch mismatch for node {}: expected {} got {}",
                     req.node_id, node.epoch, req.epoch
                 )));
+            }
+            if node.base.node_type != req.node_type {
+                return Err(FsError::common(format!(
+                    "node_type mismatch for node {}: expected {:?} got {:?}",
+                    req.node_id, node.base.node_type, req.node_type
+                )));
+            }
+            if node.base.address != req.address {
+                warn!(
+                    "node {} endpoint changed in heartbeat: registered={:?}, reported={:?}; keep registered endpoint until raft endpoint update is implemented",
+                    req.node_id,
+                    node.base.address,
+                    req.address
+                );
             }
 
             match node.state {
@@ -330,6 +363,17 @@ impl NodeManager {
         node.last_persist_ms = entry.op_ms;
 
         let mut index = self.index.write().unwrap();
+        if node.base.node_id == 0 {
+            warn!("RegisterNode with invalid node_id=0; skip");
+            return Ok(());
+        }
+        if !Self::payload_matches_node_type(&node.payload, node.base.node_type) {
+            warn!(
+                "RegisterNode payload type mismatch node_id={}, node_type={:?}; skip",
+                node.base.node_id, node.base.node_type
+            );
+            return Ok(());
+        }
         if let Some(existing) = index.get_by_id(node.base.node_id) {
             if node.epoch != existing.epoch.saturating_add(1) {
                 warn!(
@@ -338,10 +382,22 @@ impl NodeManager {
                 );
                 return Ok(());
             }
-            if !matches!(existing.state, NodeState::Lost | NodeState::Offline) {
+            let allow_replace = match existing.state {
+                NodeState::Lost | NodeState::Offline => true,
+                NodeState::Starting | NodeState::Live => {
+                    node.base.startup_time_ms > existing.base.startup_time_ms
+                }
+                NodeState::Decommission | NodeState::Blacklist => false,
+            };
+            if !allow_replace {
                 warn!(
-                    "RegisterNode rejected by current state node_id={}, entry_epoch={}, current_epoch={}, current_state={:?}; skip",
-                    node.base.node_id, node.epoch, existing.epoch, existing.state
+                    "RegisterNode rejected by current state/incarnation node_id={}, entry_epoch={}, current_epoch={}, current_state={:?}, current_startup_time_ms={}, entry_startup_time_ms={}; skip",
+                    node.base.node_id,
+                    node.epoch,
+                    existing.epoch,
+                    existing.state,
+                    existing.base.startup_time_ms,
+                    node.base.startup_time_ms
                 );
                 return Ok(());
             }
@@ -645,12 +701,13 @@ impl NodeManager {
                     payload_update: None,
                 })
                 .collect();
-            if let Err(e) = self.journal_client.propose_as_leader(PdEntry::BatchUpdateNodeState(
-                BatchUpdateNodeStateEntry {
+            if let Err(e) = self
+                .journal_client
+                .propose_as_leader(PdEntry::BatchUpdateNodeState(BatchUpdateNodeStateEntry {
                     op_ms: now_ms,
                     entries,
-                },
-            )) {
+                }))
+            {
                 warn!(
                     "propose timeout BatchUpdateNodeState failed batch_size={}, err={}",
                     chunk.len(),
@@ -751,12 +808,15 @@ impl NodeManager {
                     entries.len(),
                     recovery_window
                 );
-                if let Err(e) = self.journal_client.propose_as_leader(PdEntry::BatchUpdateNodeState(
-                    BatchUpdateNodeStateEntry {
-                        op_ms: now,
-                        entries,
-                    },
-                )) {
+                if let Err(e) =
+                    self.journal_client
+                        .propose_as_leader(PdEntry::BatchUpdateNodeState(
+                            BatchUpdateNodeStateEntry {
+                                op_ms: now,
+                                entries,
+                            },
+                        ))
+                {
                     warn!(
                         "propose Lost->Offline BatchUpdateNodeState failed batch_size={}, err={}",
                         chunk.len(),
@@ -1065,6 +1125,96 @@ mod tests {
         kv.put("meta", &key, &bytes).expect("KvStore put");
         let mut index = mgr.index.write().unwrap();
         index.insert(node.clone());
+    }
+
+    #[test]
+    fn apply_register_node_allows_lost_without_newer_startup_time() {
+        let mgr = test_manager();
+        let mut existing = make_node(1, NodeType::Worker, NodeState::Lost);
+        existing.base.startup_time_ms = 100;
+        insert_node(&mgr, &existing);
+
+        let mut replacement = make_node(1, NodeType::Worker, NodeState::Starting);
+        replacement.epoch = 2;
+        replacement.base.startup_time_ms = 100;
+
+        mgr.apply_register_node(&NodeEntry {
+            op_ms: 200,
+            info: replacement.clone(),
+        })
+        .expect("apply register");
+
+        let applied = mgr.get_node(1).expect("node exists");
+        assert_eq!(applied.epoch, 2);
+        assert_eq!(applied.state, NodeState::Starting);
+        assert_eq!(applied.base.startup_time_ms, 100);
+    }
+
+    #[test]
+    fn apply_register_node_rejects_starting_with_equal_startup_time() {
+        let mgr = test_manager();
+        let mut existing = make_node(1, NodeType::Worker, NodeState::Starting);
+        existing.base.startup_time_ms = 100;
+        insert_node(&mgr, &existing);
+
+        let mut stale_replacement = make_node(1, NodeType::Worker, NodeState::Starting);
+        stale_replacement.epoch = 2;
+        stale_replacement.base.startup_time_ms = 100;
+
+        mgr.apply_register_node(&NodeEntry {
+            op_ms: 200,
+            info: stale_replacement,
+        })
+        .expect("apply register should skip equal startup_time for Starting");
+
+        let current = mgr.get_node(1).expect("node exists");
+        assert_eq!(current.epoch, 1);
+        assert_eq!(current.state, NodeState::Starting);
+    }
+
+    #[test]
+    fn apply_register_node_rejects_live_without_newer_startup_time() {
+        let mgr = test_manager();
+        let mut existing = make_node(1, NodeType::Worker, NodeState::Live);
+        existing.base.startup_time_ms = 100;
+        insert_node(&mgr, &existing);
+
+        let mut stale_replacement = make_node(1, NodeType::Worker, NodeState::Starting);
+        stale_replacement.epoch = 2;
+        stale_replacement.base.startup_time_ms = 100;
+
+        mgr.apply_register_node(&NodeEntry {
+            op_ms: 200,
+            info: stale_replacement,
+        })
+        .expect("apply register should skip stale incarnation");
+
+        let current = mgr.get_node(1).expect("node exists");
+        assert_eq!(current.epoch, 1);
+        assert_eq!(current.state, NodeState::Live);
+    }
+
+    #[test]
+    fn apply_register_node_rejects_invalid_identity() {
+        let mgr = test_manager();
+
+        let mut invalid_id = make_node(0, NodeType::Worker, NodeState::Starting);
+        invalid_id.epoch = 1;
+        mgr.apply_register_node(&NodeEntry {
+            op_ms: 100,
+            info: invalid_id,
+        })
+        .expect("invalid id should be skipped");
+        assert!(mgr.get_node(0).is_none());
+
+        let mut mismatch = make_node(2, NodeType::Worker, NodeState::Starting);
+        mismatch.payload = NodePayload::Meta(MetaNodePayload::default());
+        mgr.apply_register_node(&NodeEntry {
+            op_ms: 100,
+            info: mismatch,
+        })
+        .expect("payload mismatch should be skipped");
+        assert!(mgr.get_node(2).is_none());
     }
 
     #[test]

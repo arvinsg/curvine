@@ -81,6 +81,10 @@ pub enum RpcCode {
 
     // pd metanode route.
     GetMetaRouteSummary = 104,
+
+    // pd node register / heartbeat.
+    NodeRegister = 105,
+    NodeHeartbeat = 106,
 }
 
 impl RpcCode {
@@ -135,7 +139,16 @@ impl RpcCode {
             RpcCode::ListConfig => "ListConfig",
             RpcCode::SetConfig => "SetConfig",
             RpcCode::GetMetaRouteSummary => "GetMetaRouteSummary",
+            RpcCode::NodeRegister => "NodeRegister",
+            RpcCode::NodeHeartbeat => "NodeHeartbeat",
         }
+    }
+
+    pub fn is_high_frequency(&self) -> bool {
+        matches!(
+            self,
+            RpcCode::NodeHeartbeat | RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport
+        )
     }
 }
 

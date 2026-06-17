@@ -221,11 +221,9 @@ impl MetaManager {
             .propose_as_leader_with_result(PdEntry::AddPathRoute(entry))?;
         match outcome {
             ApplyOutcome::Applied | ApplyOutcome::SkippedNoop => Ok(()),
-            ApplyOutcome::SkippedStale { reason } => Err(FsError::stale_entry(
-                "add_path_route",
-                path,
-                reason,
-            )),
+            ApplyOutcome::SkippedStale { reason } => {
+                Err(FsError::stale_entry("add_path_route", path, reason))
+            }
             ApplyOutcome::NotFound { reason } => Err(FsError::not_found(reason)),
         }
     }
@@ -244,11 +242,9 @@ impl MetaManager {
             .propose_as_leader_with_result(PdEntry::RemovePathRoute(path.to_string()))?;
         match outcome {
             ApplyOutcome::Applied | ApplyOutcome::SkippedNoop => Ok(()),
-            ApplyOutcome::SkippedStale { reason } => Err(FsError::stale_entry(
-                "remove_path_route",
-                path,
-                reason,
-            )),
+            ApplyOutcome::SkippedStale { reason } => {
+                Err(FsError::stale_entry("remove_path_route", path, reason))
+            }
             ApplyOutcome::NotFound { reason } => Err(FsError::not_found(reason)),
         }
     }

@@ -1346,12 +1346,7 @@ mod tests {
             .unwrap();
 
         // Operator wants AddReplica 99 — one step that consumes 1 epoch.
-        let mut op = make_op(
-            1000,
-            200,
-            vec![OpStep::AddReplica { worker_id: 99 }],
-            1,
-        );
+        let mut op = make_op(1000, 200, vec![OpStep::AddReplica { worker_id: 99 }], 1);
         op.bg_epoch = 1;
         assert!(ctrl.add_operator(op));
         ctrl.dispatch_next();
@@ -1422,12 +1417,7 @@ mod tests {
             .apply_create_bg(&BGEntry { op_ms: 0, info: bg })
             .unwrap();
 
-        let mut op = make_op(
-            1001,
-            201,
-            vec![OpStep::AddReplica { worker_id: 99 }],
-            1,
-        );
+        let mut op = make_op(1001, 201, vec![OpStep::AddReplica { worker_id: 99 }], 1);
         op.bg_epoch = 1;
         assert!(ctrl.add_operator(op));
         ctrl.dispatch_next();

@@ -23,23 +23,6 @@ use std::collections::HashMap;
 
 use super::{PeerInfo, RwPolicy};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ProgressStepResult {
-    Running,
-    Finished,
-    Failed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerProgressReport {
-    pub op_id: u64,
-    pub bg_id: u32,
-    pub worker_id: u32,
-    pub step_index: usize,
-    pub result: ProgressStepResult,
-    pub report_time_ms: u64,
-}
-
 /// Per-BG report from worker: replica state + stats
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerBGReport {
@@ -86,8 +69,6 @@ pub struct WorkerHeartbeatPayload {
     ///
     #[serde(default)]
     pub bg_epochs: HashMap<u32, u64>,
-    #[serde(default)]
-    pub progress_reports: Vec<WorkerProgressReport>,
     /// Per-BG replica state + stats.
     #[serde(default)]
     pub bg_reports: Vec<WorkerBGReport>,

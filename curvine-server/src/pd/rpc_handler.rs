@@ -21,7 +21,8 @@ use curvine_common::error::FsError;
 use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
-use curvine_common::utils::{ProtoUtils, SerdeUtils as Serde};
+use curvine_common::state::NodeType;
+use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::common::LocalTime;
 use orpc::handler::MessageHandler;
@@ -109,10 +110,29 @@ impl MessageHandler for PdRpcHandler {
             RpcCode::GetMetaRouteSummary => {
                 let _req: GetMetaRouteSummaryRequest = ctx.parse_header()?;
                 let summary = self.cluster_manager.meta_manager().build_client_summary()?;
-                let summary_bytes = Serde::serialize(&summary)?;
                 ctx.response(GetMetaRouteSummaryResponse {
-                    summary: Some(summary_bytes),
+                    summary: ProtoUtils::meta_route_summary_to_pb(&summary),
                 })?
+            }
+            RpcCode::NodeRegister => {
+                self.cluster_manager.ensure_leader()?;
+                let req_pb: NodeRegisterRequest = ctx.parse_header()?;
+                let req = ProtoUtils::register_request_from_pb(req_pb)?;
+                let resp = match req.base.node_type {
+                    NodeType::Worker => self.cluster_manager.handle_worker_register(req)?,
+                    NodeType::Meta => self.cluster_manager.handle_meta_register(req)?,
+                };
+                ctx.response(ProtoUtils::register_response_to_pb(&resp))?
+            }
+            RpcCode::NodeHeartbeat => {
+                self.cluster_manager.ensure_leader()?;
+                let req_pb: NodeHeartbeatRequest = ctx.parse_header()?;
+                let req = ProtoUtils::heartbeat_request_from_pb(req_pb)?;
+                let resp = match req.node_type {
+                    NodeType::Worker => self.cluster_manager.handle_worker_heartbeat(req)?,
+                    NodeType::Meta => self.cluster_manager.handle_meta_heartbeat(req)?,
+                };
+                ctx.response(ProtoUtils::heartbeat_response_to_pb(&resp))?
             }
             RpcCode::Undefined => {
                 return Err(FsError::from("PD RPC: undefined config code".to_string()))

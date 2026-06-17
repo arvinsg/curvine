@@ -151,9 +151,7 @@ mod tests {
 
     #[test]
     fn into_propose_result_maps_outcomes() {
-        assert!(ApplyOutcome::Applied
-            .into_propose_result("test")
-            .is_ok());
+        assert!(ApplyOutcome::Applied.into_propose_result("test").is_ok());
         assert!(ApplyOutcome::SkippedNoop
             .into_propose_result("test")
             .is_ok());

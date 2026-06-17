@@ -14,6 +14,7 @@
 
 use super::{NodeAddress, NodeState};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// BG state
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +119,8 @@ pub struct ReplicaInfo {
     pub node_id: u32,
     pub address: NodeAddress,
     pub state: NodeState,
+    /// Worker labels (for client-side topology-aware replica selection, e.g. az/rack/host).
+    pub labels: HashMap<String, String>,
 }
 
 /// BG operation state: tracks whether a BG is currently being operated on

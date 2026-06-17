@@ -114,10 +114,8 @@ pub async fn list_mounts_handler(
     match instance.mount_manager.get_mount_table() {
         Ok(table) => {
             // Deref Arc<MountInfo> for the wire response.
-            let mut mounts: Vec<curvine_common::state::MountInfo> = table
-                .into_iter()
-                .map(|arc| (*arc).clone())
-                .collect();
+            let mut mounts: Vec<curvine_common::state::MountInfo> =
+                table.into_iter().map(|arc| (*arc).clone()).collect();
             if let Some(prefix) = &params.prefix {
                 if !prefix.is_empty() {
                     mounts.retain(|m| {

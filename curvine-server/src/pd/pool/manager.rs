@@ -221,10 +221,7 @@ impl PoolManager {
             .into_iter()
             .collect();
         for pool_id in pool_ids {
-            let desired = desired_by_pool
-                .get(&pool_id)
-                .cloned()
-                .unwrap_or_default();
+            let desired = desired_by_pool.get(&pool_id).cloned().unwrap_or_default();
             match self.propose_pool_mutate(pool_id, |info| {
                 if info.workers != desired {
                     info.workers = desired.clone();
@@ -359,7 +356,9 @@ impl PoolManager {
         match outcome {
             ApplyOutcome::Applied => Ok(PoolMutateResult::Applied),
             ApplyOutcome::SkippedNoop => Ok(PoolMutateResult::Skipped),
-            ApplyOutcome::SkippedStale { reason: stale_reason } => {
+            ApplyOutcome::SkippedStale {
+                reason: stale_reason,
+            } => {
                 // §17 contract: do not retry in propose path. Surface the stale
                 // outcome to upper-layer scheduling (patrol will reschedule).
                 log::warn!(
@@ -374,9 +373,7 @@ impl PoolManager {
                     stale_reason,
                 ))
             }
-            ApplyOutcome::NotFound { reason: nf_reason } => {
-                Err(FsError::not_found(nf_reason))
-            }
+            ApplyOutcome::NotFound { reason: nf_reason } => Err(FsError::not_found(nf_reason)),
         }
     }
 
@@ -677,13 +674,7 @@ impl PoolManager {
             .get_pool(info.pool_id)
             .map(|p| p.epoch)
             .unwrap_or(0);
-        info.epoch = if self
-            .index
-            .read()
-            .unwrap()
-            .get_pool(info.pool_id)
-            .is_some()
-        {
+        info.epoch = if self.index.read().unwrap().get_pool(info.pool_id).is_some() {
             expected_epoch.saturating_add(1)
         } else {
             0

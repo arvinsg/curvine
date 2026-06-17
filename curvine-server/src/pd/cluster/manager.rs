@@ -20,8 +20,9 @@ use crate::pd::node::NodeManager;
 use crate::pd::pool::PoolManager;
 use crate::pd::schedule::{Manager, ManagerContext, OperatorController};
 use curvine_common::state::{
-    HeartbeatRequest, HeartbeatResponse, HeartbeatResponsePayload, MetaHeartbeatResponse,
-    NodePayload, NodeState, RegisterRequest, WorkerHeartbeatResponse,
+    HeartbeatPayload, HeartbeatRequest, HeartbeatResponse, HeartbeatResponsePayload,
+    MetaHeartbeatResponse, NodePayload, NodeState, NodeType, RegisterRequest,
+    WorkerHeartbeatResponse,
 };
 use curvine_common::{FsError, FsResult};
 use orpc::runtime::RpcRuntime;
@@ -31,13 +32,14 @@ use tokio_util::sync::CancellationToken;
 // LeaderChecker / RaftLeaderChecker / AlwaysLeader were moved to
 // `pd/journal/leader.rs` to avoid a circular dependency with `journal::Client`.
 // Re-exports keep existing call sites (`crate::pd::cluster::manager::...`) working.
-pub use crate::pd::journal::{LeaderChecker, RaftLeaderChecker};
 #[cfg(test)]
 pub use crate::pd::journal::AlwaysLeader;
+pub use crate::pd::journal::{LeaderChecker, RaftLeaderChecker};
 
 /// Cluster manager: ties node, pool, bg and schedule manager.
 /// Owns the leader lifecycle: starts/stops schedule+liveness loops on leader change.
 pub struct ClusterManager {
+    cluster_id: String,
     node_manager: Arc<NodeManager>,
     pool_manager: Arc<PoolManager>,
     bg_manager: Arc<BGManager>,
@@ -52,6 +54,7 @@ pub struct ClusterManager {
 
 impl ClusterManager {
     pub fn new(
+        cluster_id: String,
         node_manager: Arc<NodeManager>,
         pool_manager: Arc<PoolManager>,
         bg_manager: Arc<BGManager>,
@@ -76,6 +79,7 @@ impl ClusterManager {
         let schedule_manager = Arc::new(Manager::new(ctx));
 
         Self {
+            cluster_id,
             node_manager,
             pool_manager,
             bg_manager,
@@ -145,19 +149,84 @@ impl ClusterManager {
         }
     }
 
-    pub fn handle_worker_register(&self, req: RegisterRequest) -> FsResult<HeartbeatResponse> {
-        if !matches!(&req.payload, NodePayload::Worker(_)) {
-            return Err(FsError::common("expected Worker payload"));
+    pub fn is_leader(&self) -> bool {
+        self.leader_checker.is_leader()
+    }
+
+    pub fn ensure_leader(&self) -> FsResult<()> {
+        if !self.is_leader() {
+            return Err(FsError::not_leader(
+                "PD node RPC rejected: this PD node is not the raft leader",
+            ));
         }
+        Ok(())
+    }
+
+    fn validate_cluster_id(&self, actual: &str) -> FsResult<()> {
+        if actual != self.cluster_id {
+            return Err(FsError::common(format!(
+                "cluster_id mismatch: expected {} got {}",
+                self.cluster_id, actual
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_worker_register(&self, req: &RegisterRequest) -> FsResult<()> {
+        self.validate_cluster_id(&req.cluster_id)?;
+        if req.base.node_type != NodeType::Worker || !matches!(&req.payload, NodePayload::Worker(_))
+        {
+            return Err(FsError::common(format!(
+                "expected Worker register payload, got node_type={:?}",
+                req.base.node_type
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_meta_register(&self, req: &RegisterRequest) -> FsResult<()> {
+        self.validate_cluster_id(&req.cluster_id)?;
+        if req.base.node_type != NodeType::Meta || !matches!(&req.payload, NodePayload::Meta(_)) {
+            return Err(FsError::common(format!(
+                "expected Meta register payload, got node_type={:?}",
+                req.base.node_type
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_worker_heartbeat(&self, req: &HeartbeatRequest) -> FsResult<()> {
+        self.validate_cluster_id(&req.cluster_id)?;
+        if req.node_type != NodeType::Worker || !matches!(&req.payload, HeartbeatPayload::Worker(_))
+        {
+            return Err(FsError::common(format!(
+                "expected Worker heartbeat payload, got node_type={:?}",
+                req.node_type
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_meta_heartbeat(&self, req: &HeartbeatRequest) -> FsResult<()> {
+        self.validate_cluster_id(&req.cluster_id)?;
+        if req.node_type != NodeType::Meta || !matches!(&req.payload, HeartbeatPayload::Meta(_)) {
+            return Err(FsError::common(format!(
+                "expected Meta heartbeat payload, got node_type={:?}",
+                req.node_type
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn handle_worker_register(&self, req: RegisterRequest) -> FsResult<HeartbeatResponse> {
+        self.validate_worker_register(&req)?;
 
         let (node_info, new_epoch) = self.node_manager.register(req)?;
 
         let worker_bgs = self.bg_manager.get_bgs_on_worker(node_info.base.node_id);
         // Wire format expects Vec<BlockGroupInfo>; deref-clone Arc-wrapped values.
-        let worker_bgs: Vec<curvine_common::state::BlockGroupInfo> = worker_bgs
-            .into_iter()
-            .map(|arc| (*arc).clone())
-            .collect();
+        let worker_bgs: Vec<curvine_common::state::BlockGroupInfo> =
+            worker_bgs.into_iter().map(|arc| (*arc).clone()).collect();
 
         Ok(HeartbeatResponse {
             error: None,
@@ -173,17 +242,36 @@ impl ClusterManager {
     }
 
     pub fn handle_worker_heartbeat(&self, req: HeartbeatRequest) -> FsResult<HeartbeatResponse> {
+        self.validate_worker_heartbeat(&req)?;
         let mut resp = self.node_manager.handle_heartbeat(req.clone())?;
 
         let reported_bg_epochs: std::collections::HashMap<u32, u64> =
-            if let curvine_common::state::HeartbeatPayload::Worker(ref w) = req.payload {
+            if let HeartbeatPayload::Worker(ref w) = req.payload {
                 if !w.bg_reports.is_empty() {
-                    self.bg_manager
-                        .apply_replica_reports(req.node_id, &w.bg_reports)?;
+                    if let Err(e) = self
+                        .bg_manager
+                        .apply_replica_reports(req.node_id, &w.bg_reports)
+                    {
+                        log::warn!(
+                            "worker heartbeat bg_reports soft error worker_id={}, err={}",
+                            req.node_id,
+                            e
+                        );
+                        resp.error = Some(format!("apply bg_reports failed: {}", e));
+                    }
                 } else if !w.bg_epochs.is_empty() {
                     let bg_ids: Vec<u32> = w.bg_epochs.keys().copied().collect();
-                    self.bg_manager
-                        .promote_pending_replicas(req.node_id, &bg_ids)?;
+                    if let Err(e) = self
+                        .bg_manager
+                        .promote_pending_replicas(req.node_id, &bg_ids)
+                    {
+                        log::warn!(
+                            "worker heartbeat promote_pending_replicas soft error worker_id={}, err={}",
+                            req.node_id,
+                            e
+                        );
+                        resp.error = Some(format!("promote pending replicas failed: {}", e));
+                    }
                 }
                 w.bg_epochs.clone()
             } else {
@@ -206,9 +294,7 @@ impl ClusterManager {
     }
 
     pub fn handle_meta_register(&self, req: RegisterRequest) -> FsResult<HeartbeatResponse> {
-        if !matches!(&req.payload, NodePayload::Meta(_)) {
-            return Err(FsError::common("expected Meta payload"));
-        }
+        self.validate_meta_register(&req)?;
 
         let (_node_info, new_epoch) = self.node_manager.register(req)?;
 
@@ -229,6 +315,7 @@ impl ClusterManager {
     }
 
     pub fn handle_meta_heartbeat(&self, req: HeartbeatRequest) -> FsResult<HeartbeatResponse> {
+        self.validate_meta_heartbeat(&req)?;
         let mut resp = self.node_manager.handle_heartbeat(req)?;
         resp.mount_version = self.mount_manager.version();
         resp.table_epochs = self.bg_manager.get_table_epochs();
