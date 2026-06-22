@@ -247,7 +247,7 @@ impl PdMetrics {
     }
 
     fn snapshot_node_gauges(&self) {
-        let node_types = [NodeType::Worker, NodeType::Meta];
+        let node_types = [NodeType::Worker, NodeType::Meta, NodeType::Task];
 
         for nt in &node_types {
             let nodes = self.node_manager.get_nodes_by_type(*nt);

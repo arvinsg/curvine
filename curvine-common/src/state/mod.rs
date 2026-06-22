@@ -102,6 +102,9 @@ pub use self::worker_node_info::*;
 mod meta_node_info;
 pub use self::meta_node_info::*;
 
+mod task_node_info;
+pub use self::task_node_info::*;
+
 mod node_rpc;
 pub use self::node_rpc::*;
 

@@ -16,6 +16,7 @@ use crate::state::meta_node_info::{InodesStats, NodeGroupInfo};
 use crate::state::meta_node_mode::PathRouteEntry;
 use crate::state::node_info::{NodePayload, SystemStats};
 use crate::state::node_state::{NodeAddress, NodeBase, NodeType};
+use crate::state::task_node_info::TaskNodeStats;
 use crate::state::worker_node_info::StorageStats;
 use crate::state::{BGStats, BlockGroupInfo, ReplicaState};
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,7 @@ pub struct HeartbeatRequest {
 pub enum HeartbeatPayload {
     Worker(WorkerHeartbeatPayload),
     Meta(MetaHeartbeatPayload),
+    Task(TaskHeartbeatPayload),
 }
 
 /// Worker heartbeat payload
@@ -86,6 +88,13 @@ pub struct MetaHeartbeatPayload {
     pub sys_stats: SystemStats,
 }
 
+/// TaskNode heartbeat payload.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskHeartbeatPayload {
+    pub sys_stats: SystemStats,
+    pub stats: TaskNodeStats,
+}
+
 /// Heartbeat response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatResponse {
@@ -102,6 +111,7 @@ pub struct HeartbeatResponse {
 pub enum HeartbeatResponsePayload {
     Worker(WorkerHeartbeatResponse),
     Meta(MetaHeartbeatResponse),
+    Task(TaskHeartbeatResponse),
 }
 
 /// Worker heartbeat response
@@ -111,6 +121,10 @@ pub struct WorkerHeartbeatResponse {
     pub remove_bgs: Vec<u32>,
     pub update_bgs: Vec<BlockGroupInfo>,
 }
+
+/// TaskNode heartbeat response.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskHeartbeatResponse {}
 
 /// Route update action (full sync or incremental)
 #[derive(Debug, Clone, Serialize, Deserialize)]

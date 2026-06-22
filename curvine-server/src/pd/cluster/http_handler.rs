@@ -17,6 +17,7 @@ pub async fn list_nodes_by_type_handler(
     let nt = match node_type.to_lowercase().as_str() {
         "worker" => NodeType::Worker,
         "meta" => NodeType::Meta,
+        "task" => NodeType::Task,
         _ => {
             let err = ClusterError::invalid_node_type(node_type);
             return ApiResponse::<Vec<NodeInfo>>::error(

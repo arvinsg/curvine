@@ -22,7 +22,7 @@ use crate::pd::schedule::{Manager, ManagerContext, OperatorController};
 use curvine_common::state::{
     HeartbeatPayload, HeartbeatRequest, HeartbeatResponse, HeartbeatResponsePayload,
     MetaHeartbeatResponse, NodePayload, NodeState, NodeType, RegisterRequest,
-    WorkerHeartbeatResponse,
+    TaskHeartbeatResponse, WorkerHeartbeatResponse,
 };
 use curvine_common::{FsError, FsResult};
 use orpc::runtime::RpcRuntime;
@@ -195,6 +195,17 @@ impl ClusterManager {
         Ok(())
     }
 
+    fn validate_task_register(&self, req: &RegisterRequest) -> FsResult<()> {
+        self.validate_cluster_id(&req.cluster_id)?;
+        if req.base.node_type != NodeType::Task || !matches!(&req.payload, NodePayload::Task(_)) {
+            return Err(FsError::common(format!(
+                "expected Task register payload, got node_type={:?}",
+                req.base.node_type
+            )));
+        }
+        Ok(())
+    }
+
     fn validate_worker_heartbeat(&self, req: &HeartbeatRequest) -> FsResult<()> {
         self.validate_cluster_id(&req.cluster_id)?;
         if req.node_type != NodeType::Worker || !matches!(&req.payload, HeartbeatPayload::Worker(_))
@@ -212,6 +223,17 @@ impl ClusterManager {
         if req.node_type != NodeType::Meta || !matches!(&req.payload, HeartbeatPayload::Meta(_)) {
             return Err(FsError::common(format!(
                 "expected Meta heartbeat payload, got node_type={:?}",
+                req.node_type
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_task_heartbeat(&self, req: &HeartbeatRequest) -> FsResult<()> {
+        self.validate_cluster_id(&req.cluster_id)?;
+        if req.node_type != NodeType::Task || !matches!(&req.payload, HeartbeatPayload::Task(_)) {
+            return Err(FsError::common(format!(
+                "expected Task heartbeat payload, got node_type={:?}",
                 req.node_type
             )));
         }
@@ -323,6 +345,28 @@ impl ClusterManager {
             meta.path_route_update = self.meta_manager.get_path_route_update();
             meta.node_group_update = self.meta_manager.get_node_group_update();
         }
+        Ok(resp)
+    }
+
+    pub fn handle_task_register(&self, req: RegisterRequest) -> FsResult<HeartbeatResponse> {
+        self.validate_task_register(&req)?;
+
+        let (_node_info, new_epoch) = self.node_manager.register(req)?;
+
+        Ok(HeartbeatResponse {
+            error: None,
+            epoch: new_epoch,
+            mount_version: self.mount_manager.version(),
+            table_epochs: self.bg_manager.get_table_epochs(),
+            payload: HeartbeatResponsePayload::Task(TaskHeartbeatResponse::default()),
+        })
+    }
+
+    pub fn handle_task_heartbeat(&self, req: HeartbeatRequest) -> FsResult<HeartbeatResponse> {
+        self.validate_task_heartbeat(&req)?;
+        let mut resp = self.node_manager.handle_heartbeat(req)?;
+        resp.mount_version = self.mount_manager.version();
+        resp.table_epochs = self.bg_manager.get_table_epochs();
         Ok(resp)
     }
 

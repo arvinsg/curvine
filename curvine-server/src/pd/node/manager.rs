@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use super::event::{NodeEvent, NodeEventType};
-use super::{HandlerRegistry, HeartbeatHandler, MetaHeartbeatHandler, WorkerHeartbeatHandler};
+use super::{
+    HandlerRegistry, HeartbeatHandler, MetaHeartbeatHandler, TaskHeartbeatHandler,
+    WorkerHeartbeatHandler,
+};
 use crate::pd::config::ConfigManager;
 use crate::pd::journal::entry::{
     BatchUpdateNodeStateEntry, DeleteNodeEntry, HeartbeatCheckpointEntry, NodeEntry,
@@ -58,6 +61,7 @@ impl NodeManager {
         let mut registry = HandlerRegistry::new();
         registry.register(Arc::new(WorkerHeartbeatHandler::new()));
         registry.register(Arc::new(MetaHeartbeatHandler::new()));
+        registry.register(Arc::new(TaskHeartbeatHandler::new()));
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             index: Arc::new(RwLock::new(NodeIndex::new())),
@@ -855,7 +859,9 @@ impl NodeManager {
     fn payload_matches_node_type(payload: &NodePayload, node_type: NodeType) -> bool {
         matches!(
             (payload, node_type),
-            (NodePayload::Worker(_), NodeType::Worker) | (NodePayload::Meta(_), NodeType::Meta)
+            (NodePayload::Worker(_), NodeType::Worker)
+                | (NodePayload::Meta(_), NodeType::Meta)
+                | (NodePayload::Task(_), NodeType::Task)
         )
     }
 
@@ -868,6 +874,9 @@ impl NodeManager {
                 dst.bg_reports = src.bg_reports.clone();
             }
             (NodePayload::Meta(ref mut dst), NodePayload::Meta(ref src)) => {
+                dst.stats = src.stats.clone();
+            }
+            (NodePayload::Task(ref mut dst), NodePayload::Task(ref src)) => {
                 dst.stats = src.stats.clone();
             }
             _ => {}
@@ -884,6 +893,9 @@ impl NodeManager {
                 cur.peers = old.peers.clone();
                 cur.rw_policy = old.rw_policy;
                 cur.group_epoch = old.group_epoch;
+            }
+            (NodePayload::Task(cur), NodePayload::Task(old)) => {
+                cur.stats = old.stats.clone();
             }
             (cur, old) => {
                 *cur = old.clone();
@@ -1049,7 +1061,7 @@ mod tests {
     use super::*;
     use curvine_common::state::{
         MetaNodePayload, NodeAddress, NodeBase, NodeInfo, NodePayload, NodeState, NodeType,
-        WorkerNodePayload,
+        TaskNodePayload, WorkerNodePayload,
     };
     use std::sync::Arc;
 
@@ -1081,6 +1093,7 @@ mod tests {
         let payload = match node_type {
             NodeType::Worker => NodePayload::Worker(WorkerNodePayload::default()),
             NodeType::Meta => NodePayload::Meta(MetaNodePayload::default()),
+            NodeType::Task => NodePayload::Task(TaskNodePayload::default()),
         };
         NodeInfo {
             base: NodeBase {

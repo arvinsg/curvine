@@ -11,6 +11,7 @@ import "common.proto";
 enum NodeTypeProto {
     NODE_TYPE_PROTO_WORKER = 0;
     NODE_TYPE_PROTO_META = 1;
+    NODE_TYPE_PROTO_TASK = 2;
 }
 
 enum NodeStateProto {
@@ -91,6 +92,19 @@ message WorkerHeartbeatPayloadProto {
     required SystemStatsProto sys_stats = 2;
     map<uint32, uint64> bg_epochs = 3;
     repeated WorkerBGReportProto bg_reports = 4;
+}
+
+message TaskNodeStatsProto {
+    required uint32 running_tasks = 1;
+    required uint64 failed_tasks = 2;
+}
+
+message TaskRegisterPayloadProto {
+}
+
+message TaskHeartbeatPayloadProto {
+    required SystemStatsProto sys_stats = 1;
+    required TaskNodeStatsProto stats = 2;
 }
 
 enum BGStateProto {
@@ -235,6 +249,9 @@ message MetaHeartbeatResponseProto {
     optional NodeGroupUpdateProto node_group_update = 2;
 }
 
+message TaskHeartbeatResponseProto {
+}
+
 message NodeHeartbeatResponseProto {
     optional string error = 1;
     required uint64 epoch = 2;
@@ -242,6 +259,7 @@ message NodeHeartbeatResponseProto {
     map<uint32, uint64> table_epochs = 4;
     optional WorkerHeartbeatResponseProto worker = 5;
     optional MetaHeartbeatResponseProto meta = 6;
+    optional TaskHeartbeatResponseProto task = 7;
 }
 
 message NodeRegisterRequest {
@@ -249,6 +267,7 @@ message NodeRegisterRequest {
     required NodeBaseProto base = 2;
     optional WorkerRegisterPayloadProto worker = 3;
     optional MetaRegisterPayloadProto meta = 4;
+    optional TaskRegisterPayloadProto task = 5;
 }
 
 message NodeRegisterResponse {
@@ -264,6 +283,7 @@ message NodeHeartbeatRequest {
     required NodeAddressProto address = 6;
     optional WorkerHeartbeatPayloadProto worker = 7;
     optional MetaHeartbeatPayloadProto meta = 8;
+    optional TaskHeartbeatPayloadProto task = 9;
 }
 
 enum MetaNodeModeProto {

@@ -711,6 +711,7 @@ impl ProtoUtils {
         match t {
             NodeType::Worker => 0,
             NodeType::Meta => 1,
+            NodeType::Task => 2,
         }
     }
 
@@ -718,6 +719,7 @@ impl ProtoUtils {
         match v {
             0 => Ok(NodeType::Worker),
             1 => Ok(NodeType::Meta),
+            2 => Ok(NodeType::Task),
             _ => Err(Self::invalid_proto(format!("unknown node_type={}", v))),
         }
     }
@@ -1177,34 +1179,80 @@ impl ProtoUtils {
         })
     }
 
+    pub fn task_node_stats_to_pb(stats: &TaskNodeStats) -> TaskNodeStatsProto {
+        TaskNodeStatsProto {
+            running_tasks: stats.running_tasks,
+            failed_tasks: stats.failed_tasks,
+        }
+    }
+
+    pub fn task_node_stats_from_pb(stats: TaskNodeStatsProto) -> TaskNodeStats {
+        TaskNodeStats {
+            running_tasks: stats.running_tasks,
+            failed_tasks: stats.failed_tasks,
+        }
+    }
+
+    pub fn task_register_payload_to_pb(_payload: &TaskNodePayload) -> TaskRegisterPayloadProto {
+        TaskRegisterPayloadProto {}
+    }
+
+    pub fn task_register_payload_from_pb(_payload: TaskRegisterPayloadProto) -> TaskNodePayload {
+        TaskNodePayload::default()
+    }
+
+    pub fn task_heartbeat_payload_to_pb(
+        payload: &TaskHeartbeatPayload,
+    ) -> TaskHeartbeatPayloadProto {
+        TaskHeartbeatPayloadProto {
+            sys_stats: Self::system_stats_to_pb(&payload.sys_stats),
+            stats: Self::task_node_stats_to_pb(&payload.stats),
+        }
+    }
+
+    pub fn task_heartbeat_payload_from_pb(
+        payload: TaskHeartbeatPayloadProto,
+    ) -> TaskHeartbeatPayload {
+        TaskHeartbeatPayload {
+            sys_stats: Self::system_stats_from_pb(payload.sys_stats),
+            stats: Self::task_node_stats_from_pb(payload.stats),
+        }
+    }
+
     pub fn register_request_to_pb(req: &RegisterRequest) -> NodeRegisterRequest {
-        let (worker, meta) = match &req.payload {
-            NodePayload::Worker(p) => (Some(Self::worker_register_payload_to_pb(p)), None),
-            NodePayload::Meta(p) => (None, Some(Self::meta_register_payload_to_pb(p))),
+        let (worker, meta, task) = match &req.payload {
+            NodePayload::Worker(p) => (Some(Self::worker_register_payload_to_pb(p)), None, None),
+            NodePayload::Meta(p) => (None, Some(Self::meta_register_payload_to_pb(p)), None),
+            NodePayload::Task(p) => (None, None, Some(Self::task_register_payload_to_pb(p))),
         };
         NodeRegisterRequest {
             cluster_id: req.cluster_id.clone(),
             base: Self::node_base_to_pb(&req.base),
             worker,
             meta,
+            task,
         }
     }
 
     pub fn register_request_from_pb(req: NodeRegisterRequest) -> FsResult<RegisterRequest> {
         let base = Self::node_base_from_pb(req.base)?;
-        let payload = match (base.node_type, req.worker, req.meta) {
-            (NodeType::Worker, Some(worker), None) => {
+        let payload = match (base.node_type, req.worker, req.meta, req.task) {
+            (NodeType::Worker, Some(worker), None, None) => {
                 NodePayload::Worker(Self::worker_register_payload_from_pb(worker))
             }
-            (NodeType::Meta, None, Some(meta)) => {
+            (NodeType::Meta, None, Some(meta), None) => {
                 NodePayload::Meta(Self::meta_register_payload_from_pb(meta)?)
             }
-            (node_type, worker, meta) => {
+            (NodeType::Task, None, None, Some(task)) => {
+                NodePayload::Task(Self::task_register_payload_from_pb(task))
+            }
+            (node_type, worker, meta, task) => {
                 return Err(Self::invalid_proto(format!(
-                    "register payload mismatch node_type={:?}, worker_set={}, meta_set={}",
+                    "register payload mismatch node_type={:?}, worker_set={}, meta_set={}, task_set={}",
                     node_type,
                     worker.is_some(),
-                    meta.is_some()
+                    meta.is_some(),
+                    task.is_some()
                 )));
             }
         };
@@ -1216,9 +1264,12 @@ impl ProtoUtils {
     }
 
     pub fn heartbeat_request_to_pb(req: &HeartbeatRequest) -> NodeHeartbeatRequest {
-        let (worker, meta) = match &req.payload {
-            HeartbeatPayload::Worker(p) => (Some(Self::worker_heartbeat_payload_to_pb(p)), None),
-            HeartbeatPayload::Meta(p) => (None, Some(Self::meta_heartbeat_payload_to_pb(p))),
+        let (worker, meta, task) = match &req.payload {
+            HeartbeatPayload::Worker(p) => {
+                (Some(Self::worker_heartbeat_payload_to_pb(p)), None, None)
+            }
+            HeartbeatPayload::Meta(p) => (None, Some(Self::meta_heartbeat_payload_to_pb(p)), None),
+            HeartbeatPayload::Task(p) => (None, None, Some(Self::task_heartbeat_payload_to_pb(p))),
         };
         NodeHeartbeatRequest {
             cluster_id: req.cluster_id.clone(),
@@ -1229,6 +1280,7 @@ impl ProtoUtils {
             address: Self::node_address_to_pb(&req.address),
             worker,
             meta,
+            task,
         }
     }
 
@@ -1237,19 +1289,23 @@ impl ProtoUtils {
             return Err(Self::invalid_proto("node_id must not be 0"));
         }
         let node_type = Self::node_type_from_pb(req.node_type)?;
-        let payload = match (node_type, req.worker, req.meta) {
-            (NodeType::Worker, Some(worker), None) => {
+        let payload = match (node_type, req.worker, req.meta, req.task) {
+            (NodeType::Worker, Some(worker), None, None) => {
                 HeartbeatPayload::Worker(Self::worker_heartbeat_payload_from_pb(worker)?)
             }
-            (NodeType::Meta, None, Some(meta)) => {
+            (NodeType::Meta, None, Some(meta), None) => {
                 HeartbeatPayload::Meta(Self::meta_heartbeat_payload_from_pb(meta)?)
             }
-            (node_type, worker, meta) => {
+            (NodeType::Task, None, None, Some(task)) => {
+                HeartbeatPayload::Task(Self::task_heartbeat_payload_from_pb(task))
+            }
+            (node_type, worker, meta, task) => {
                 return Err(Self::invalid_proto(format!(
-                    "heartbeat payload mismatch node_type={:?}, worker_set={}, meta_set={}",
+                    "heartbeat payload mismatch node_type={:?}, worker_set={}, meta_set={}, task_set={}",
                     node_type,
                     worker.is_some(),
-                    meta.is_some()
+                    meta.is_some(),
+                    task.is_some()
                 )));
             }
         };
@@ -1585,13 +1641,28 @@ impl ProtoUtils {
         })
     }
 
+    pub fn task_heartbeat_response_to_pb(
+        _resp: &TaskHeartbeatResponse,
+    ) -> TaskHeartbeatResponseProto {
+        TaskHeartbeatResponseProto {}
+    }
+
+    pub fn task_heartbeat_response_from_pb(
+        _resp: TaskHeartbeatResponseProto,
+    ) -> TaskHeartbeatResponse {
+        TaskHeartbeatResponse::default()
+    }
+
     pub fn heartbeat_response_to_pb(resp: &HeartbeatResponse) -> NodeHeartbeatResponseProto {
-        let (worker, meta) = match &resp.payload {
+        let (worker, meta, task) = match &resp.payload {
             HeartbeatResponsePayload::Worker(w) => {
-                (Some(Self::worker_heartbeat_response_to_pb(w)), None)
+                (Some(Self::worker_heartbeat_response_to_pb(w)), None, None)
             }
             HeartbeatResponsePayload::Meta(m) => {
-                (None, Some(Self::meta_heartbeat_response_to_pb(m)))
+                (None, Some(Self::meta_heartbeat_response_to_pb(m)), None)
+            }
+            HeartbeatResponsePayload::Task(t) => {
+                (None, None, Some(Self::task_heartbeat_response_to_pb(t)))
             }
         };
         NodeHeartbeatResponseProto {
@@ -1601,24 +1672,29 @@ impl ProtoUtils {
             table_epochs: resp.table_epochs.clone(),
             worker,
             meta,
+            task,
         }
     }
 
     pub fn heartbeat_response_from_pb(
         resp: NodeHeartbeatResponseProto,
     ) -> FsResult<HeartbeatResponse> {
-        let payload = match (resp.worker, resp.meta) {
-            (Some(worker), None) => {
+        let payload = match (resp.worker, resp.meta, resp.task) {
+            (Some(worker), None, None) => {
                 HeartbeatResponsePayload::Worker(Self::worker_heartbeat_response_from_pb(worker)?)
             }
-            (None, Some(meta)) => {
+            (None, Some(meta), None) => {
                 HeartbeatResponsePayload::Meta(Self::meta_heartbeat_response_from_pb(meta)?)
             }
-            (worker, meta) => {
+            (None, None, Some(task)) => {
+                HeartbeatResponsePayload::Task(Self::task_heartbeat_response_from_pb(task))
+            }
+            (worker, meta, task) => {
                 return Err(Self::invalid_proto(format!(
-                    "heartbeat response payload mismatch worker_set={} meta_set={}",
+                    "heartbeat response payload mismatch worker_set={} meta_set={} task_set={}",
                     worker.is_some(),
-                    meta.is_some()
+                    meta.is_some(),
+                    task.is_some()
                 )));
             }
         };
@@ -1770,6 +1846,41 @@ mod pd_proto_utils_tests {
             }),
         }
     }
+    fn task_register_request() -> RegisterRequest {
+        RegisterRequest {
+            cluster_id: "curvine".to_string(),
+            base: NodeBase {
+                node_id: 30,
+                node_type: NodeType::Task,
+                address: node_addr(30),
+                labels: HashMap::from([("rack".to_string(), "r2".to_string())]),
+                software_version: "test".to_string(),
+                startup_time_ms: 789,
+            },
+            payload: NodePayload::Task(TaskNodePayload::default()),
+        }
+    }
+
+    fn task_heartbeat_request() -> HeartbeatRequest {
+        HeartbeatRequest {
+            cluster_id: "curvine".to_string(),
+            node_id: 30,
+            node_type: NodeType::Task,
+            epoch: 4,
+            timestamp_ms: 999,
+            address: node_addr(30),
+            payload: HeartbeatPayload::Task(TaskHeartbeatPayload {
+                sys_stats: SystemStats {
+                    cpu_usage: 0.7,
+                    memory_usage: 0.8,
+                },
+                stats: TaskNodeStats {
+                    running_tasks: 2,
+                    failed_tasks: 3,
+                },
+            }),
+        }
+    }
 
     fn meta_register_payload_pb() -> MetaRegisterPayloadProto {
         MetaRegisterPayloadProto {
@@ -1811,6 +1922,55 @@ mod pd_proto_utils_tests {
             }
             _ => panic!("expected worker heartbeat payload"),
         }
+    }
+
+    #[test]
+    fn register_request_task_round_trip() {
+        let req = task_register_request();
+        let decoded =
+            ProtoUtils::register_request_from_pb(ProtoUtils::register_request_to_pb(&req))
+                .expect("round trip task register");
+        assert_eq!(decoded.cluster_id, req.cluster_id);
+        assert_eq!(decoded.base.node_id, req.base.node_id);
+        assert_eq!(decoded.base.node_type, NodeType::Task);
+        assert!(matches!(decoded.payload, NodePayload::Task(_)));
+    }
+
+    #[test]
+    fn heartbeat_request_task_round_trip() {
+        let req = task_heartbeat_request();
+        let decoded =
+            ProtoUtils::heartbeat_request_from_pb(ProtoUtils::heartbeat_request_to_pb(&req))
+                .expect("round trip task heartbeat");
+        assert_eq!(decoded.node_id, req.node_id);
+        assert_eq!(decoded.node_type, NodeType::Task);
+        assert_eq!(decoded.epoch, req.epoch);
+        match decoded.payload {
+            HeartbeatPayload::Task(t) => {
+                assert_eq!(t.stats.running_tasks, 2);
+                assert_eq!(t.stats.failed_tasks, 3);
+                assert_eq!(t.sys_stats.cpu_usage, 0.7);
+            }
+            _ => panic!("expected task heartbeat payload"),
+        }
+    }
+
+    #[test]
+    fn heartbeat_response_task_round_trip() {
+        let resp = HeartbeatResponse {
+            error: None,
+            epoch: 5,
+            mount_version: 6,
+            table_epochs: HashMap::from([(2, 10)]),
+            payload: HeartbeatResponsePayload::Task(TaskHeartbeatResponse::default()),
+        };
+        let decoded =
+            ProtoUtils::heartbeat_response_from_pb(ProtoUtils::heartbeat_response_to_pb(&resp))
+                .expect("round trip task heartbeat response");
+        assert_eq!(decoded.epoch, resp.epoch);
+        assert_eq!(decoded.mount_version, resp.mount_version);
+        assert_eq!(decoded.table_epochs.get(&2), Some(&10));
+        assert!(matches!(decoded.payload, HeartbeatResponsePayload::Task(_)));
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub enum NodeType {
     #[default]
     Worker,
     Meta,
+    Task,
 }
 
 impl NodeType {
@@ -28,6 +29,7 @@ impl NodeType {
         match self {
             NodeType::Worker => "worker",
             NodeType::Meta => "meta",
+            NodeType::Task => "task",
         }
     }
 }

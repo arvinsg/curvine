@@ -12,22 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod event;
-mod heartbeat;
-mod index;
-mod manager;
-mod meta_handler;
-mod registry;
-mod store;
-mod task_handler;
-mod worker_handler;
+use serde::{Deserialize, Serialize};
 
-pub use event::{NodeEvent, NodeEventType};
-pub use heartbeat::HeartbeatHandler;
-pub use index::NodeIndex;
-pub use manager::NodeManager;
-pub use meta_handler::MetaHeartbeatHandler;
-pub use registry::HandlerRegistry;
-pub use store::NodeStore;
-pub use task_handler::TaskHeartbeatHandler;
-pub use worker_handler::WorkerHeartbeatHandler;
+/// TaskNode runtime stats reported by heartbeat.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskNodeStats {
+    pub running_tasks: u32,
+    pub failed_tasks: u64,
+}
+
+/// TaskNode persisted payload.
+///
+/// The first version keeps registration payload empty. Runtime stats are
+/// updated from heartbeat and skipped from persistence.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskNodePayload {
+    #[serde(skip)]
+    pub stats: TaskNodeStats,
+}

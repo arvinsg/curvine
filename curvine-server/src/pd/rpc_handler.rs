@@ -121,6 +121,7 @@ impl MessageHandler for PdRpcHandler {
                 let resp = match req.base.node_type {
                     NodeType::Worker => self.cluster_manager.handle_worker_register(req)?,
                     NodeType::Meta => self.cluster_manager.handle_meta_register(req)?,
+                    NodeType::Task => self.cluster_manager.handle_task_register(req)?,
                 };
                 ctx.response(ProtoUtils::register_response_to_pb(&resp))?
             }
@@ -131,6 +132,7 @@ impl MessageHandler for PdRpcHandler {
                 let resp = match req.node_type {
                     NodeType::Worker => self.cluster_manager.handle_worker_heartbeat(req)?,
                     NodeType::Meta => self.cluster_manager.handle_meta_heartbeat(req)?,
+                    NodeType::Task => self.cluster_manager.handle_task_heartbeat(req)?,
                 };
                 ctx.response(ProtoUtils::heartbeat_response_to_pb(&resp))?
             }

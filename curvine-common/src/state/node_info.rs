@@ -14,6 +14,7 @@
 
 use super::meta_node_info::MetaNodePayload;
 use super::node_state::{NodeBase, NodeState};
+use super::task_node_info::TaskNodePayload;
 use super::worker_node_info::WorkerNodePayload;
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +23,7 @@ use serde::{Deserialize, Serialize};
 pub enum NodePayload {
     Worker(WorkerNodePayload),
     Meta(MetaNodePayload),
+    Task(TaskNodePayload),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -70,6 +72,9 @@ impl NodeInfo {
                 dst.bg_reports = src.bg_reports.clone();
             }
             (NodePayload::Meta(ref mut dst), NodePayload::Meta(ref src)) => {
+                dst.stats = src.stats.clone();
+            }
+            (NodePayload::Task(ref mut dst), NodePayload::Task(ref src)) => {
                 dst.stats = src.stats.clone();
             }
             _ => {}
