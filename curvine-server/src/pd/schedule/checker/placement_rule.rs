@@ -17,7 +17,7 @@ use crate::pd::bg::placement::{
 };
 use crate::pd::schedule::ManagerContext;
 use crate::pd::schedule::{BGOperator, OpPriority, OperatorBuilder, OperatorKind};
-use curvine_common::state::{BlockGroupInfo, ReplicaState};
+use curvine_common::state::{table_id_pool_type, BlockGroupInfo, ReplicaState};
 
 pub struct PlacementRuleChecker;
 
@@ -47,8 +47,8 @@ impl super::Checker for PlacementRuleChecker {
         let worst_worker = worst_replica(&resident, &rule, &worker_labels)?;
         let current_score = isolation_score(&resident, &rule.location_labels, &worker_labels);
 
-        let pool_id = (bg.table_id >> 16) as u16;
-        let all_worker_ids: Vec<u32> = ctx.pool_manager.get_live_workers(pool_id);
+        let pool_type = table_id_pool_type(bg.table_id)?;
+        let all_worker_ids: Vec<u32> = ctx.pool_manager.get_live_workers(pool_type);
         let all_worker_labels = ctx.pool_manager.get_workers_labels(&all_worker_ids);
 
         let mut best_replacement = None;
@@ -118,9 +118,9 @@ impl super::Checker for PlacementRuleChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pd::pool::POOL_ID_SSD;
     use crate::pd::schedule::checker::tests_common::{decompose, Fixture};
     use crate::pd::schedule::checker::Checker;
+    use curvine_common::state::PoolType;
 
     #[test]
     fn name_and_priority() {
@@ -133,10 +133,10 @@ mod tests {
     fn no_op_when_no_min_isolation_level() {
         // topology_aware policy but min_isolation_level=None → no op.
         let f = Fixture::with_topology(vec!["az"], None);
-        f.add_worker(100, POOL_ID_SSD, &[("az", "a")]);
-        f.add_worker(101, POOL_ID_SSD, &[("az", "a")]);
-        f.add_worker(102, POOL_ID_SSD, &[("az", "b")]);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_worker(100, PoolType::Ssd, &[("az", "a")]);
+        f.add_worker(101, PoolType::Ssd, &[("az", "a")]);
+        f.add_worker(102, PoolType::Ssd, &[("az", "b")]);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         let bg = f.insert_bg(1, table_id, vec![100, 101, 102], None);
         assert!(PlacementRuleChecker.check_bg(&bg, &f.ctx).is_none());
     }
@@ -230,9 +230,9 @@ mod tests {
         for case in cases() {
             let f = Fixture::with_topology(vec!["az"], Some("az"));
             for (wid, labels) in &case.workers {
-                f.add_worker(*wid, POOL_ID_SSD, labels);
+                f.add_worker(*wid, PoolType::Ssd, labels);
             }
-            let table_id = f.insert_table(POOL_ID_SSD, 3);
+            let table_id = f.insert_table(PoolType::Ssd, 3);
             let bg = f.insert_bg(
                 1,
                 table_id,

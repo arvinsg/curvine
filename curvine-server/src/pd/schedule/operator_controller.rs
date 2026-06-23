@@ -806,7 +806,7 @@ mod tests {
     use crate::pd::journal::{BGEntry, BGUpdateEntry, Client as JournalClient};
     use crate::pd::node::{NodeManager, NodeStore};
     use crate::pd::pd_server::init_metrics_for_test;
-    use crate::pd::pool::{PoolManager, PoolStore};
+    use crate::pd::pool::PoolManager;
     use crate::pd::store::{KvStore, MemoryKvEngine};
     use std::collections::HashMap;
 
@@ -823,8 +823,7 @@ mod tests {
         let config = Arc::new(ConfigManager::new(store.clone(), jc.clone(), overrides));
         let node_store = Arc::new(NodeStore::new(store.clone()));
         let node_mgr = Arc::new(NodeManager::new(node_store, config.clone(), jc.clone()));
-        let pool_store = Arc::new(PoolStore::new(store.clone()));
-        let pool_mgr = Arc::new(PoolManager::new(pool_store, node_mgr, jc.clone()));
+        let pool_mgr = Arc::new(PoolManager::new(node_mgr));
         let bg_store = Arc::new(BGStore::new(store));
         let bg_mgr = Arc::new(BGManager::new(
             bg_store,

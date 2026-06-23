@@ -26,7 +26,8 @@ use crate::pd::journal::{self, ApplyOutcome, PdEntry};
 use crate::pd::pool::PoolManager;
 use curvine_common::state::{
     gen_table_id, BGLease, BGOpState, BGState, BGStats, BGTableSummary, BlockGroupInfo,
-    BlockGroupInfoView, NodeState, ReplicaInfo, ReplicaState, StorageType, WorkerBGReport,
+    BlockGroupInfoView, NodeState, PoolType, ReplicaInfo, ReplicaState, StorageType,
+    WorkerBGReport,
 };
 use curvine_common::{FsError, FsResult};
 use std::collections::{HashMap, HashSet};
@@ -559,6 +560,8 @@ impl BGManager {
 
         let summary = BGTableSummary {
             table_id: table.table_id,
+            pool_type: table.pool_type,
+            replica_count: table.replica_count(),
             bucket_count: table.bucket_count,
             epoch: table.epoch,
             buckets,
@@ -1186,17 +1189,17 @@ impl BGManager {
     /// to workers, then proposes the entire result as a single BatchBG Raft entry.
     pub fn create_table(
         &self,
-        pool_id: u16,
+        pool_type: PoolType,
         bucket_count: u32,
         replica_count: u16,
         _workers: &[u32],
     ) -> FsResult<()> {
-        let table_id = gen_table_id(pool_id, replica_count);
+        let table_id = gen_table_id(pool_type, replica_count);
 
         if self.tables.read().unwrap().contains_key(&table_id) {
             return Err(FsError::common(format!(
                 "table already exists for pool {} replicas {}",
-                pool_id, replica_count
+                pool_type, replica_count
             )));
         }
 
@@ -1204,6 +1207,7 @@ impl BGManager {
 
         let stub_table = BGTable {
             table_id,
+            pool_type,
             bucket_count: 0,
             buckets: vec![],
             epoch: 0,
@@ -1211,7 +1215,7 @@ impl BGManager {
             last_rebuild_ms: 0,
             stats: BGTableStats::default(),
         };
-        let inputs = self.prepare_placement_inputs(pool_id, &stub_table, true)?;
+        let inputs = self.prepare_placement_inputs(pool_type, &stub_table, true)?;
 
         let tolerant = self.rebuild_tolerant_ratio();
         let ctx = PlacementContext {
@@ -1247,13 +1251,13 @@ impl BGManager {
         self.propose_batch_bg(entry)
     }
 
-    /// Check if a BGTable exists for the given pool_id.
-    pub fn has_table_for_pool(&self, pool_id: u16) -> bool {
+    /// Check if a BGTable exists for the given pool type.
+    pub fn has_table_for_pool(&self, pool_type: PoolType) -> bool {
         self.tables
             .read()
             .unwrap()
             .values()
-            .any(|t| t.pool_id() == pool_id)
+            .any(|t| t.pool_type() == pool_type)
     }
 
     // P4.2 (removed): `bump_table_epoch_for_publish` and
@@ -1532,8 +1536,8 @@ impl BGManager {
         media: StorageType,
         init: bool,
     ) -> HashMap<u32, WorkerLoadSnapshot> {
-        let pool_id = table.pool_id();
-        let live_workers = self.pool_manager.get_live_workers(pool_id);
+        let pool_type = table.pool_type();
+        let live_workers = self.pool_manager.get_live_workers(pool_type);
 
         let table_bgs: Vec<Arc<BlockGroupInfo>> = if init {
             vec![]
@@ -1601,7 +1605,7 @@ impl BGManager {
             .get(&bg.table_id)
             .cloned()
             .ok_or_else(|| FsError::common(format!("table {} not found", bg.table_id)))?;
-        let inputs = self.prepare_placement_inputs(table.pool_id(), &table, false)?;
+        let inputs = self.prepare_placement_inputs(table.pool_type(), &table, false)?;
 
         let tolerant = self.rebuild_tolerant_ratio();
         let ctx = PlacementContext {
@@ -1700,7 +1704,7 @@ impl BGManager {
             return Ok(None);
         }
 
-        let inputs = self.prepare_placement_inputs(table.pool_id(), &table, false)?;
+        let inputs = self.prepare_placement_inputs(table.pool_type(), &table, false)?;
         let tolerant = self.rebuild_tolerant_ratio();
         let ctx = PlacementContext {
             workers: &inputs.workers,
@@ -1772,11 +1776,11 @@ impl BGManager {
     }
 
     /// Rebuild all tables for a pool, calls rebuild_table for each table in the pool.
-    pub fn rebuild_tables_for_pool(&self, pool_id: u16) -> FsResult<()> {
+    pub fn rebuild_tables_for_pool(&self, pool_type: PoolType) -> FsResult<()> {
         let table_ids: Vec<u32> = self
             .list_tables()
             .into_iter()
-            .filter(|t| t.pool_id() == pool_id)
+            .filter(|t| t.pool_type() == pool_type)
             .map(|t| t.table_id)
             .collect();
         for table_id in table_ids {
@@ -1833,14 +1837,14 @@ impl BGManager {
         &self.replica_counts
     }
 
-    /// Assemble the worker snapshot, placement rule, and balance policy for `pool_id`.
+    /// Assemble the worker snapshot, placement rule, and balance policy for `pool_type`.
     fn prepare_placement_inputs(
         &self,
-        pool_id: u16,
+        pool_type: PoolType,
         table_for_snapshot: &BGTable,
         for_create: bool,
     ) -> FsResult<PlacementInputs> {
-        let pool = self.pool_manager.get_pool(pool_id)?;
+        let pool = self.pool_manager.get_pool(pool_type)?;
         let workers = self.build_worker_snapshots(table_for_snapshot, pool.media, for_create);
         let rule = self.placement_rule();
         let policy = create_policy(&self.balance_policy_strategy());
@@ -1910,7 +1914,6 @@ mod tests {
     use super::*;
     use crate::pd::config::ConfigManager;
     use crate::pd::node::{NodeManager, NodeStore};
-    use crate::pd::pool::PoolStore;
     use crate::pd::store::memory_kv_engine::MemoryKvEngine;
     use crate::pd::store::KvStore;
     use curvine_common::conf::JournalConf;
@@ -1920,7 +1923,6 @@ mod tests {
     fn test_manager() -> BGManager {
         let store: Arc<dyn KvStore> = Arc::new(MemoryKvEngine::new());
         let bg_store = Arc::new(BGStore::new(store));
-        let pool_store = Arc::new(PoolStore::new(Arc::new(MemoryKvEngine::new())));
         let node_store = Arc::new(NodeStore::new(Arc::new(MemoryKvEngine::new())));
         let journal_conf = JournalConf::default();
         let rt = journal_conf.create_runtime();
@@ -1936,7 +1938,7 @@ mod tests {
             config_manager.clone(),
             jc.clone(),
         ));
-        let pool_manager = Arc::new(PoolManager::new(pool_store, node_manager, jc.clone()));
+        let pool_manager = Arc::new(PoolManager::new(node_manager));
         let mgr = BGManager::new(
             bg_store,
             pool_manager,
@@ -2055,6 +2057,7 @@ mod tests {
         let info = make_bg(4, 10, vec![400]);
         mgr.test_insert_table(BGTable {
             table_id: 10,
+            pool_type: PoolType::Ssd,
             bucket_count: 1,
             buckets: vec![4],
             epoch: 0,
@@ -2248,6 +2251,7 @@ mod tests {
         let info = make_bg(21, 1, vec![1, 2]);
         mgr.test_insert_table(BGTable {
             table_id: 1,
+            pool_type: PoolType::Ssd,
             bucket_count: 1,
             buckets: vec![21],
             epoch: 0,
@@ -2334,6 +2338,7 @@ mod tests {
         mgr.test_insert_node(make_worker_node(100, NodeState::Live));
         mgr.test_insert_table(BGTable {
             table_id: 10,
+            pool_type: PoolType::Ssd,
             bucket_count: 1,
             buckets: vec![1],
             epoch: 1,
@@ -2358,6 +2363,7 @@ mod tests {
         mgr.test_insert_node(make_worker_node(100, NodeState::Live));
         mgr.test_insert_table(BGTable {
             table_id: 10,
+            pool_type: PoolType::Ssd,
             bucket_count: 1,
             buckets: vec![1],
             epoch: 1,
@@ -2410,6 +2416,7 @@ mod tests {
         let mgr = test_manager();
         let table = BGTable {
             table_id: 10,
+            pool_type: PoolType::Ssd,
             bucket_count: 1,
             buckets: vec![1],
             epoch: 1,
@@ -2573,11 +2580,12 @@ mod tests {
     fn baseline_concurrent_batch_create_same_table_orphans_first_bgs() {
         use crate::pd::bg::BGTable;
         let mgr = test_manager();
-        let table_id = curvine_common::state::gen_table_id(1, 3);
+        let table_id = curvine_common::state::gen_table_id(PoolType::Ssd, 3);
 
         // Path A: build table with bg_id range 100..103.
         let table_a = BGTable {
             table_id,
+            pool_type: PoolType::Ssd,
             bucket_count: 3,
             buckets: vec![100, 101, 102],
             epoch: 0,
@@ -2592,6 +2600,7 @@ mod tests {
         // Path B: build same table with disjoint bg_id range 200..203.
         let table_b = BGTable {
             table_id,
+            pool_type: PoolType::Ssd,
             bucket_count: 3,
             buckets: vec![200, 201, 202],
             epoch: 0,
@@ -2669,6 +2678,7 @@ mod tests {
         let table_id = 42;
         mgr.test_insert_table(BGTable {
             table_id,
+            pool_type: PoolType::Ssd,
             bucket_count: 1,
             buckets: vec![1],
             epoch: 5,

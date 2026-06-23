@@ -16,7 +16,7 @@ use super::context::PlacementContext;
 use super::policy::{PlacementPolicy, PolicyState, RebuildOptions, ReplicaDecision};
 use super::rule::{best_isolation_candidates, filter_min_isolation, Labels, PlacementRule};
 use crate::pd::bg::{BGTable, BGTableStats};
-use curvine_common::state::{BGLease, BGState, BlockGroupInfo};
+use curvine_common::state::{table_id_pool_type, BGLease, BGState, BlockGroupInfo};
 use curvine_common::FsError;
 use orpc::common::LocalTime;
 use std::collections::HashSet;
@@ -122,9 +122,12 @@ pub fn build_table(
         });
     }
 
+    let pool_type = table_id_pool_type(table_id)
+        .ok_or_else(|| FsError::common(format!("invalid table_id pool type: {}", table_id)))?;
     let buckets: Vec<u32> = (next_bg_id..next_bg_id + bucket_count).collect();
     let table = BGTable {
         table_id,
+        pool_type,
         bucket_count,
         buckets,
         epoch: 1,
@@ -348,7 +351,7 @@ fn try_pick(
 mod tests {
     use super::*;
     use crate::pd::bg::placement::{QuotaPolicy, WorkerLoadSnapshot};
-    use curvine_common::state::BGOpState;
+    use curvine_common::state::{gen_table_id, BGOpState, PoolType};
     use std::collections::HashMap;
 
     fn make_ctx<'a>(
@@ -417,7 +420,17 @@ mod tests {
         let policy = QuotaPolicy::new();
         let mut st = policy.prepare(&ctx).unwrap();
 
-        let result = build_table(1, 4, 2, 100, &ctx, &rule, &policy, &mut st).unwrap();
+        let result = build_table(
+            gen_table_id(PoolType::Ssd, 2),
+            4,
+            2,
+            100,
+            &ctx,
+            &rule,
+            &policy,
+            &mut st,
+        )
+        .unwrap();
 
         assert_eq!(result.table.bucket_count, 4);
         assert_eq!(result.bgs.len(), 4);
@@ -479,6 +492,7 @@ mod tests {
 
         let table = BGTable {
             table_id: 1,
+            pool_type: PoolType::Ssd,
             bucket_count: 1,
             buckets: vec![100],
             epoch: 1,
@@ -529,6 +543,7 @@ mod tests {
 
         let table = BGTable {
             table_id: 1,
+            pool_type: PoolType::Ssd,
             bucket_count: 1,
             buckets: vec![100],
             epoch: 1,
@@ -583,6 +598,7 @@ mod tests {
 
         let table = BGTable {
             table_id: 1,
+            pool_type: PoolType::Ssd,
             bucket_count: 4,
             buckets: vec![100, 101, 102, 103],
             epoch: 1,

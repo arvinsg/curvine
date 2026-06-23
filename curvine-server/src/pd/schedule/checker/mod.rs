@@ -89,13 +89,12 @@ pub fn default_checkers() -> Vec<Box<dyn Checker>> {
 #[cfg(test)]
 pub mod tests_common {
     use crate::pd::bg::{BGTable, BGTableStats};
-    use crate::pd::journal::{BGEntry, PoolEntry};
-    use crate::pd::pool::{POOL_ID_HDD, POOL_ID_MEM, POOL_ID_SSD};
+    use crate::pd::journal::BGEntry;
     use crate::pd::schedule::ManagerContext;
     use curvine_common::state::{
         gen_table_id, table_id_replica_count, BGLease, BGOpState, BGState, BlockGroupInfo,
-        NodeAddress, NodeBase, NodeInfo, NodePayload, NodeState, NodeType, PoolInfo, ReplicaState,
-        StorageType, WorkerNodePayload,
+        NodeAddress, NodeBase, NodeInfo, NodePayload, NodeState, NodeType, PoolType, ReplicaState,
+        StorageSpec, WorkerNodePayload,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -127,12 +126,7 @@ pub mod tests_common {
             config.clone(),
             jc.clone(),
         ));
-        let pool_store = Arc::new(crate::pd::pool::PoolStore::new(store.clone()));
-        let pool_mgr = Arc::new(crate::pd::pool::PoolManager::new(
-            pool_store,
-            node_mgr.clone(),
-            jc.clone(),
-        ));
+        let pool_mgr = Arc::new(crate::pd::pool::PoolManager::new(node_mgr.clone()));
         let bg_store = Arc::new(crate::pd::bg::BGStore::new(store));
         let bg_mgr = Arc::new(crate::pd::bg::BGManager::new(
             bg_store,
@@ -198,24 +192,27 @@ pub mod tests_common {
 
         fn build(overrides: HashMap<String, String>, location_labels: Vec<String>) -> Self {
             let ctx = test_context_with_labels(overrides, location_labels);
-            for (pool_id, name, media) in [
-                (POOL_ID_MEM, "mem_pool", StorageType::Mem),
-                (POOL_ID_SSD, "ssd_pool", StorageType::Ssd),
-                (POOL_ID_HDD, "hdd_pool", StorageType::Hdd),
-            ] {
-                ctx.pool_manager
-                    .test_install_pool(PoolInfo::new(pool_id, name.to_string(), media))
-                    .unwrap();
-            }
             Self { ctx }
         }
 
-        /// Register a worker as Live, assign labels, and add to the pool.
-        pub fn add_worker(&self, worker_id: u32, pool_id: u16, labels: &[(&str, &str)]) {
+        /// Register a worker as Live, assign labels, and add storage specs for the pool.
+        pub fn add_worker(&self, worker_id: u32, pool_type: PoolType, labels: &[(&str, &str)]) {
             let mut label_map = HashMap::new();
             for (k, v) in labels {
                 label_map.insert(k.to_string(), v.to_string());
             }
+            let mut payload = WorkerNodePayload::default();
+            payload.storage_specs.insert(
+                "s0".to_string(),
+                StorageSpec {
+                    dir_id: 0,
+                    storage_id: "s0".to_string(),
+                    failed: false,
+                    storage_type: pool_type.media(),
+                    dir_path: "/tmp/s0".to_string(),
+                },
+            );
+            let storage_specs = payload.storage_specs.clone();
             self.ctx.node_manager.test_insert_node(NodeInfo {
                 base: NodeBase {
                     node_id: worker_id,
@@ -230,18 +227,19 @@ pub mod tests_common {
                     ..Default::default()
                 },
                 state: NodeState::Live,
-                payload: NodePayload::Worker(WorkerNodePayload::default()),
+                payload: NodePayload::Worker(payload),
                 ..Default::default()
             });
-            let mut pool = self.ctx.pool_manager.get_pool(pool_id).unwrap();
-            pool.workers.insert(worker_id);
-            self.ctx.pool_manager.test_install_pool(pool).unwrap();
+            self.ctx
+                .pool_manager
+                .assign_worker_to_pools(worker_id, &storage_specs)
+                .unwrap();
         }
 
         /// Register multiple workers (no labels).
-        pub fn add_workers(&self, worker_ids: &[u32], pool_id: u16) {
+        pub fn add_workers(&self, worker_ids: &[u32], pool_type: PoolType) {
             for &wid in worker_ids {
-                self.add_worker(wid, pool_id, &[]);
+                self.add_worker(wid, pool_type, &[]);
             }
         }
 
@@ -253,12 +251,13 @@ pub mod tests_common {
             self.ctx.node_manager.test_insert_node(node);
         }
 
-        /// Insert a BGTable for (pool_id, replica_count). Returns the composed table_id.
-        pub fn insert_table(&self, pool_id: u16, replica_count: u16) -> u32 {
-            let table_id = gen_table_id(pool_id, replica_count);
+        /// Insert a BGTable for (pool_type, replica_count). Returns the composed table_id.
+        pub fn insert_table(&self, pool_type: PoolType, replica_count: u16) -> u32 {
+            let table_id = gen_table_id(pool_type, replica_count);
             debug_assert_eq!(table_id_replica_count(table_id), replica_count);
             self.ctx.bg_manager.test_insert_table(BGTable {
                 table_id,
+                pool_type,
                 bucket_count: 16,
                 buckets: vec![],
                 epoch: 1,

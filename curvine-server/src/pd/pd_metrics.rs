@@ -134,27 +134,27 @@ impl PdMetrics {
             pool_capacity_bytes: m::new_gauge_vec(
                 "pd_pool_capacity_bytes",
                 "Pool total capacity in bytes",
-                &["pool_id"],
+                &["pool_type"],
             )?,
             pool_available_bytes: m::new_gauge_vec(
                 "pd_pool_available_bytes",
                 "Pool available space in bytes",
-                &["pool_id"],
+                &["pool_type"],
             )?,
             pool_used_bytes: m::new_gauge_vec(
                 "pd_pool_used_bytes",
                 "Pool used space in bytes",
-                &["pool_id"],
+                &["pool_type"],
             )?,
             pool_worker_count: m::new_gauge_vec(
                 "pd_pool_worker_count",
                 "Number of workers in pool",
-                &["pool_id"],
+                &["pool_type"],
             )?,
             pool_block_count: m::new_gauge_vec(
                 "pd_pool_block_count",
                 "Total block count in pool",
-                &["pool_id"],
+                &["pool_type"],
             )?,
 
             // BG
@@ -286,7 +286,7 @@ impl PdMetrics {
     fn snapshot_pool_gauges(&self) {
         let pools = self.pool_manager.list_active_pools();
         for pool in &pools {
-            let pid = pool.pool_id.to_string();
+            let pid = pool.pool_type.to_string();
             self.pool_capacity_bytes
                 .with_label_values(&[&pid])
                 .set(pool.stats.capacity_bytes as i64);
@@ -298,7 +298,7 @@ impl PdMetrics {
                 .set(pool.stats.used_bytes as i64);
             self.pool_worker_count
                 .with_label_values(&[&pid])
-                .set(pool.workers.len() as i64);
+                .set(self.pool_manager.get_workers_in_pool(pool.pool_type).len() as i64);
             self.pool_block_count
                 .with_label_values(&[&pid])
                 .set(pool.stats.block_count as i64);

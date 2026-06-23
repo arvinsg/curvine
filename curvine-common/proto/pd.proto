@@ -164,6 +164,8 @@ message BGTableSummaryProto {
     required uint64 epoch = 3;
     required uint64 last_rebuild_ms = 4;
     repeated BlockGroupInfoViewProto buckets = 5;
+    required uint32 pool_type = 6;
+    required uint32 replica_count = 7;
 }
 
 message WorkerHeartbeatResponseProto {

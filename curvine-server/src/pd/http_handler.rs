@@ -75,7 +75,7 @@ impl RouterHandler for PdHttpHandler {
             )
             // Pool
             .route("/api/v1/pool", get(list_pools_handler))
-            .route("/api/v1/pool/:pool_id", get(get_pool_handler))
+            .route("/api/v1/pool/:pool_type", get(get_pool_handler))
             // BG
             .route("/api/v1/bg/table", get(list_bg_tables_handler))
             .route("/api/v1/bg/table/:table_id", get(get_bg_table_handler))

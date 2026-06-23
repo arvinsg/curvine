@@ -14,11 +14,8 @@
 
 mod index;
 mod manager;
-mod store;
-
 #[cfg(test)]
 mod manager_tests;
 
 pub use index::PoolIndex;
-pub use manager::{PoolManager, POOL_ID_HDD, POOL_ID_MEM, POOL_ID_SSD};
-pub use store::PoolStore;
+pub use manager::PoolManager;

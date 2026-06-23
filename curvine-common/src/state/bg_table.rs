@@ -12,29 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::PoolType;
 use orpc::common::Utils;
 use serde::{Deserialize, Serialize};
 
-/// table_id encoding: (pool_id << 16) | replicas
+/// Temporary deterministic table id encoding before namespace-scoped table id
+/// allocation lands: (pool_type_code << 16) | replicas.
 #[inline]
 pub fn table_id_replica_count(table_id: u32) -> u16 {
     (table_id & 0xFFFF) as u16
 }
 
 #[inline]
-pub fn table_id_pool_id(table_id: u32) -> u16 {
-    (table_id >> 16) as u16
+pub fn table_id_pool_type(table_id: u32) -> Option<PoolType> {
+    PoolType::from_code((table_id >> 16) as u16)
 }
 
 #[inline]
-pub fn gen_table_id(pool_id: u16, replica_count: u16) -> u32 {
-    ((pool_id as u32) << 16) | (replica_count as u32)
+pub fn gen_table_id(pool_type: PoolType, replica_count: u16) -> u32 {
+    ((pool_type.code() as u32) << 16) | (replica_count as u32)
 }
 
 /// Built by PD from BGTable.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BGTableSummary {
     pub table_id: u32,
+    pub pool_type: PoolType,
+    pub replica_count: u16,
     pub bucket_count: u32,
     pub epoch: u64,
     pub last_rebuild_ms: u64,
@@ -43,11 +47,11 @@ pub struct BGTableSummary {
 
 impl BGTableSummary {
     pub fn replica_count(&self) -> u16 {
-        table_id_replica_count(self.table_id)
+        self.replica_count
     }
 
-    pub fn pool_id(&self) -> u16 {
-        table_id_pool_id(self.table_id)
+    pub fn pool_type(&self) -> PoolType {
+        self.pool_type
     }
 
     /// Lookup which BlockGroup (with replicas) to use for the given key.
@@ -84,15 +88,17 @@ mod tests {
 
     #[test]
     fn table_id_helpers() {
-        let table_id = (2u32 << 16) | 3u32;
+        let table_id = gen_table_id(PoolType::Ssd, 3);
         assert_eq!(table_id_replica_count(table_id), 3);
-        assert_eq!(table_id_pool_id(table_id), 2);
+        assert_eq!(table_id_pool_type(table_id), Some(PoolType::Ssd));
     }
 
     #[test]
-    fn summary_replica_count_and_pool_id() {
+    fn summary_replica_count_and_pool_type() {
         let s = BGTableSummary {
-            table_id: (2 << 16) | 3,
+            table_id: gen_table_id(PoolType::Ssd, 3),
+            pool_type: PoolType::Ssd,
+            replica_count: 3,
             bucket_count: 4,
             epoch: 1,
             last_rebuild_ms: 0,
@@ -104,13 +110,15 @@ mod tests {
             ],
         };
         assert_eq!(s.replica_count(), 3);
-        assert_eq!(s.pool_id(), 2);
+        assert_eq!(s.pool_type(), PoolType::Ssd);
     }
 
     #[test]
     fn summary_lookup() {
         let s = BGTableSummary {
             table_id: 1,
+            pool_type: PoolType::Ssd,
+            replica_count: 1,
             bucket_count: 4,
             epoch: 0,
             last_rebuild_ms: 0,
@@ -131,6 +139,8 @@ mod tests {
     fn summary_lookup_empty_none() {
         let s = BGTableSummary {
             table_id: 1,
+            pool_type: PoolType::Ssd,
+            replica_count: 1,
             bucket_count: 0,
             epoch: 0,
             last_rebuild_ms: 0,

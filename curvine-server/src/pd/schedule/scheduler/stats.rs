@@ -87,8 +87,8 @@ impl Scheduler for StatsScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pd::pool::POOL_ID_SSD;
     use crate::pd::schedule::checker::tests_common::Fixture;
+    use curvine_common::state::PoolType;
     use curvine_common::state::{WorkerBGReport, WorkerNodePayload};
 
     #[test]
@@ -126,8 +126,8 @@ mod tests {
     #[test]
     fn schedule_aggregates_bg_reports_into_table_stats() {
         let f = Fixture::new();
-        f.add_workers(&[100, 101, 102], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         let bg1 = 5_000;
         let bg2 = 5_001;
         f.insert_bg(bg1, table_id, vec![100, 101, 102], None);
@@ -178,8 +178,8 @@ mod tests {
     #[test]
     fn multiple_schedule_calls_refresh_table_stats() {
         let f = Fixture::new();
-        f.add_workers(&[100, 101, 102], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         let bg_id = 5_100;
         f.insert_bg(bg_id, table_id, vec![100, 101, 102], None);
         f.set_table_buckets(table_id, &[bg_id]);
@@ -226,8 +226,8 @@ mod tests {
     #[test]
     fn schedule_without_reports_leaves_table_stats_zero() {
         let f = Fixture::new();
-        f.add_workers(&[100, 101, 102], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
 
         StatsScheduler::new().schedule(&f.ctx);
 

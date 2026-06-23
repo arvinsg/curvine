@@ -432,12 +432,7 @@ mod tests {
             config.clone(),
             jc.clone(),
         ));
-        let pool_store = std::sync::Arc::new(crate::pd::pool::PoolStore::new(store.clone()));
-        let pool_mgr = std::sync::Arc::new(crate::pd::pool::PoolManager::new(
-            pool_store,
-            node_mgr,
-            jc.clone(),
-        ));
+        let pool_mgr = std::sync::Arc::new(crate::pd::pool::PoolManager::new(node_mgr));
         let bg_store = std::sync::Arc::new(crate::pd::bg::BGStore::new(store));
         let bg_mgr = std::sync::Arc::new(BGManager::new(
             bg_store,

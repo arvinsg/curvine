@@ -120,32 +120,20 @@ impl Manager {
 
     fn full_reconcile(&self) {
         log::info!("Schedule manager: running leader full reconcile");
-        if let Err(e) = self.ctx.pool_manager.ensure_default_pools() {
-            log::error!("Failed to ensure default pools: {}", e);
-        }
         self.reconcile_worker_pool_membership();
+        self.ctx.pool_manager.refresh_pool_stats();
         self.reconcile_observed_replica_states();
         self.scheduler_controller.on_leader_start();
         log::info!("Schedule manager: leader full reconcile completed");
     }
 
     fn reconcile_worker_pool_membership(&self) {
-        let workers = self.ctx.node_manager.get_nodes_by_type(NodeType::Worker);
-        match self
-            .ctx
-            .pool_manager
-            .reconcile_worker_pool_membership(&workers)
-        {
+        match self.ctx.pool_manager.reconcile_worker_pool_membership() {
             Ok(result) => log::info!(
-                "Schedule manager: worker pool reconcile done, workers={}, changed_pool_ids={:?}",
-                workers.len(),
-                result.changed_pool_ids
+                "Schedule manager: worker pool reconcile done, changed_pool_types={:?}",
+                result.changed_pool_types
             ),
-            Err(e) => log::warn!(
-                "Schedule manager: worker pool reconcile failed, workers={}, err={}",
-                workers.len(),
-                e
-            ),
+            Err(e) => log::warn!("Schedule manager: worker pool reconcile failed, err={}", e),
         }
     }
 
@@ -448,19 +436,25 @@ impl Manager {
                 return None;
             }
         };
-        if result.changed_pool_ids.is_empty() {
+        if result.target_pool_types.is_empty() {
+            log::info!(
+                "Worker {} registered, but has no storage specs that map to a pool",
+                event.node_id
+            );
+            return None;
+        }
+        if result.changed_pool_types.is_empty() {
             log::info!(
                 "Worker {} registered, target pools {:?}, no pool membership changed",
                 event.node_id,
-                result.target_pool_ids
+                result.target_pool_types
             );
             return None;
         }
         Some(ScheduleEvent::WorkerJoinedPools {
             worker_id: event.node_id,
             node_epoch: event.epoch,
-            target_pool_ids: result.target_pool_ids,
-            changed_pool_ids: result.changed_pool_ids,
+            pool_types: result.changed_pool_types,
             event_time_ms: event.event_time_ms,
         })
     }
@@ -496,7 +490,7 @@ mod tests {
     #[test]
     fn fence_worker_event_accepts_current_worker_event() {
         let f = Fixture::new();
-        f.add_worker(100, crate::pd::pool::POOL_ID_SSD, &[]);
+        f.add_worker(100, curvine_common::state::PoolType::Ssd, &[]);
         let manager = Manager::new(f.ctx.clone());
         let event = worker_event(100, 0, Some(NodeState::Live));
 
@@ -508,7 +502,7 @@ mod tests {
     #[test]
     fn fence_worker_event_rejects_stale_epoch_single_side() {
         let f = Fixture::new();
-        f.add_worker(100, crate::pd::pool::POOL_ID_SSD, &[]);
+        f.add_worker(100, curvine_common::state::PoolType::Ssd, &[]);
         let manager = Manager::new(f.ctx.clone());
         let event = worker_event(100, 1, Some(NodeState::Live));
 
@@ -520,7 +514,7 @@ mod tests {
     #[test]
     fn fence_worker_event_rejects_state_mismatch_single_side() {
         let f = Fixture::new();
-        f.add_worker(100, crate::pd::pool::POOL_ID_SSD, &[]);
+        f.add_worker(100, curvine_common::state::PoolType::Ssd, &[]);
         let manager = Manager::new(f.ctx.clone());
         let event = worker_event(100, 0, Some(NodeState::Lost));
 
@@ -542,7 +536,7 @@ mod tests {
     #[test]
     fn fence_deleted_worker_event_rejects_newer_incarnation() {
         let f = Fixture::new();
-        f.add_worker(100, crate::pd::pool::POOL_ID_SSD, &[]);
+        f.add_worker(100, curvine_common::state::PoolType::Ssd, &[]);
         let mut node = f.ctx.node_manager.get_node(100).unwrap();
         node.epoch = 2;
         f.ctx.node_manager.test_insert_node(node);

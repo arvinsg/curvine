@@ -17,7 +17,7 @@ use crate::pd::config::keys;
 use crate::pd::schedule::{
     BGOperator, ManagerContext, OpPriority, OperatorBuilder, OperatorKind, ScheduleEvent,
 };
-use curvine_common::state::{gen_table_id, BGOpState, ReplicaState};
+use curvine_common::state::{gen_table_id, BGOpState, PoolType, ReplicaState};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -33,7 +33,7 @@ pub struct PendingPoolRebuild {
     pub scheduled_time_ms: u64,
 }
 
-/// BGTable scheduler: two responsibilities keyed by `pool_id`:
+/// BGTable scheduler: two responsibilities keyed by `pool_type`:
 ///
 /// 1. **Initialize** — when a pool has no BGTable for some configured `replica_count`,
 ///    wait for `cooldown` of quiescence (no further node joins) before creating it.
@@ -42,8 +42,8 @@ pub struct PendingPoolRebuild {
 ///    `cooldown` of quiescence and then re-plan placement via the rebuild diff.
 pub struct BGTableScheduler {
     ctx: Arc<ManagerContext>,
-    pending: Mutex<HashMap<u16, PendingPoolRebuild>>,
-    pool_generations: Mutex<HashMap<u16, u64>>,
+    pending: Mutex<HashMap<PoolType, PendingPoolRebuild>>,
+    pool_generations: Mutex<HashMap<PoolType, u64>>,
 }
 
 impl BGTableScheduler {
@@ -61,43 +61,42 @@ impl BGTableScheduler {
             .get_u64(keys::PD_BG_REBUILD_COOLDOWN_MS)
     }
 
-    fn enqueue(&self, pool_id: u16) {
+    fn enqueue(&self, pool_type: PoolType) {
         let deadline = orpc::common::LocalTime::mills() + self.cooldown_ms();
         let mut guard = self.pending.lock().unwrap();
-        let entry = guard.entry(pool_id).or_insert(PendingPoolRebuild {
+        let entry = guard.entry(pool_type).or_insert(PendingPoolRebuild {
             scheduled_time_ms: deadline,
         });
         entry.scheduled_time_ms = entry.scheduled_time_ms.max(deadline);
     }
 
     /// Manual trigger.
-    pub fn request_rebuild(&self, pool_ids: Vec<u16>) {
-        for pool_id in pool_ids {
-            self.enqueue(pool_id);
+    pub fn request_rebuild(&self, pool_types: Vec<PoolType>) {
+        for pool_type in pool_types {
+            self.enqueue(pool_type);
         }
     }
 
-    fn has_table(&self, pool_id: u16, replica_count: u16) -> bool {
+    fn has_table(&self, pool_type: PoolType, replica_count: u16) -> bool {
         self.ctx
             .bg_manager
-            .get_table(gen_table_id(pool_id, replica_count))
+            .get_table(gen_table_id(pool_type, replica_count))
             .is_some()
     }
 
     /// Has any table for any configured replica_count on this pool?
-    fn has_any_table(&self, pool_id: u16) -> bool {
+    fn has_any_table(&self, pool_type: PoolType) -> bool {
         self.ctx
             .bg_manager
             .replica_counts()
             .iter()
-            .any(|&rc| self.has_table(pool_id, rc))
+            .any(|&rc| self.has_table(pool_type, rc))
     }
 
-    fn pool_generation(pool: &curvine_common::state::PoolInfo) -> u64 {
-        let mut workers: Vec<u32> = pool.workers.iter().copied().collect();
-        workers.sort_unstable();
+    fn pool_generation(&self, pool_type: PoolType) -> u64 {
+        let workers = self.ctx.pool_manager.get_workers_in_pool(pool_type);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        pool.pool_id.hash(&mut hasher);
+        pool_type.hash(&mut hasher);
         workers.hash(&mut hasher);
         hasher.finish()
     }
@@ -106,19 +105,20 @@ impl BGTableScheduler {
         let pools = self.ctx.pool_manager.list_active_pools();
         let mut generations = self.pool_generations.lock().unwrap();
         for pool in pools {
-            let generation = Self::pool_generation(&pool);
+            let pool_type = pool.pool_type;
+            let generation = self.pool_generation(pool_type);
             let changed = generations
-                .insert(pool.pool_id, generation)
+                .insert(pool_type, generation)
                 .map(|old| old != generation)
                 .unwrap_or(true);
             if changed {
                 log::info!(
-                    "BGTableScheduler detected pool membership generation change pool_id={}, generation={}",
-                    pool.pool_id,
+                    "BGTableScheduler detected pool membership generation change pool_type={}, generation={}",
+                    pool_type,
                     generation
                 );
                 drop(generations);
-                self.enqueue(pool.pool_id);
+                self.enqueue(pool_type);
                 generations = self.pool_generations.lock().unwrap();
             }
         }
@@ -126,19 +126,19 @@ impl BGTableScheduler {
 
     fn bootstrap_missing_tables(&self) {
         let deadline = orpc::common::LocalTime::mills() + self.cooldown_ms();
-        let pools_needing_init: Vec<u16> = self
+        let pools_needing_init: Vec<PoolType> = self
             .ctx
             .pool_manager
             .list_active_pools()
             .into_iter()
-            .filter(|p| !self.has_any_table(p.pool_id))
-            .map(|p| p.pool_id)
+            .filter(|p| !self.has_any_table(p.pool_type))
+            .map(|p| p.pool_type)
             .collect();
 
         let mut guard = self.pending.lock().unwrap();
-        for pool_id in pools_needing_init {
-            if let Entry::Vacant(v) = guard.entry(pool_id) {
-                log::debug!("bootstrap: seeding Init for pool {}", pool_id);
+        for pool_type in pools_needing_init {
+            if let Entry::Vacant(v) = guard.entry(pool_type) {
+                log::debug!("bootstrap: seeding Init for pool {}", pool_type);
                 v.insert(PendingPoolRebuild {
                     scheduled_time_ms: deadline,
                 });
@@ -161,14 +161,14 @@ impl BGTableScheduler {
             .get_bool(keys::PD_BG_REBUILD_AUTO_ENABLED)
     }
 
-    fn pools_needing_only_init(&self) -> HashSet<u16> {
-        let pending_pool_ids: Vec<u16> = {
+    fn pools_needing_only_init(&self) -> HashSet<PoolType> {
+        let pending_pool_types: Vec<PoolType> = {
             let guard = self.pending.lock().unwrap();
             guard.keys().copied().collect()
         };
-        pending_pool_ids
+        pending_pool_types
             .into_iter()
-            .filter(|&pid| !self.has_any_table(pid))
+            .filter(|&pool_type| !self.has_any_table(pool_type))
             .collect()
     }
 
@@ -176,10 +176,10 @@ impl BGTableScheduler {
         &self,
         now: u64,
         auto_enabled: bool,
-        pure_init_pools: &HashSet<u16>,
-    ) -> Vec<u16> {
+        pure_init_pools: &HashSet<PoolType>,
+    ) -> Vec<PoolType> {
         let mut guard = self.pending.lock().unwrap();
-        let ready: Vec<u16> = guard
+        let ready: Vec<PoolType> = guard
             .iter()
             .filter(|(pid, v)| {
                 v.scheduled_time_ms <= now && (auto_enabled || pure_init_pools.contains(pid))
@@ -192,43 +192,48 @@ impl BGTableScheduler {
         ready
     }
 
-    fn dispatch_drained_pools(&self, pool_ids: Vec<u16>, auto_enabled: bool) -> Vec<BGOperator> {
+    fn dispatch_drained_pools(
+        &self,
+        pool_types: Vec<PoolType>,
+        auto_enabled: bool,
+    ) -> Vec<BGOperator> {
         let mut ops = Vec::new();
-        for pool_id in pool_ids {
+        for pool_type in pool_types {
             for &rc in self.ctx.bg_manager.replica_counts() {
-                if self.has_table(pool_id, rc) {
+                if self.has_table(pool_type, rc) {
                     if auto_enabled {
-                        ops.extend(self.build_rebuild_ops(gen_table_id(pool_id, rc)));
+                        ops.extend(self.build_rebuild_ops(gen_table_id(pool_type, rc)));
                     }
                 } else {
-                    self.try_initialize_table(pool_id, rc);
+                    self.try_initialize_table(pool_type, rc);
                 }
             }
         }
         ops
     }
 
-    fn try_initialize_table(&self, pool_id: u16, replica_count: u16) {
-        if self.has_table(pool_id, replica_count) {
+    fn try_initialize_table(&self, pool_type: PoolType, replica_count: u16) {
+        if self.has_table(pool_type, replica_count) {
             return;
         }
-        let pool = match self.ctx.pool_manager.get_pool(pool_id) {
+        let _pool = match self.ctx.pool_manager.get_pool(pool_type) {
             Ok(p) => p,
             Err(e) => {
-                log::warn!("init pool={}: get_pool failed: {}", pool_id, e);
+                log::warn!("init pool={}: get_pool failed: {}", pool_type, e);
                 return;
             }
         };
-        let workers: Vec<u32> = pool
-            .workers
-            .iter()
-            .copied()
+        let workers: Vec<u32> = self
+            .ctx
+            .pool_manager
+            .get_live_workers(pool_type)
+            .into_iter()
             .filter(|w| self.ctx.pool_manager.is_worker_available(*w))
             .collect();
         if workers.len() < replica_count as usize {
             log::warn!(
                 "init pool={} replica_count={}: only {} available workers; will retry on next event/scan",
-                pool_id,
+                pool_type,
                 replica_count,
                 workers.len()
             );
@@ -237,7 +242,7 @@ impl BGTableScheduler {
         let bucket_count = self.ctx.bg_manager.bucket_count();
         log::info!(
             "Initializing BGTable pool={} buckets={} replica_count={} workers={}",
-            pool_id,
+            pool_type,
             bucket_count,
             replica_count,
             workers.len()
@@ -245,11 +250,11 @@ impl BGTableScheduler {
         if let Err(e) =
             self.ctx
                 .bg_manager
-                .create_table(pool_id, bucket_count, replica_count, &workers)
+                .create_table(pool_type, bucket_count, replica_count, &workers)
         {
             log::error!(
                 "create_table pool={} replica_count={} failed: {}",
-                pool_id,
+                pool_type,
                 replica_count,
                 e
             );
@@ -340,12 +345,9 @@ impl Scheduler for BGTableScheduler {
     }
 
     fn on_event(&self, event: &ScheduleEvent) {
-        if let ScheduleEvent::WorkerJoinedPools {
-            changed_pool_ids, ..
-        } = event
-        {
-            for &pool_id in changed_pool_ids {
-                self.enqueue(pool_id);
+        if let ScheduleEvent::WorkerJoinedPools { pool_types, .. } = event {
+            for &pool_type in pool_types {
+                self.enqueue(pool_type);
             }
         }
     }
@@ -360,8 +362,8 @@ impl Scheduler for BGTableScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pd::pool::POOL_ID_SSD;
     use crate::pd::schedule::checker::tests_common::{test_context, Fixture};
+    use curvine_common::state::PoolType;
 
     #[test]
     fn name_and_type() {
@@ -388,11 +390,11 @@ mod tests {
         BGTableScheduler::new(f.ctx.clone())
     }
 
-    fn pending_deadline(s: &BGTableScheduler, pool_id: u16) -> Option<u64> {
+    fn pending_deadline(s: &BGTableScheduler, pool_type: PoolType) -> Option<u64> {
         s.pending
             .lock()
             .unwrap()
-            .get(&pool_id)
+            .get(&pool_type)
             .map(|v| v.scheduled_time_ms)
     }
 
@@ -402,9 +404,9 @@ mod tests {
         let s = scheduler_for(&f);
         let before = orpc::common::LocalTime::mills();
 
-        s.enqueue(POOL_ID_SSD);
+        s.enqueue(PoolType::Ssd);
 
-        let deadline = pending_deadline(&s, POOL_ID_SSD).unwrap();
+        let deadline = pending_deadline(&s, PoolType::Ssd).unwrap();
         assert!(deadline >= before + 60_000, "default cooldown is 60s");
     }
 
@@ -413,12 +415,12 @@ mod tests {
         let f = Fixture::new();
         let s = scheduler_for(&f);
 
-        s.enqueue(POOL_ID_SSD);
-        let t1 = pending_deadline(&s, POOL_ID_SSD).unwrap();
+        s.enqueue(PoolType::Ssd);
+        let t1 = pending_deadline(&s, PoolType::Ssd).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(5));
-        s.enqueue(POOL_ID_SSD);
-        let t2 = pending_deadline(&s, POOL_ID_SSD).unwrap();
+        s.enqueue(PoolType::Ssd);
+        let t2 = pending_deadline(&s, PoolType::Ssd).unwrap();
 
         assert!(t2 > t1, "subsequent event must push deadline forward");
     }
@@ -426,26 +428,26 @@ mod tests {
     #[test]
     fn bootstrap_seeds_pools_without_tables() {
         let f = Fixture::new();
-        f.add_worker(100, POOL_ID_SSD, &[]);
+        f.add_worker(100, PoolType::Ssd, &[]);
         let s = scheduler_for(&f);
 
         s.bootstrap_missing_tables();
 
-        assert!(pending_deadline(&s, POOL_ID_SSD).is_some());
+        assert!(pending_deadline(&s, PoolType::Ssd).is_some());
     }
 
     #[test]
     fn bootstrap_does_not_bump_existing_deadline() {
         let f = Fixture::new();
-        f.add_worker(100, POOL_ID_SSD, &[]);
+        f.add_worker(100, PoolType::Ssd, &[]);
         let s = scheduler_for(&f);
 
         s.bootstrap_missing_tables();
-        let t1 = pending_deadline(&s, POOL_ID_SSD).unwrap();
+        let t1 = pending_deadline(&s, PoolType::Ssd).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(5));
         s.bootstrap_missing_tables();
-        let t2 = pending_deadline(&s, POOL_ID_SSD).unwrap();
+        let t2 = pending_deadline(&s, PoolType::Ssd).unwrap();
 
         assert_eq!(t1, t2, "bootstrap must be idempotent w.r.t. deadline");
     }
@@ -453,8 +455,8 @@ mod tests {
     #[test]
     fn bootstrap_skips_pools_with_any_table() {
         let f = Fixture::new();
-        f.add_workers(&[100, 101, 102], POOL_ID_SSD);
-        f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102], PoolType::Ssd);
+        f.insert_table(PoolType::Ssd, 3);
         let s = scheduler_for(&f);
 
         s.bootstrap_missing_tables();
@@ -466,14 +468,14 @@ mod tests {
     fn check_and_execute_skips_future_deadlines() {
         let f = Fixture::new();
         let s = scheduler_for(&f);
-        s.enqueue(POOL_ID_SSD);
-        let before = pending_deadline(&s, POOL_ID_SSD);
+        s.enqueue(PoolType::Ssd);
+        let before = pending_deadline(&s, PoolType::Ssd);
 
         let ops = s.check_and_execute();
 
         assert!(ops.is_empty());
         assert_eq!(
-            pending_deadline(&s, POOL_ID_SSD),
+            pending_deadline(&s, PoolType::Ssd),
             before,
             "future deadline must stay in pending"
         );
@@ -483,10 +485,10 @@ mod tests {
     fn check_and_execute_drains_ready_entry() {
         // 1 worker (< replica_count=3) so try_initialize drops early → no Raft call.
         let f = Fixture::new();
-        f.add_worker(100, POOL_ID_SSD, &[]);
+        f.add_worker(100, PoolType::Ssd, &[]);
         let s = scheduler_for(&f);
         s.pending.lock().unwrap().insert(
-            POOL_ID_SSD,
+            PoolType::Ssd,
             PendingPoolRebuild {
                 scheduled_time_ms: 0,
             },
@@ -495,7 +497,7 @@ mod tests {
         s.check_and_execute();
 
         assert!(
-            !s.pending.lock().unwrap().contains_key(&POOL_ID_SSD),
+            !s.pending.lock().unwrap().contains_key(&PoolType::Ssd),
             "ready entry must be drained"
         );
     }
@@ -508,11 +510,11 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         );
-        f.add_workers(&[100, 101, 102], POOL_ID_SSD);
-        f.insert_table(POOL_ID_SSD, 3); // pool has a table → rebuild, not init
+        f.add_workers(&[100, 101, 102], PoolType::Ssd);
+        f.insert_table(PoolType::Ssd, 3); // pool has a table → rebuild, not init
         let s = scheduler_for(&f);
         s.pending.lock().unwrap().insert(
-            POOL_ID_SSD,
+            PoolType::Ssd,
             PendingPoolRebuild {
                 scheduled_time_ms: 0,
             },
@@ -525,7 +527,7 @@ mod tests {
             "rebuild suppressed under auto_enabled=false"
         );
         assert!(
-            s.pending.lock().unwrap().contains_key(&POOL_ID_SSD),
+            s.pending.lock().unwrap().contains_key(&PoolType::Ssd),
             "entry preserved so it fires once auto_enabled flips back on"
         );
     }
@@ -540,10 +542,10 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         );
-        f.add_worker(100, POOL_ID_SSD, &[]);
+        f.add_worker(100, PoolType::Ssd, &[]);
         let s = scheduler_for(&f);
         s.pending.lock().unwrap().insert(
-            POOL_ID_SSD,
+            PoolType::Ssd,
             PendingPoolRebuild {
                 scheduled_time_ms: 0,
             },
@@ -552,7 +554,7 @@ mod tests {
         s.check_and_execute();
 
         assert!(
-            !s.pending.lock().unwrap().contains_key(&POOL_ID_SSD),
+            !s.pending.lock().unwrap().contains_key(&PoolType::Ssd),
             "pure init must dispatch even under auto_enabled=false"
         );
     }
@@ -561,11 +563,11 @@ mod tests {
     fn fresh_event_after_drain_creates_new_entry() {
         // Atomic drain + new event = fresh entry for next cycle; no lost update.
         let f = Fixture::new();
-        f.insert_table(POOL_ID_SSD, 3);
+        f.insert_table(PoolType::Ssd, 3);
         let s = scheduler_for(&f);
 
         s.pending.lock().unwrap().insert(
-            POOL_ID_SSD,
+            PoolType::Ssd,
             PendingPoolRebuild {
                 scheduled_time_ms: 0,
             },
@@ -573,16 +575,15 @@ mod tests {
         let _ = s.check_and_execute();
         assert!(s.pending.lock().unwrap().is_empty());
 
-        s.enqueue(POOL_ID_SSD);
-        assert!(pending_deadline(&s, POOL_ID_SSD).is_some());
+        s.enqueue(PoolType::Ssd);
+        assert!(pending_deadline(&s, PoolType::Ssd).is_some());
     }
 
-    fn worker_joined_event(changed_pool_ids: Vec<u16>) -> ScheduleEvent {
+    fn worker_joined_event(pool_types: Vec<PoolType>) -> ScheduleEvent {
         ScheduleEvent::WorkerJoinedPools {
             worker_id: 100,
             node_epoch: 1,
-            target_pool_ids: changed_pool_ids.clone(),
-            changed_pool_ids,
+            pool_types,
             event_time_ms: 0,
         }
     }
@@ -595,9 +596,9 @@ mod tests {
         s.detect_pool_membership_changes();
         assert!(s.pending.lock().unwrap().is_empty());
 
-        f.add_worker(100, POOL_ID_SSD, &[]);
+        f.add_worker(100, PoolType::Ssd, &[]);
         s.detect_pool_membership_changes();
-        assert!(pending_deadline(&s, POOL_ID_SSD).is_some());
+        assert!(pending_deadline(&s, PoolType::Ssd).is_some());
 
         s.pending.lock().unwrap().clear();
         s.detect_pool_membership_changes();
@@ -606,27 +607,27 @@ mod tests {
             "unchanged pool generation must not enqueue again"
         );
 
-        f.add_worker(101, POOL_ID_SSD, &[]);
+        f.add_worker(101, PoolType::Ssd, &[]);
         s.detect_pool_membership_changes();
-        assert!(pending_deadline(&s, POOL_ID_SSD).is_some());
+        assert!(pending_deadline(&s, PoolType::Ssd).is_some());
     }
 
     #[test]
     fn worker_registered_enqueues_pool() {
         let f = Fixture::new();
-        f.add_worker(100, POOL_ID_SSD, &[]);
+        f.add_worker(100, PoolType::Ssd, &[]);
         let s = scheduler_for(&f);
 
-        s.on_event(&worker_joined_event(vec![POOL_ID_SSD]));
+        s.on_event(&worker_joined_event(vec![PoolType::Ssd]));
 
-        assert!(pending_deadline(&s, POOL_ID_SSD).is_some());
+        assert!(pending_deadline(&s, PoolType::Ssd).is_some());
     }
 
     #[test]
     fn worker_offline_is_ignored_by_bg_table() {
         // Offline / DecommissionFinished belong to DecommissionScheduler.
         let f = Fixture::new();
-        f.add_worker(100, POOL_ID_SSD, &[]);
+        f.add_worker(100, PoolType::Ssd, &[]);
         let s = scheduler_for(&f);
 
         s.on_event(&ScheduleEvent::WorkerOffline {
@@ -656,16 +657,15 @@ mod tests {
     #[test]
     fn multiple_registrations_collapse_to_one_entry() {
         let f = Fixture::new();
-        f.add_worker(100, POOL_ID_SSD, &[]);
+        f.add_worker(100, PoolType::Ssd, &[]);
         let s = scheduler_for(&f);
 
-        s.on_event(&worker_joined_event(vec![POOL_ID_SSD]));
-        f.add_worker(101, POOL_ID_SSD, &[]);
+        s.on_event(&worker_joined_event(vec![PoolType::Ssd]));
+        f.add_worker(101, PoolType::Ssd, &[]);
         s.on_event(&ScheduleEvent::WorkerJoinedPools {
             worker_id: 101,
             node_epoch: 1,
-            target_pool_ids: vec![POOL_ID_SSD],
-            changed_pool_ids: vec![POOL_ID_SSD],
+            pool_types: vec![PoolType::Ssd],
             event_time_ms: 0,
         });
 
@@ -677,8 +677,8 @@ mod tests {
         let f = Fixture::new();
         let s = scheduler_for(&f);
 
-        s.request_rebuild(vec![POOL_ID_SSD]);
+        s.request_rebuild(vec![PoolType::Ssd]);
 
-        assert!(pending_deadline(&s, POOL_ID_SSD).is_some());
+        assert!(pending_deadline(&s, PoolType::Ssd).is_some());
     }
 }

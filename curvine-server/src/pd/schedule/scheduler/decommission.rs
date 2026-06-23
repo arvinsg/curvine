@@ -144,9 +144,9 @@ impl Scheduler for DecommissionScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pd::pool::POOL_ID_SSD;
     use crate::pd::schedule::checker::tests_common::{decompose, Fixture};
     use crate::pd::schedule::Scheduler;
+    use curvine_common::state::PoolType;
 
     #[test]
     fn name_and_type() {
@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn no_ops_when_no_leaving_nodes() {
         let f = Fixture::new();
-        f.add_workers(&[100, 101, 102], POOL_ID_SSD);
+        f.add_workers(&[100, 101, 102], PoolType::Ssd);
         assert!(DecommissionScheduler::new().schedule(&f.ctx).is_empty());
     }
 
@@ -175,8 +175,8 @@ mod tests {
         bg_count: u32,
         lease_owner: u32,
     ) -> (u32, Vec<u32>) {
-        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102, 103], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         let bg_ids: Vec<u32> = (0..bg_count).map(|i| 3_000 + i).collect();
         for &bg_id in &bg_ids {
             f.insert_bg(bg_id, table_id, vec![100, 101, 102], Some(lease_owner));
@@ -264,8 +264,8 @@ mod tests {
         // candidate that's not in replica_set is... none. select_replacement_workers
         // returns empty, build_migration_op returns None.
         let f = Fixture::new();
-        f.add_workers(&[100, 101, 102], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         f.insert_bg(3_000, table_id, vec![100, 101, 102], Some(101));
         f.activate_all_replicas(3_000);
         f.set_table_buckets(table_id, &[3_000]);

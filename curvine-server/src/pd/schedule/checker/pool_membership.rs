@@ -40,15 +40,16 @@ impl super::Checker for PoolMembershipChecker {
             return None;
         }
 
-        log::warn!("Worker {} is Live but not assigned to any pool", wid);
-
+        log::warn!(
+            "Worker {} is Live but not assigned to any runtime pool",
+            wid
+        );
         if !ctx
             .config_manager
             .get_bool(keys::PD_CHECKER_POOL_MEMBERSHIP_AUTO_REPAIR)
         {
             return None;
         }
-
         let NodePayload::Worker(payload) = &worker.payload else {
             return None;
         };
@@ -56,7 +57,7 @@ impl super::Checker for PoolMembershipChecker {
             .pool_manager
             .assign_worker_to_pools(wid, &payload.storage_specs)
         {
-            Ok(result) if result.target_pool_ids.is_empty() => {
+            Ok(result) if result.target_pool_types.is_empty() => {
                 log::error!(
                     "PoolMembershipChecker: worker {} has no usable storage specs for pool assignment",
                     wid
@@ -66,8 +67,8 @@ impl super::Checker for PoolMembershipChecker {
                 log::info!(
                     "PoolMembershipChecker repaired worker {}: target_pools={:?}, changed_pools={:?}",
                     wid,
-                    result.target_pool_ids,
-                    result.changed_pool_ids
+                    result.target_pool_types,
+                    result.changed_pool_types
                 );
             }
             Err(e) => {
@@ -78,7 +79,6 @@ impl super::Checker for PoolMembershipChecker {
                 );
             }
         }
-
         None
     }
 }
@@ -86,9 +86,9 @@ impl super::Checker for PoolMembershipChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pd::pool::POOL_ID_SSD;
     use crate::pd::schedule::checker::tests_common::Fixture;
     use crate::pd::schedule::checker::Checker;
+    use curvine_common::state::PoolType;
     use curvine_common::state::{
         NodeAddress, NodeBase, NodeInfo, NodePayload, NodeType, WorkerNodePayload,
     };
@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn live_worker_in_pool_is_noop() {
         let f = Fixture::new();
-        f.add_workers(&[100], POOL_ID_SSD);
+        f.add_workers(&[100], PoolType::Ssd);
         let worker = f.ctx.node_manager.get_node(100).unwrap();
         assert!(PoolMembershipChecker
             .check_worker(&worker, &f.ctx)

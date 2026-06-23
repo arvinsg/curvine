@@ -15,7 +15,6 @@
 use curvine_common::state::BGLease;
 use curvine_common::state::{
     BlockGroupInfo, ConfigInfo, MountInfo, NodeInfo, NodePayload, NodeState, PathRouteEntry,
-    PoolInfo,
 };
 use serde::{Deserialize, Serialize};
 
@@ -94,26 +93,6 @@ pub struct DeleteNodeEntry {
     pub expected_state: Option<NodeState>,
 }
 
-/// Pool entry (Raft log) — used for worker add/remove persistence.
-///
-/// `expected_epoch` is the pool's epoch as observed by the proposer when the
-/// entry was constructed. apply_save_pool uses it as a CAS guard:
-///   - existing.epoch == expected_epoch  → accept (replaces with info)
-///   - existing.epoch != expected_epoch  → SkippedStale (concurrent write)
-/// `info.epoch` MUST be `existing.epoch + 1`. apply enforces strict +1
-/// monotonicity to catch malformed entries.
-#[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct PoolEntry {
-    pub op_ms: u64,
-    pub info: PoolInfo,
-    /// Pool epoch the proposer based this entry on. `serde(default)` keeps
-    /// pre-P1.1 logs decodable: legacy entries decode with expected_epoch=0,
-    /// which combined with monotonicity check makes them effectively reject
-    /// against any non-zero pool. New entries always set this explicitly.
-    #[serde(default)]
-    pub expected_epoch: u64,
-}
-
 /// BG create entry (Raft log)
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct BGEntry {
@@ -161,7 +140,7 @@ pub struct BatchBGEntry {
     pub bump_table_epoch: Option<u32>,
     /// P2.3: when `table` is set and this is true, apply requires the table to
     /// NOT already exist. Used by `create_table` to prevent two concurrent
-    /// creates with the same `(pool_id, replica_count)` from clobbering each
+    /// creates with the same `(pool_type, replica_count)` from clobbering each
     /// other's BGs (the second batch's CAS fails and orphan BGs are avoided).
     /// Pre-P2.3 entries decode with `expected_table_absent = false` (no guard).
     #[serde(default)]
@@ -217,9 +196,6 @@ pub enum PdEntry {
     HeartbeatCheckpoint(HeartbeatCheckpointEntry),
     DeleteNode(DeleteNodeEntry),
 
-    // Pool management
-    SavePool(PoolEntry),
-
     // BG management
     CreateBG(BGEntry),
     UpdateBG(BGUpdateEntry),
@@ -245,7 +221,6 @@ impl PdEntry {
             PdEntry::BatchUpdateNodeState(_) => "batch_update_node_state",
             PdEntry::HeartbeatCheckpoint(_) => "heartbeat_checkpoint",
             PdEntry::DeleteNode(_) => "delete_node",
-            PdEntry::SavePool(_) => "save_pool",
             PdEntry::CreateBG(_) => "create_bg",
             PdEntry::UpdateBG(_) => "update_bg",
             PdEntry::DeleteBG(_) => "delete_bg",

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::{table_id_pool_id, table_id_replica_count};
+use curvine_common::state::{table_id_replica_count, PoolType};
 use orpc::common::Utils;
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,7 @@ pub struct BGTableStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BGTable {
     pub table_id: u32,
+    pub pool_type: PoolType,
     pub bucket_count: u32,
     pub buckets: Vec<u32>,
     pub epoch: u64,
@@ -48,8 +49,8 @@ impl BGTable {
         self.buckets.get(idx).copied().unwrap_or(0)
     }
 
-    pub fn pool_id(&self) -> u16 {
-        table_id_pool_id(self.table_id)
+    pub fn pool_type(&self) -> PoolType {
+        self.pool_type
     }
 
     pub fn replica_count(&self) -> u16 {
@@ -65,6 +66,7 @@ mod tests {
     fn lookup_empty_buckets_returns_zero() {
         let t = BGTable {
             table_id: 1,
+            pool_type: PoolType::Ssd,
             bucket_count: 0,
             buckets: vec![],
             epoch: 0,
@@ -79,6 +81,7 @@ mod tests {
     fn lookup_returns_bg_id_at_bucket_index() {
         let t = BGTable {
             table_id: 1,
+            pool_type: PoolType::Ssd,
             bucket_count: 4,
             buckets: vec![10, 20, 30, 40],
             epoch: 0,
@@ -94,6 +97,7 @@ mod tests {
     fn lookup_is_deterministic() {
         let t = BGTable {
             table_id: 1,
+            pool_type: PoolType::Ssd,
             bucket_count: 8,
             buckets: vec![1, 2, 3, 4, 5, 6, 7, 8],
             epoch: 0,

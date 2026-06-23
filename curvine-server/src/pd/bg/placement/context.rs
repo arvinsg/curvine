@@ -14,7 +14,7 @@
 
 use crate::pd::bg::BGManager;
 use crate::pd::pool::PoolManager;
-use curvine_common::state::{table_id_pool_id, BlockGroupInfo, StorageType};
+use curvine_common::state::{table_id_pool_type, BlockGroupInfo, StorageType};
 use std::collections::{HashMap, HashSet};
 
 /// Per-worker load snapshot for one table, constructed by the scheduler layer.
@@ -115,8 +115,10 @@ pub fn build_table_snapshot(
     influence: &PendingInfluence,
     media: StorageType,
 ) -> HashMap<u32, WorkerLoadSnapshot> {
-    let pool_id = table_id_pool_id(table_id);
-    let live_workers = pool_manager.get_live_workers(pool_id);
+    let Some(pool_type) = table_id_pool_type(table_id) else {
+        return HashMap::new();
+    };
+    let live_workers = pool_manager.get_live_workers(pool_type);
 
     let Some(table) = bg_manager.get_table(table_id) else {
         return HashMap::new();

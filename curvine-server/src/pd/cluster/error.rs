@@ -10,7 +10,7 @@ pub enum ClusterError {
     NodeNotFound(u32),
 
     #[error("pool {0} not found")]
-    PoolNotFound(u16),
+    PoolNotFound(String),
 
     #[error("{0}")]
     InternalError(String),
@@ -41,8 +41,8 @@ impl ClusterError {
         ClusterError::NodeNotFound(node_id)
     }
 
-    pub fn pool_not_found(pool_id: u16) -> Self {
-        ClusterError::PoolNotFound(pool_id)
+    pub fn pool_not_found(pool: impl Into<String>) -> Self {
+        ClusterError::PoolNotFound(pool.into())
     }
 
     pub fn internal_error(e: impl ToString) -> Self {

@@ -54,8 +54,8 @@ impl Scheduler for BGBalanceScheduler {
         let tables = ctx.bg_manager.list_tables();
 
         for table in &tables {
-            let pool_id = table.pool_id();
-            let pool = match ctx.pool_manager.get_pool(pool_id) {
+            let pool_type = table.pool_type();
+            let pool = match ctx.pool_manager.get_pool(pool_type) {
                 Ok(p) => p,
                 Err(_) => continue,
             };
@@ -255,9 +255,9 @@ impl Scheduler for BGBalanceScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pd::pool::POOL_ID_SSD;
     use crate::pd::schedule::checker::tests_common::{decompose, Fixture};
     use curvine_common::state::BGOpState;
+    use curvine_common::state::PoolType;
     use std::collections::HashMap;
 
     #[test]
@@ -308,8 +308,8 @@ mod tests {
     #[test]
     fn no_ops_when_fewer_than_two_workers() {
         let f = Fixture::new();
-        f.add_worker(100, POOL_ID_SSD, &[]);
-        f.insert_table(POOL_ID_SSD, 3);
+        f.add_worker(100, PoolType::Ssd, &[]);
+        f.insert_table(PoolType::Ssd, 3);
         assert!(BGBalanceScheduler::default().schedule(&f.ctx).is_empty());
     }
 
@@ -317,8 +317,8 @@ mod tests {
     fn no_ops_when_balanced() {
         // 4 workers, 4 BGs each with replica_count=3 → 12 replica slots / 4 workers = 3 each.
         let f = Fixture::new();
-        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102, 103], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         let bg_ids: Vec<u32> = vec![10, 11, 12, 13];
         for (bg_id, set) in [
             (10, vec![100, 101, 102]),
@@ -344,8 +344,8 @@ mod tests {
         // 4 workers, 8 BGs all pinned to first 3 → worker 103 has 0 replicas.
         // bucket_count=8 → per-worker quota = 24/4 = 6, threshold = 7. Overloaded 100/101/102 hold 8.
         let f = Fixture::new();
-        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102, 103], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         seed_imbalanced_bgs(&f, table_id, &[100, 101, 102, 103], 3, 8);
 
         let ops = BGBalanceScheduler::default().schedule(&f.ctx);
@@ -372,8 +372,8 @@ mod tests {
             crate::pd::config::keys::PD_SCHEDULE_BALANCE_MAX_OPS_PER_CYCLE,
             "1",
         )]));
-        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102, 103], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         seed_imbalanced_bgs(&f, table_id, &[100, 101, 102, 103], 3, 8);
 
         let ops = BGBalanceScheduler::default().schedule(&f.ctx);
@@ -383,8 +383,8 @@ mod tests {
     #[test]
     fn non_idle_bgs_are_skipped() {
         let f = Fixture::new();
-        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102, 103], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         seed_imbalanced_bgs(&f, table_id, &[100, 101, 102, 103], 3, 8);
         for bg_id in 1_000..1_008 {
             f.ctx.bg_manager.set_op_state(bg_id, BGOpState::Recovering);
@@ -397,8 +397,8 @@ mod tests {
     #[test]
     fn source_lease_owner_triggers_lease_transfer() {
         let f = Fixture::new();
-        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102, 103], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         let bg_ids: Vec<u32> = (0..8).map(|i| 1_000 + i).collect();
         for &bg_id in &bg_ids {
             f.insert_bg(bg_id, table_id, vec![100, 101, 102], Some(100));
@@ -431,8 +431,8 @@ mod tests {
         // Lease owner = one of the overloaded workers, but another overloaded worker can also
         // be the source. When source != lease owner, the op must NOT contain TransferLease.
         let f = Fixture::new();
-        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102, 103], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         let bg_ids: Vec<u32> = (0..8).map(|i| 1_000 + i).collect();
         for &bg_id in &bg_ids {
             f.insert_bg(bg_id, table_id, vec![100, 101, 102], Some(100));

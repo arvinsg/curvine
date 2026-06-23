@@ -275,10 +275,10 @@ mod tests {
     use super::super::CheckerPriority;
     use super::*;
     use crate::pd::config::keys;
-    use crate::pd::pool::POOL_ID_SSD;
     use crate::pd::schedule::checker::tests_common::{decompose, Fixture};
     use crate::pd::schedule::checker::Checker;
     use crate::pd::schedule::OpPriority;
+    use curvine_common::state::PoolType;
     use curvine_common::state::ReplicaState;
 
     #[test]
@@ -385,9 +385,9 @@ mod tests {
         for case in cases() {
             let f = Fixture::new();
             if let Some(ref workers) = case.candidate_workers {
-                f.add_workers(workers, POOL_ID_SSD);
+                f.add_workers(workers, PoolType::Ssd);
             }
-            let table_id = f.insert_table(POOL_ID_SSD, case.desired_replicas);
+            let table_id = f.insert_table(PoolType::Ssd, case.desired_replicas);
             let bg = f.insert_bg(1, table_id, case.replica_set.clone(), None);
             f.set_replica_states(bg.bg_id, &offline(&case.offline_wids));
 
@@ -444,8 +444,8 @@ mod tests {
     fn over_replicated_removes_lease_owner_only_as_last_resort() {
         // 5 replicas, desired=3 → remove 2. Lease owner = 100. Should remove two non-lease workers.
         let f = Fixture::new();
-        f.add_workers(&[100, 101, 102, 103, 104], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102, 103, 104], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         let bg = f.insert_bg(1, table_id, vec![100, 101, 102, 103, 104], Some(100));
 
         let op = ReplicaChecker.check_bg(&bg, &f.ctx).expect("op");
@@ -461,8 +461,8 @@ mod tests {
     fn over_replicated_can_fall_back_to_lease_owner_when_needed() {
         // desired=1, replica_set=[100, 101] with lease_owner=100. Remove 1 non-lease (101).
         let f = Fixture::new();
-        f.add_workers(&[100, 101], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 1);
+        f.add_workers(&[100, 101], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 1);
         let bg = f.insert_bg(1, table_id, vec![100, 101], Some(100));
 
         let op = ReplicaChecker.check_bg(&bg, &f.ctx).expect("op");
@@ -476,8 +476,8 @@ mod tests {
         // replicas are NOT in the leaving cascade — they may recover. The
         // checker falls through to topology+load policy without preferring 102.
         let f = Fixture::new();
-        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102, 103], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         let bg = f.insert_bg(1, table_id, vec![100, 101, 102, 103], Some(100));
         f.set_replica_states(1, &[(102, ReplicaState::Lost)]);
 
@@ -498,8 +498,8 @@ mod tests {
             curvine_common::state::NodeState::Decommission,
         ] {
             let f = Fixture::new();
-            f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
-            let table_id = f.insert_table(POOL_ID_SSD, 3);
+            f.add_workers(&[100, 101, 102, 103], PoolType::Ssd);
+            let table_id = f.insert_table(PoolType::Ssd, 3);
             let bg = f.insert_bg(1, table_id, vec![100, 101, 102], Some(100));
             f.set_worker_state(102, leaving_state);
 
@@ -522,8 +522,8 @@ mod tests {
             "0".to_string(),
         );
         let f = Fixture::with_overrides(overrides);
-        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102, 103], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         let bg = f.insert_bg(1, table_id, vec![100, 101, 102, 103], Some(100));
         f.set_worker_state(102, curvine_common::state::NodeState::Decommission);
 
@@ -545,8 +545,8 @@ mod tests {
             "0".to_string(),
         );
         let f = Fixture::with_overrides(overrides);
-        f.add_workers(&[100, 101, 102, 103, 104], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102, 103, 104], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         let bg = f.insert_bg(1, table_id, vec![100, 101, 102, 103, 104], Some(100));
         f.set_worker_state(102, curvine_common::state::NodeState::Decommission);
 
@@ -566,8 +566,8 @@ mod tests {
             "0".to_string(),
         );
         let f = Fixture::with_overrides(overrides);
-        f.add_workers(&[100, 101, 102, 103, 104], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102, 103, 104], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         let bg = f.insert_bg(1, table_id, vec![100, 101, 102, 103, 104], Some(100));
         f.set_worker_state(102, curvine_common::state::NodeState::Offline);
         f.set_worker_state(103, curvine_common::state::NodeState::Decommission);
@@ -590,8 +590,8 @@ mod tests {
             "0".to_string(),
         );
         let f = Fixture::with_overrides(overrides);
-        f.add_workers(&[100, 101, 102, 103, 104], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102, 103, 104], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         // lease_owner = 102 (will be removed)
         let bg = f.insert_bg(1, table_id, vec![100, 101, 102, 103, 104], Some(102));
         f.set_worker_state(102, curvine_common::state::NodeState::Decommission);
@@ -624,8 +624,8 @@ mod tests {
             "0".to_string(),
         );
         let f = Fixture::with_overrides(overrides);
-        f.add_workers(&[100, 101, 102, 103, 104], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102, 103, 104], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         // lease_owner = 100 (survives)
         let bg = f.insert_bg(1, table_id, vec![100, 101, 102, 103, 104], Some(100));
         f.set_worker_state(103, curvine_common::state::NodeState::Decommission);
@@ -646,8 +646,8 @@ mod tests {
             "0".to_string(),
         );
         let f = Fixture::with_overrides(overrides);
-        f.add_workers(&[100, 101], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 0);
+        f.add_workers(&[100, 101], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 0);
         let bg = f.insert_bg(1, table_id, vec![100, 101], Some(100));
         f.set_worker_state(100, curvine_common::state::NodeState::Decommission);
         f.set_worker_state(101, curvine_common::state::NodeState::Decommission);

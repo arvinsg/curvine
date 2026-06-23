@@ -82,9 +82,9 @@ mod tests {
     use super::super::CheckerPriority;
     use super::*;
     use crate::pd::journal::BGEntry;
-    use crate::pd::pool::POOL_ID_SSD;
     use crate::pd::schedule::checker::tests_common::{decompose, Fixture};
     use crate::pd::schedule::checker::Checker;
+    use curvine_common::state::PoolType;
     use curvine_common::state::{BGLease, BGOpState, BGState, NodeState};
 
     #[test]
@@ -186,11 +186,11 @@ mod tests {
             let f = Fixture::new();
             // Register all replicas as workers; we'll mark some Lost per-case.
             for &w in &case.replica_set {
-                f.add_worker(w, POOL_ID_SSD, &[]);
+                f.add_worker(w, PoolType::Ssd, &[]);
             }
             // Extra candidate for OutsideReplicaSet case.
             if let LeaseOwnerSetup::OutsideReplicaSet(_) = case.lease {}
-            let table_id = f.insert_table(POOL_ID_SSD, 3);
+            let table_id = f.insert_table(PoolType::Ssd, 3);
 
             let (lease_owner_override, lost_worker) = match case.lease {
                 LeaseOwnerSetup::Healthy(w) => (Some(w), None),
@@ -276,8 +276,8 @@ mod tests {
     #[test]
     fn prefers_worker_with_lowest_lease_count() {
         let f = Fixture::new();
-        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102, 103], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
 
         // Load up lease counts on 101 and 103 by creating BGs whose lease_owner is them.
         for (bg_id, owner) in [

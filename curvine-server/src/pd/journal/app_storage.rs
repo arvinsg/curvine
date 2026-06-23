@@ -126,19 +126,6 @@ impl PdAppStorage {
                 );
                 self.node_manager.apply_delete_node(&entry)?;
             }
-            PdEntry::SavePool(entry) => {
-                info!(
-                    "Apply SavePool pool_id:{}, workers:{}, expected_epoch:{}, info_epoch:{}",
-                    entry.info.pool_id,
-                    entry.info.workers.len(),
-                    entry.expected_epoch,
-                    entry.info.epoch
-                );
-                let outcome = self.pool_manager.apply_save_pool(&entry)?;
-                // Migrated to ApplyOutcome (P1.1): leaders receive structured
-                // result via ProposeResponse.apply_result.
-                return Ok(outcome.encode()?);
-            }
             PdEntry::CreateBG(entry) => {
                 info!("Apply CreateBG bg_id={}", entry.info.bg_id);
                 self.bg_manager

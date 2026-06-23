@@ -23,7 +23,7 @@ pub use apply_outcome::ApplyOutcome;
 pub use client::Client;
 pub use entry::{
     BGDeleteEntry, BGEntry, BGUpdateEntry, BatchBGEntry, ConfigEntry, MountEntry, NodeEntry,
-    PdEntry, PoolEntry, UnMountEntry,
+    PdEntry, UnMountEntry,
 };
 #[cfg(test)]
 pub use leader::AlwaysLeader;

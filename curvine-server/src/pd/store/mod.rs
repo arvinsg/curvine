@@ -25,7 +25,6 @@ pub const CF_DATA: &str = "data";
 // ---- Key Prefixes for CF_META ----
 pub const PREFIX_CONFIG: u8 = 0x10;
 pub const PREFIX_NODE: u8 = 0x20;
-pub const PREFIX_POOL: u8 = 0x30;
 pub const PREFIX_MOUNT_VERSION: u8 = 0x40;
 pub const PREFIX_MOUNT: u8 = 0x41;
 pub const PREFIX_ROUTE_VERSION: u8 = 0x50;

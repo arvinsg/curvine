@@ -2,7 +2,7 @@ use super::error::ClusterError;
 use crate::pd::http::ApiResponse;
 use crate::pd::http_handler::PdHttpHandler;
 use axum::{extract::Path as PathParam, http::StatusCode, response::IntoResponse, Extension, Json};
-use curvine_common::state::{BGTableSummary, NodeInfo, NodeState, NodeType, PoolInfo};
+use curvine_common::state::{BGTableSummary, NodeInfo, NodeState, NodeType, PoolInfo, PoolType};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -70,16 +70,27 @@ pub async fn list_pools_handler(
     ApiResponse::success(instance.cluster_manager.pool_manager().list_active_pools())
 }
 
-/// GET /api/v1/pool/:pool_id — get single pool info.
+/// GET /api/v1/pool/:pool_type — get single pool info.
 pub async fn get_pool_handler(
     Extension(instance): Extension<Arc<PdHttpHandler>>,
-    PathParam(pool_id): PathParam<u16>,
+    PathParam(pool_type): PathParam<String>,
 ) -> impl IntoResponse {
+    let parsed = match PoolType::try_from(pool_type.as_str()) {
+        Ok(v) => v,
+        Err(_) => {
+            let err = ClusterError::pool_not_found(pool_type);
+            return ApiResponse::<PoolInfo>::error(
+                err.code().into(),
+                err.to_string(),
+                err.status_code(),
+            );
+        }
+    };
     let pool_mgr = instance.cluster_manager.pool_manager();
-    match pool_mgr.get_pool(pool_id) {
+    match pool_mgr.get_pool(parsed) {
         Ok(pool) => ApiResponse::success(pool),
         Err(_) => {
-            let err = ClusterError::pool_not_found(pool_id);
+            let err = ClusterError::pool_not_found(parsed.to_string());
             ApiResponse::<PoolInfo>::error(err.code().into(), err.to_string(), err.status_code())
         }
     }
@@ -119,7 +130,7 @@ pub async fn get_bg_table_handler(
 
 #[derive(Debug, Deserialize)]
 pub struct RebuildBody {
-    pub pool_id: u16,
+    pub pool_type: PoolType,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -135,7 +146,7 @@ pub async fn rebuild_bg_handler(
     match instance
         .cluster_manager
         .bg_manager()
-        .rebuild_tables_for_pool(body.pool_id)
+        .rebuild_tables_for_pool(body.pool_type)
     {
         Ok(()) => ApiResponse::success(RebuildResult { success: true }),
         Err(e) => {

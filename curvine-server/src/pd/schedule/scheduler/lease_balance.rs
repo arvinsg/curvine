@@ -50,8 +50,8 @@ impl Scheduler for LeaseBalanceScheduler {
         let tables = ctx.bg_manager.list_tables();
 
         for table in &tables {
-            let pool_id = table.pool_id();
-            let pool = match ctx.pool_manager.get_pool(pool_id) {
+            let pool_type = table.pool_type();
+            let pool = match ctx.pool_manager.get_pool(pool_type) {
                 Ok(p) => p,
                 Err(_) => continue,
             };
@@ -194,8 +194,8 @@ impl Scheduler for LeaseBalanceScheduler {
 mod tests {
     use super::*;
     use crate::pd::config::keys;
-    use crate::pd::pool::POOL_ID_SSD;
     use crate::pd::schedule::checker::tests_common::{decompose, Fixture};
+    use curvine_common::state::PoolType;
     use std::collections::HashMap;
 
     #[test]
@@ -247,8 +247,8 @@ mod tests {
     #[test]
     fn no_ops_when_fewer_than_two_workers() {
         let f = Fixture::new();
-        f.add_worker(100, POOL_ID_SSD, &[]);
-        f.insert_table(POOL_ID_SSD, 3);
+        f.add_worker(100, PoolType::Ssd, &[]);
+        f.insert_table(PoolType::Ssd, 3);
         assert!(LeaseBalanceScheduler::default().schedule(&f.ctx).is_empty());
     }
 
@@ -256,8 +256,8 @@ mod tests {
     fn no_ops_when_lease_balanced() {
         // Each worker is lease owner for exactly 2 BGs (8 BGs / 4 workers = 2).
         let f = Fixture::new();
-        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102, 103], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         let replica_set = vec![100, 101, 102, 103]; // Not quite — replica_count=3. Use rotation instead.
         let _ = replica_set;
         let bg_ids: Vec<u32> = (0..8)
@@ -290,8 +290,8 @@ mod tests {
     fn overloaded_lease_owner_triggers_transfer() {
         // Worker 100 owns ALL 8 leases; other replicas in replica_set get zero.
         let f = Fixture::new();
-        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102, 103], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         seed_bgs_with_owner(&f, table_id, vec![100, 101, 102], 100, 8);
 
         let ops = LeaseBalanceScheduler::default().schedule(&f.ctx);
@@ -324,8 +324,8 @@ mod tests {
             keys::PD_SCHEDULE_BALANCE_MAX_OPS_PER_CYCLE,
             "1",
         )]));
-        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102, 103], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         seed_bgs_with_owner(&f, table_id, vec![100, 101, 102], 100, 8);
 
         let ops = LeaseBalanceScheduler::default().schedule(&f.ctx);
@@ -335,8 +335,8 @@ mod tests {
     #[test]
     fn skips_bg_when_source_is_not_lease_owner() {
         let f = Fixture::new();
-        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102, 103], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         seed_bgs_with_owner(&f, table_id, vec![100, 101, 103], 103, 8);
 
         let ops = LeaseBalanceScheduler::default().schedule(&f.ctx);
@@ -352,8 +352,8 @@ mod tests {
     #[test]
     fn skips_non_idle_bgs() {
         let f = Fixture::new();
-        f.add_workers(&[100, 101, 102, 103], POOL_ID_SSD);
-        let table_id = f.insert_table(POOL_ID_SSD, 3);
+        f.add_workers(&[100, 101, 102, 103], PoolType::Ssd);
+        let table_id = f.insert_table(PoolType::Ssd, 3);
         let bg_ids = seed_bgs_with_owner(&f, table_id, vec![100, 101, 102], 100, 8);
         for &bg_id in &bg_ids {
             f.ctx

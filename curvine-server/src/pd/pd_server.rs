@@ -22,7 +22,7 @@ use crate::pd::mount::MountManager;
 use crate::pd::node::NodeManager;
 use crate::pd::node::NodeStore;
 use crate::pd::pd_metrics::PdMetrics;
-use crate::pd::pool::{PoolManager, PoolStore};
+use crate::pd::pool::PoolManager;
 use crate::pd::store::{KvStore, RocksKvEngine, CF_DATA, CF_META};
 use curvine_common::conf::PdConf;
 use curvine_common::raft::storage::{LogStorage, RocksLogStorage};
@@ -148,12 +148,7 @@ impl Pd {
         ));
         node_manager.restore()?;
 
-        let pool_store = Arc::new(PoolStore::new(store.clone()));
-        let pool_manager = Arc::new(PoolManager::new(
-            pool_store,
-            node_manager.clone(),
-            journal_client.clone(),
-        ));
+        let pool_manager = Arc::new(PoolManager::new(node_manager.clone()));
         pool_manager.restore()?;
 
         let bg_store = Arc::new(BGStore::new(store.clone()));
@@ -307,7 +302,7 @@ pub fn init_metrics_for_test() {
     use crate::pd::bg::{BGManager, BGStore};
     use crate::pd::journal::Client;
     use crate::pd::node::{NodeManager, NodeStore};
-    use crate::pd::pool::{PoolManager, PoolStore};
+    use crate::pd::pool::PoolManager;
     use crate::pd::store::{KvStore, MemoryKvEngine};
     use std::collections::HashMap;
 
@@ -325,8 +320,7 @@ pub fn init_metrics_for_test() {
         ));
         let node_store = Arc::new(NodeStore::new(store.clone()));
         let node_mgr = Arc::new(NodeManager::new(node_store, config.clone(), jc.clone()));
-        let pool_store = Arc::new(PoolStore::new(store.clone()));
-        let pool_mgr = Arc::new(PoolManager::new(pool_store, node_mgr.clone(), jc.clone()));
+        let pool_mgr = Arc::new(PoolManager::new(node_mgr.clone()));
         let bg_store = Arc::new(BGStore::new(store));
         let bg_mgr = Arc::new(BGManager::new(
             bg_store,

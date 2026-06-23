@@ -25,7 +25,7 @@ pub use meta::MetaManager;
 pub use mount::MountManager;
 pub use node::{NodeManager, NodeStore};
 pub use pd_server::Pd;
-pub use pool::{PoolManager, PoolStore};
+pub use pool::PoolManager;
 pub use rpc_context::RpcContext;
 pub use rpc_handler::PdRpcHandler;
 pub use schedule::{BGCommands, Manager, ManagerContext, OperatorController};

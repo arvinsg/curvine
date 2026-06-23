@@ -1424,6 +1424,8 @@ impl ProtoUtils {
                 .iter()
                 .map(Self::block_group_info_view_to_pb)
                 .collect(),
+            pool_type: summary.pool_type.code() as u32,
+            replica_count: summary.replica_count as u32,
         }
     }
 
@@ -1432,8 +1434,13 @@ impl ProtoUtils {
         for bucket in summary.buckets {
             buckets.push(Self::block_group_info_view_from_pb(bucket)?);
         }
+        let pool_type = PoolType::from_code(summary.pool_type as u16).ok_or_else(|| {
+            Self::invalid_proto(format!("unknown pool_type={}", summary.pool_type))
+        })?;
         Ok(BGTableSummary {
             table_id: summary.table_id,
+            pool_type,
+            replica_count: summary.replica_count as u16,
             bucket_count: summary.bucket_count,
             epoch: summary.epoch,
             last_rebuild_ms: summary.last_rebuild_ms,

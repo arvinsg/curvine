@@ -20,6 +20,7 @@ pub mod stats;
 
 use crate::pd::bg::placement::context::PendingInfluence;
 use crate::pd::schedule::{BGOperator, ManagerContext, OperatorController};
+use curvine_common::state::PoolType;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -27,8 +28,7 @@ pub enum ScheduleEvent {
     WorkerJoinedPools {
         worker_id: u32,
         node_epoch: u64,
-        target_pool_ids: Vec<u16>,
-        changed_pool_ids: Vec<u16>,
+        pool_types: Vec<PoolType>,
         event_time_ms: u64,
     },
     WorkerLost {
