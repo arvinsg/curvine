@@ -75,7 +75,7 @@ pub async fn create_mount_handler(
 
     match instance
         .mount_manager
-        .mount(None, &body.cv_path, &body.ufs_path, &mnt_opt)
+        .mount(&body.cv_path, &body.ufs_path, &mnt_opt)
     {
         Ok(()) => ApiResponse::<()>::success_with_status_code(StatusCode::OK),
         Err(e) => {

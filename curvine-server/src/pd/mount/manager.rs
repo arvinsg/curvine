@@ -14,16 +14,16 @@
 
 use super::index::MountTableIndex;
 use super::store::MountStore;
-use crate::pd::journal::entry::MountEntry;
+use crate::pd::journal::entry::{MountAddEntry, MountEntry, MountUpdateEntry, UnMountEntry};
 use crate::pd::journal::{self, ApplyOutcome, PdEntry};
+use crate::pd::namespace::NamespaceManager;
 use crate::pd::store::KvStore;
 use curvine_common::fs::Path;
-use curvine_common::state::{MountInfo, MountOptions};
+use curvine_common::state::{MountInfo, MountOptions, NamespaceId, INVALID_NAMESPACE_ID};
 use curvine_common::{FsError, FsResult};
 use log::{info, warn};
 use orpc::common::LocalTime;
-use rand::Rng;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -31,188 +31,401 @@ pub struct MountManager {
     index: Arc<RwLock<MountTableIndex>>,
     store: Arc<MountStore>,
     journal_client: Arc<journal::Client>,
+    namespace_manager: Arc<NamespaceManager>,
     version: AtomicU64,
+    /// Committed mount-id counter. Advanced only by Raft apply.
+    next_mount_id: AtomicU32,
+    /// Leader-local reservation counter. Advanced by propose-time id allocation
+    /// and never persisted directly. Gaps are acceptable when propose fails.
+    reserved_next_mount_id: AtomicU32,
 }
 
 impl MountManager {
-    pub fn new(store: Arc<dyn KvStore>, journal_client: Arc<journal::Client>) -> Self {
+    pub fn new(
+        store: Arc<dyn KvStore>,
+        journal_client: Arc<journal::Client>,
+        namespace_manager: Arc<NamespaceManager>,
+    ) -> Self {
         let store = Arc::new(MountStore::new(store));
         Self {
             index: Arc::new(RwLock::new(MountTableIndex::new())),
             store,
             journal_client,
+            namespace_manager,
             version: AtomicU64::new(0),
+            next_mount_id: AtomicU32::new(1),
+            reserved_next_mount_id: AtomicU32::new(1),
         }
     }
 
     pub fn restore(&self) -> FsResult<()> {
         let mounts = self.store.list_all_mounts()?;
         let mut index = self.index.write().unwrap();
+        index.clear();
+        let mut max_mount_id = 0u32;
+        let mut max_mount_version = 0u64;
         for mnt in mounts {
             info!(
                 "Restore mount: {} -> {} (id={})",
                 mnt.cv_path, mnt.ufs_path, mnt.mount_id
             );
+            max_mount_id = max_mount_id.max(mnt.mount_id);
+            max_mount_version = max_mount_version.max(mnt.version);
             index.insert(mnt);
         }
-        let version = self.store.get_version()?;
+        drop(index);
+
+        // Restore derives safe runtime counters from persisted counters and rows.
+        let next_mount_id = self
+            .store
+            .get_next_mount_id()?
+            .max(max_mount_id.saturating_add(1))
+            .max(1);
+        let version = self.store.get_version()?.max(max_mount_version);
+        self.next_mount_id.store(next_mount_id, Ordering::Relaxed);
+        self.reserved_next_mount_id
+            .store(next_mount_id, Ordering::Relaxed);
         self.version.store(version, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Apply a mount entry from Raft.
-    ///
-    /// P3.2: re-check prefix conflict at apply time. Pre-P3.2, the conflict
-    /// check ran only in the propose path — two concurrent add_mount calls
-    /// could both pass propose-time check (snapshot has neither) and both
-    /// install conflicting entries. Now apply rejects the second one as
-    /// `SkippedStale` and the index never holds prefix-conflicting mounts.
-    pub fn apply_mount(&self, info: MountInfo) -> FsResult<ApplyOutcome> {
-        let mut index = self.index.write().unwrap();
-        // Apply-side prefix conflict re-check. Skip when this is an in-place
-        // replace of the same mount_id (update_mount path).
-        let is_replace = index.contains_id(info.mount_id);
-        if !is_replace {
-            if index.get_by_ufs_path(&info.ufs_path).is_some() {
-                warn!(
-                    "Apply mount skipped: ufs_path={} already mounted (concurrent add_mount)",
-                    info.ufs_path
-                );
-                return Ok(ApplyOutcome::stale(format!(
-                    "ufs_path {} already mounted",
-                    info.ufs_path
-                )));
+    fn validate_namespace_id(&self, namespace_id: NamespaceId) -> FsResult<()> {
+        if namespace_id == INVALID_NAMESPACE_ID {
+            return Err(FsError::invalid_argument(
+                "mount namespace_id must be specified",
+            ));
+        }
+        if self.namespace_manager.get_namespace(namespace_id).is_none() {
+            return Err(FsError::not_found(format!(
+                "namespace {} not found",
+                namespace_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn resolve_namespace_name(&self, mnt_opt: &MountOptions) -> FsResult<NamespaceId> {
+        let name = mnt_opt
+            .namespace_name
+            .as_deref()
+            .ok_or_else(|| FsError::invalid_argument("mount namespace name must be specified"))?;
+        if name.trim().is_empty() {
+            return Err(FsError::invalid_argument(
+                "mount namespace name must not be empty",
+            ));
+        }
+        let namespace = self
+            .namespace_manager
+            .get_namespace_by_name(name)
+            .ok_or_else(|| FsError::not_found(format!("namespace {} not found", name)))?;
+        Ok(namespace.id)
+    }
+
+    fn next_version(&self) -> u64 {
+        self.version.load(Ordering::Relaxed).saturating_add(1)
+    }
+
+    fn commit_runtime_version(&self, version: u64) {
+        self.version.store(version, Ordering::Relaxed);
+    }
+
+    fn commit_runtime_next_mount_id(&self, next_mount_id: u32) {
+        self.next_mount_id.store(next_mount_id, Ordering::Relaxed);
+    }
+
+    fn reserve_next_mount_id(&self, index: &MountTableIndex) -> FsResult<u32> {
+        loop {
+            let reserved = self.reserved_next_mount_id.load(Ordering::Acquire);
+            let committed = self.next_mount_id.load(Ordering::Acquire);
+            let mut candidate = reserved.max(committed).max(1);
+            while index.get_by_id(candidate).is_some() {
+                candidate = next_mount_id_after(candidate)?;
             }
-            if index.get_by_cv_path(&info.cv_path).is_some() {
-                warn!(
-                    "Apply mount skipped: cv_path={} already mounted (concurrent add_mount)",
-                    info.cv_path
-                );
-                return Ok(ApplyOutcome::stale(format!(
-                    "cv_path {} already mounted",
-                    info.cv_path
-                )));
-            }
-            if let Err(e) = index.check_conflict(&info.cv_path, &info.ufs_path) {
-                warn!(
-                    "Apply mount skipped: prefix conflict cv_path={}, ufs_path={}, err={}",
-                    info.cv_path, info.ufs_path, e
-                );
-                return Ok(ApplyOutcome::stale(format!(
-                    "prefix conflict on cv_path={}, ufs_path={}: {}",
-                    info.cv_path, info.ufs_path, e
-                )));
+            let next = next_mount_id_after(candidate)?;
+            if self
+                .reserved_next_mount_id
+                .compare_exchange(reserved, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(candidate);
             }
         }
+    }
+
+    fn next_mount_id_to_commit(&self, mount_id: u32) -> FsResult<u32> {
+        Ok(self
+            .next_mount_id
+            .load(Ordering::Relaxed)
+            .max(next_mount_id_after(mount_id)?)
+            .max(1))
+    }
+
+    fn validate_insert_paths(
+        &self,
+        index: &MountTableIndex,
+        info: &MountInfo,
+        exclude_id: Option<u32>,
+    ) -> FsResult<Option<ApplyOutcome>> {
+        if let Some(dup) = index.get_by_ufs_path(&info.ufs_path) {
+            if Some(dup.mount_id) != exclude_id {
+                return Ok(Some(ApplyOutcome::stale(format!(
+                    "ufs_path {} already mounted",
+                    info.ufs_path
+                ))));
+            }
+        }
+        if let Some(dup) = index.get_by_cv_path(&info.cv_path) {
+            if Some(dup.mount_id) != exclude_id {
+                return Ok(Some(ApplyOutcome::stale(format!(
+                    "cv_path {} already mounted",
+                    info.cv_path
+                ))));
+            }
+        }
+        if let Err(e) = index.check_conflict_excluding(&info.cv_path, &info.ufs_path, exclude_id) {
+            return Ok(Some(ApplyOutcome::stale(format!(
+                "prefix conflict on cv_path={}, ufs_path={}: {}",
+                info.cv_path, info.ufs_path, e
+            ))));
+        }
+        Ok(None)
+    }
+
+    fn validate_add_request_paths(
+        &self,
+        index: &MountTableIndex,
+        cv_path: &str,
+        ufs_path: &str,
+    ) -> FsResult<()> {
+        if index.get_by_ufs_path(ufs_path).is_some() {
+            return Err(FsError::mount_path_exists(ufs_path));
+        }
+        if index.get_by_cv_path(cv_path).is_some() {
+            return Err(FsError::mount_path_exists(cv_path));
+        }
+        index.check_conflict(cv_path, ufs_path)
+    }
+
+    fn validate_update_request(&self, cv_path: &str) -> FsResult<Arc<MountInfo>> {
+        let index = self.index.read().unwrap();
+        index.get_by_cv_path(cv_path).ok_or_else(|| {
+            FsError::not_found(format!(
+                "update mode: mount point {} does not exist",
+                cv_path
+            ))
+        })
+    }
+
+    fn validate_add_entry(
+        &self,
+        index: &MountTableIndex,
+        info: &MountInfo,
+    ) -> FsResult<Option<ApplyOutcome>> {
+        if let Some(outcome) = self.validate_insert_paths(index, info, None)? {
+            return Ok(Some(outcome));
+        }
+        if info.mount_id == 0 {
+            return Ok(Some(ApplyOutcome::stale("mount_id must not be 0")));
+        }
+        if index.get_by_id(info.mount_id).is_some() {
+            return Ok(Some(ApplyOutcome::stale(format!(
+                "mount_id {} already exists",
+                info.mount_id
+            ))));
+        }
+        Ok(None)
+    }
+
+    fn validate_update_entry(
+        &self,
+        index: &MountTableIndex,
+        expected_mount_id: u32,
+        expected_cv_path: &str,
+        expected_version: u64,
+        info: &MountInfo,
+    ) -> FsResult<Result<Arc<MountInfo>, ApplyOutcome>> {
+        let old = match index.get_by_cv_path(expected_cv_path) {
+            Some(old) => old,
+            None => {
+                return Ok(Err(ApplyOutcome::not_found(format!(
+                    "update mount: cv_path {} does not exist",
+                    expected_cv_path
+                ))));
+            }
+        };
+        if old.mount_id != expected_mount_id {
+            return Ok(Err(ApplyOutcome::stale(format!(
+                "update stale: cv_path {} points to mount_id {}, expected {}",
+                expected_cv_path, old.mount_id, expected_mount_id
+            ))));
+        }
+        if old.version != expected_version {
+            return Ok(Err(ApplyOutcome::stale(format!(
+                "update stale: mount_id {} version {}, expected {}",
+                old.mount_id, old.version, expected_version
+            ))));
+        }
+        if let Some(outcome) = self.validate_insert_paths(index, info, Some(old.mount_id))? {
+            return Ok(Err(outcome));
+        }
+        if info.mount_id != expected_mount_id {
+            return Ok(Err(ApplyOutcome::stale(format!(
+                "update stale: mount_id change is not allowed, expected {}, actual {}",
+                expected_mount_id, info.mount_id
+            ))));
+        }
+        Ok(Ok(old))
+    }
+
+    /// Apply a mount entry from Raft.
+    pub fn apply_mount(&self, entry: MountEntry) -> FsResult<ApplyOutcome> {
+        match entry {
+            MountEntry::Add(entry) => self.apply_mount_add(entry),
+            MountEntry::Update(entry) => self.apply_mount_update(entry),
+        }
+    }
+
+    fn apply_mount_add(&self, entry: MountAddEntry) -> FsResult<ApplyOutcome> {
+        let MountAddEntry { mut info, .. } = entry;
+
+        if let Err(e) = self.validate_namespace_id(info.namespace_id) {
+            warn!(
+                "Apply mount add skipped: invalid namespace cv_path={}, namespace={}, err={}",
+                info.cv_path, info.namespace_id, e
+            );
+            return Ok(ApplyOutcome::stale(e.to_string()));
+        }
+
+        let mut index = self.index.write().unwrap();
+        if let Some(outcome) = self.validate_add_entry(&index, &info)? {
+            return Ok(outcome);
+        }
+        let next_mount_id = self.next_mount_id_to_commit(info.mount_id)?;
+
+        let version = self.next_version();
+        info.version = version;
+        self.store.apply_add_mount(&info, version, next_mount_id)?;
+        index.insert(info.clone());
+        self.commit_runtime_next_mount_id(next_mount_id);
+        self.commit_runtime_version(version);
         info!(
-            "Apply mount: {} -> {} (id={}, mode={})",
-            info.cv_path,
-            info.ufs_path,
-            info.mount_id,
-            if is_replace { "replace" } else { "insert" }
+            "Apply mount add: {} -> {} (id={})",
+            info.cv_path, info.ufs_path, info.mount_id
         );
-        self.store.put_mount(&info)?;
-        index.insert(info);
-        let v = self.version.fetch_add(1, Ordering::Relaxed) + 1;
-        self.store.put_version(v)?;
         Ok(ApplyOutcome::Applied)
     }
 
-    pub fn apply_unmount(&self, mount_id: u32) -> FsResult<ApplyOutcome> {
+    fn apply_mount_update(&self, entry: MountUpdateEntry) -> FsResult<ApplyOutcome> {
+        let MountUpdateEntry {
+            expected_mount_id,
+            expected_cv_path,
+            expected_version,
+            mut info,
+            ..
+        } = entry;
+
+        if let Err(e) = self.validate_namespace_id(info.namespace_id) {
+            warn!(
+                "Apply mount update skipped: invalid namespace cv_path={}, namespace={}, err={}",
+                info.cv_path, info.namespace_id, e
+            );
+            return Ok(ApplyOutcome::stale(e.to_string()));
+        }
+
         let mut index = self.index.write().unwrap();
-        let info = match index.remove(mount_id) {
+        let old = match self.validate_update_entry(
+            &index,
+            expected_mount_id,
+            &expected_cv_path,
+            expected_version,
+            &info,
+        )? {
+            Ok(old) => old,
+            Err(outcome) => return Ok(outcome),
+        };
+
+        let version = self.next_version();
+        info.version = version;
+        self.store.apply_update_mount(&info, version)?;
+        index.insert(info.clone());
+        self.commit_runtime_version(version);
+        info!(
+            "Apply mount update: {} -> {} (id={}, old_id={})",
+            info.cv_path, info.ufs_path, info.mount_id, old.mount_id
+        );
+        Ok(ApplyOutcome::Applied)
+    }
+
+    pub fn apply_unmount(&self, entry: UnMountEntry) -> FsResult<ApplyOutcome> {
+        let mut index = self.index.write().unwrap();
+        let info = match index.get_by_id(entry.id) {
             Some(i) => i,
             None => {
                 warn!(
                     "Apply unmount skipped: mount_id={} not present in index",
-                    mount_id
+                    entry.id
                 );
                 return Ok(ApplyOutcome::not_found(format!(
                     "mount_id {} not present",
-                    mount_id
+                    entry.id
                 )));
             }
         };
-        drop(index);
-        self.store.delete_mount(mount_id)?;
-        let v = self.version.fetch_add(1, Ordering::Relaxed) + 1;
-        self.store.put_version(v)?;
-        info!("Apply unmount: {} (id={})", info.cv_path, mount_id);
+        if info.cv_path != entry.expected_cv_path {
+            return Ok(ApplyOutcome::stale(format!(
+                "unmount stale: mount_id {} points to {}, expected {}",
+                entry.id, info.cv_path, entry.expected_cv_path
+            )));
+        }
+        if info.version != entry.expected_version {
+            return Ok(ApplyOutcome::stale(format!(
+                "unmount stale: mount_id {} version {}, expected {}",
+                entry.id, info.version, entry.expected_version
+            )));
+        }
+        let version = self.next_version();
+        self.store.apply_unmount(entry.id, version)?;
+        index.remove(entry.id);
+        self.commit_runtime_version(version);
+        info!("Apply unmount: {} (id={})", info.cv_path, entry.id);
         Ok(ApplyOutcome::Applied)
     }
 
-    fn assign_mount_id(&self) -> FsResult<u32> {
-        let mut rng = rand::thread_rng();
-        for _ in 0..10 {
-            let id = rng.gen::<u32>();
-            if !self.index.read().unwrap().contains_id(id) {
-                return Ok(id);
-            }
-        }
-        Err(FsError::common("failed assign mount id"))
-    }
-
-    fn add_mount(
-        &self,
-        mnt_id: Option<u32>,
-        cv_path: &str,
-        ufs_path: &str,
-        mnt_opt: &MountOptions,
-    ) -> FsResult<()> {
-        {
+    fn add_mount(&self, cv_path: &str, ufs_path: &str, mnt_opt: &MountOptions) -> FsResult<()> {
+        let namespace_id = self.resolve_namespace_name(mnt_opt)?;
+        let mount_id = {
             let index = self.index.read().unwrap();
-            if index.get_by_ufs_path(ufs_path).is_some() {
-                return Err(FsError::mount_path_exists(ufs_path));
-            }
-            if index.get_by_cv_path(cv_path).is_some() {
-                return Err(FsError::mount_path_exists(cv_path));
-            }
-            index.check_conflict(cv_path, ufs_path)?;
-        }
-
-        let mount_id = match mnt_id {
-            Some(id) => id,
-            None => self.assign_mount_id()?,
+            self.validate_add_request_paths(&index, cv_path, ufs_path)?;
+            self.reserve_next_mount_id(&index)?
         };
-
-        let info = mnt_opt.clone().to_info(mount_id, cv_path, ufs_path);
-        self.propose_mount(info, "add_mount")
-    }
-
-    fn update_mount(
-        &self,
-        mnt_id: Option<u32>,
-        cv_path: &str,
-        ufs_path: &str,
-        mnt_opt: &MountOptions,
-    ) -> FsResult<()> {
-        if self.index.read().unwrap().get_by_cv_path(cv_path).is_none() {
-            return Err(FsError::common(format!(
-                "update mode: mount point {} does not exist",
-                cv_path
-            )));
-        }
-
-        self.umount(cv_path)?;
-
-        let assign_id = match mnt_id {
-            Some(id) => id,
-            None => self.assign_mount_id()?,
-        };
-
-        let info = mnt_opt.clone().to_info(assign_id, cv_path, ufs_path);
-        self.propose_mount(info, "update_mount")
-    }
-
-    /// Common Mount propose path: leader-fenced + ApplyOutcome translation
-    /// (#6 fix). Pre-#6 used plain `propose()` which discarded apply-side
-    /// SkippedStale (e.g., P3.2 prefix conflict re-check).
-    fn propose_mount(&self, info: MountInfo, kind: &str) -> FsResult<()> {
-        let cv_path = info.cv_path.clone();
-        let entry = MountEntry {
+        let info = mnt_opt
+            .clone()
+            .to_info(mount_id, cv_path, ufs_path, namespace_id);
+        let entry = MountEntry::Add(MountAddEntry {
             op_ms: LocalTime::mills(),
             info,
-        };
+        });
+        self.propose_mount(entry, cv_path.to_string(), "add_mount")
+    }
+
+    fn update_mount(&self, cv_path: &str, ufs_path: &str, mnt_opt: &MountOptions) -> FsResult<()> {
+        let old = self.validate_update_request(cv_path)?;
+        let namespace_id = self.resolve_namespace_name(mnt_opt)?;
+        let info = mnt_opt
+            .clone()
+            .to_info(old.mount_id, cv_path, ufs_path, namespace_id);
+        let entry = MountEntry::Update(MountUpdateEntry {
+            op_ms: LocalTime::mills(),
+            expected_mount_id: old.mount_id,
+            expected_cv_path: cv_path.to_string(),
+            expected_version: old.version,
+            info,
+        });
+        self.propose_mount(entry, cv_path.to_string(), "update_mount")
+    }
+
+    /// Leader-fenced propose + ApplyOutcome translation.
+    fn propose_mount(&self, entry: MountEntry, cv_path: String, kind: &str) -> FsResult<()> {
         let outcome = self
             .journal_client
             .propose_as_leader_with_result(PdEntry::Mount(entry))?;
@@ -226,41 +439,30 @@ impl MountManager {
         }
     }
 
-    pub fn mount(
-        &self,
-        mnt_id: Option<u32>,
-        cv_path: &str,
-        ufs_path: &str,
-        mnt_opt: &MountOptions,
-    ) -> FsResult<()> {
+    pub fn mount(&self, cv_path: &str, ufs_path: &str, mnt_opt: &MountOptions) -> FsResult<()> {
         if mnt_opt.update {
-            return self.update_mount(mnt_id, cv_path, ufs_path, mnt_opt);
+            return self.update_mount(cv_path, ufs_path, mnt_opt);
         }
-        self.add_mount(mnt_id, cv_path, ufs_path, mnt_opt)
-    }
-
-    /// Test-only: insert a mount directly into the in-memory index, bypassing
-    /// Raft propose. PD module callers MUST go through `mount()` so the entry
-    /// reaches all replicas. This method is `#[cfg(test)]` to prevent misuse
-    /// (P3.4 from §15).
-    #[cfg(test)]
-    pub fn unprotected_add_mount(&self, info: MountInfo) -> FsResult<()> {
-        let mut index = self.index.write().unwrap();
-        index.insert(info);
-        Ok(())
+        self.add_mount(cv_path, ufs_path, mnt_opt)
     }
 
     pub fn umount(&self, cv_path: &str) -> FsResult<()> {
-        let mount_id = {
+        let (mount_id, expected_version) = {
             let index = self.index.read().unwrap();
             let info = index
                 .get_by_cv_path(cv_path)
-                .ok_or_else(|| FsError::common(format!("failed found {} to umount", cv_path)))?;
-            info.mount_id
+                .ok_or_else(|| FsError::not_found(format!("mount point {} not found", cv_path)))?;
+            (info.mount_id, info.version)
+        };
+        let entry = UnMountEntry {
+            op_ms: LocalTime::mills(),
+            id: mount_id,
+            expected_cv_path: cv_path.to_string(),
+            expected_version,
         };
         let outcome = self
             .journal_client
-            .propose_as_leader_with_result(PdEntry::Unmount(mount_id))?;
+            .propose_as_leader_with_result(PdEntry::Unmount(entry))?;
         match outcome {
             ApplyOutcome::Applied | ApplyOutcome::SkippedNoop => Ok(()),
             ApplyOutcome::SkippedStale { reason } => {
@@ -273,18 +475,6 @@ impl MountManager {
     pub fn unmount_by_id(&self, id: u32) -> FsResult<()> {
         let info = self.get_mount_info_by_id(id)?;
         self.umount(&info.cv_path)
-    }
-
-    /// Test-only: remove a mount directly from the in-memory index, bypassing
-    /// Raft propose. PD module callers MUST go through `umount()`. This method
-    /// is `#[cfg(test)]` to prevent misuse (P3.4 from §15).
-    #[cfg(test)]
-    pub fn unprotected_umount_by_id(&self, id: u32) -> FsResult<()> {
-        let mut index = self.index.write().unwrap();
-        match index.remove(id) {
-            Some(_) => Ok(()),
-            None => Err(FsError::common(format!("failed found {} entry", id))),
-        }
     }
 
     pub fn get_mount_info(&self, path: &Path) -> FsResult<Option<Arc<MountInfo>>> {
@@ -314,119 +504,579 @@ impl MountManager {
         let index = self.index.read().unwrap();
         index
             .get_by_id(mount_id)
-            .ok_or_else(|| FsError::common(format!("failed found {} entry", mount_id)))
+            .ok_or_else(|| FsError::not_found(format!("mount_id {} not found", mount_id)))
     }
 
     /// Monotonic mount version (incremented on each mount/unmount apply).
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::Relaxed)
     }
+
+    /// Test-only: insert a mount directly into the in-memory index, bypassing
+    /// Raft propose.
+    #[cfg(test)]
+    pub fn unprotected_add_mount(&self, info: MountInfo) -> FsResult<()> {
+        let mut index = self.index.write().unwrap();
+        index.insert(info);
+        Ok(())
+    }
+
+    /// Test-only: remove a mount directly from the in-memory index, bypassing
+    /// Raft propose.
+    #[cfg(test)]
+    pub fn unprotected_umount_by_id(&self, id: u32) -> FsResult<()> {
+        let mut index = self.index.write().unwrap();
+        match index.remove(id) {
+            Some(_) => Ok(()),
+            None => Err(FsError::not_found(format!("mount_id {} not found", id))),
+        }
+    }
+
+    #[cfg(test)]
+    fn next_mount_id(&self) -> u32 {
+        self.next_mount_id.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn reserved_next_mount_id(&self) -> u32 {
+        self.reserved_next_mount_id.load(Ordering::Relaxed)
+    }
 }
 
-// =============================================================================
-// REGRESSION-BASELINE tests (P0.4 from docs/pd-raft-consistency.md §15).
-//
-// These tests document the CURRENT bug behavior in mount apply paths:
-//   - apply_mount does NOT re-check prefix conflicts; two add_mount calls
-//     that pass propose-time check before either applies can both commit
-//     and corrupt the index (P3.2 will fix).
-//   - MountTableIndex::insert overwrites a same-ID entry without removing
-//     its old cv/ufs reverse mappings (P3.3 will fix).
-// =============================================================================
+fn next_mount_id_after(mount_id: u32) -> FsResult<u32> {
+    mount_id
+        .checked_add(1)
+        .ok_or_else(|| FsError::common("mount id exhausted: cannot allocate after u32::MAX"))
+}
+
+// Mount apply-path tests: id allocation, atomic replace, and conflict handling
+// are all validated inside the single-threaded apply loop.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pd::journal;
+    use crate::pd::namespace::NamespaceManager;
     use crate::pd::store::memory_kv_engine::MemoryKvEngine;
     use crate::pd::store::KvStore;
     use curvine_common::conf::JournalConf;
     use curvine_common::raft::RaftClient;
-    use curvine_common::state::{MountInfo, MountOptions};
+    use curvine_common::state::{MountInfo, MountOptions, NamespaceInfo};
+
+    fn test_namespace_manager() -> Arc<NamespaceManager> {
+        let namespace_manager = NamespaceManager::new_for_test();
+        namespace_manager.test_insert_namespace(NamespaceInfo {
+            id: 1,
+            name: "default".to_string(),
+            ..Default::default()
+        });
+        namespace_manager
+    }
+
+    fn test_mount_manager_with_store(store: Arc<dyn KvStore>) -> MountManager {
+        let journal_conf = JournalConf::default();
+        let raft = RaftClient::from_conf(journal_conf.create_runtime(), &journal_conf);
+        let jc = Arc::new(journal::Client::new(raft));
+        MountManager::new(store, jc, test_namespace_manager())
+    }
 
     fn test_mount_manager() -> MountManager {
-        let store: Arc<dyn KvStore> = Arc::new(MemoryKvEngine::new());
-        let journal_conf = JournalConf::default();
-        let rt = journal_conf.create_runtime();
-        let raft = RaftClient::from_conf(rt, &journal_conf);
-        let jc = Arc::new(journal::Client::new(raft));
-        MountManager::new(store, jc)
+        test_mount_manager_with_store(Arc::new(MemoryKvEngine::new()))
     }
 
     fn build_mount(mount_id: u32, cv_path: &str, ufs_path: &str) -> MountInfo {
-        let opts = MountOptions::builder().build();
-        opts.to_info(mount_id, cv_path, ufs_path)
+        let opts = MountOptions::builder().namespace_name("default").build();
+        opts.to_info(mount_id, cv_path, ufs_path, 1)
     }
 
-    /// REGRESSION (post-P3.2): apply_mount re-runs prefix conflict check; the
-    /// second of two concurrently-passing-propose-time entries is rejected
-    /// with `SkippedStale` and the index never holds prefix-conflicting mounts.
-    ///
-    /// Pre-P3.2 (now removed): both entries were inserted, leaving a corrupt
-    /// mount table.
+    fn insert_entry(info: MountInfo) -> MountEntry {
+        MountEntry::Add(MountAddEntry { op_ms: 0, info })
+    }
+
+    fn update_entry(
+        expected_mount_id: u32,
+        expected_cv_path: &str,
+        expected_version: u64,
+        info: MountInfo,
+    ) -> MountEntry {
+        MountEntry::Update(MountUpdateEntry {
+            op_ms: 0,
+            expected_mount_id,
+            expected_cv_path: expected_cv_path.to_string(),
+            expected_version,
+            info,
+        })
+    }
+
+    fn unmount_entry_with_version(
+        id: u32,
+        expected_cv_path: &str,
+        expected_version: u64,
+    ) -> UnMountEntry {
+        UnMountEntry {
+            op_ms: 0,
+            id,
+            expected_cv_path: expected_cv_path.to_string(),
+            expected_version,
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum OutcomeKind {
+        Applied,
+        Stale,
+        NotFound,
+    }
+
+    fn assert_outcome(case_name: &str, actual: ApplyOutcome, expected: OutcomeKind) {
+        match expected {
+            OutcomeKind::Applied => assert_eq!(
+                actual,
+                ApplyOutcome::Applied,
+                "case {} should be applied",
+                case_name
+            ),
+            OutcomeKind::Stale => assert!(
+                matches!(actual, ApplyOutcome::SkippedStale { .. }),
+                "case {} should be stale, got {:?}",
+                case_name,
+                actual
+            ),
+            OutcomeKind::NotFound => assert!(
+                matches!(actual, ApplyOutcome::NotFound { .. }),
+                "case {} should be not-found, got {:?}",
+                case_name,
+                actual
+            ),
+        }
+    }
+
+    fn assert_mount_table(mgr: &MountManager, expected: &[(u32, &str, &str)]) {
+        let mut actual: Vec<_> = mgr
+            .get_mount_table()
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.mount_id, m.cv_path.clone(), m.ufs_path.clone()))
+            .collect();
+        actual.sort_by_key(|(id, _, _)| *id);
+
+        let mut expected: Vec<_> = expected
+            .iter()
+            .map(|(id, cv, ufs)| (*id, (*cv).to_string(), (*ufs).to_string()))
+            .collect();
+        expected.sort_by_key(|(id, _, _)| *id);
+
+        assert_eq!(actual, expected);
+    }
+
+    fn apply_setup(mgr: &MountManager, entries: Vec<MountEntry>) {
+        for entry in entries {
+            assert_eq!(mgr.apply_mount(entry).unwrap(), ApplyOutcome::Applied);
+        }
+    }
+
     #[test]
-    fn apply_mount_recheck_prefix_conflict() {
-        let mgr = test_mount_manager();
-        let info_a = build_mount(1, "/data", "/ufs/data");
-        let info_b = build_mount(2, "/data/sub", "/ufs/data2");
+    fn apply_mount_add_cases() {
+        struct AddCase {
+            name: &'static str,
+            setup: Vec<MountEntry>,
+            entry: MountEntry,
+            expected: OutcomeKind,
+            expected_table: Vec<(u32, &'static str, &'static str)>,
+            expected_next_id: Option<u32>,
+        }
 
-        // First applies cleanly.
-        let outcome_a = mgr.apply_mount(info_a).unwrap();
-        assert_eq!(outcome_a, ApplyOutcome::Applied);
-        // Second is rejected by the apply-side prefix conflict check.
-        let outcome_b = mgr.apply_mount(info_b).unwrap();
-        assert!(
-            matches!(outcome_b, ApplyOutcome::SkippedStale { .. }),
-            "expected SkippedStale on prefix conflict, got {:?}",
-            outcome_b
-        );
+        let invalid_namespace_info = MountOptions::builder()
+            .namespace_name("default")
+            .build()
+            .to_info(1, "/data", "/ufs/data", INVALID_NAMESPACE_ID);
 
-        let table = mgr.get_mount_table().unwrap();
-        assert_eq!(table.len(), 1, "only path A survives");
-        assert_eq!(table[0].cv_path, "/data");
+        let cases = vec![
+            AddCase {
+                name: "success with explicit id advances next id",
+                setup: vec![],
+                entry: insert_entry(build_mount(9, "/explicit", "/ufs/explicit")),
+                expected: OutcomeKind::Applied,
+                expected_table: vec![(9, "/explicit", "/ufs/explicit")],
+                expected_next_id: Some(10),
+            },
+            AddCase {
+                name: "prefix conflict is rejected",
+                setup: vec![insert_entry(build_mount(1, "/data", "/ufs/data"))],
+                entry: insert_entry(build_mount(2, "/data/sub", "/ufs/data2")),
+                expected: OutcomeKind::Stale,
+                expected_table: vec![(1, "/data", "/ufs/data")],
+                expected_next_id: Some(2),
+            },
+            AddCase {
+                name: "missing namespace is rejected",
+                setup: vec![],
+                entry: insert_entry(invalid_namespace_info),
+                expected: OutcomeKind::Stale,
+                expected_table: vec![],
+                expected_next_id: Some(1),
+            },
+            AddCase {
+                name: "duplicate mount id is rejected",
+                setup: vec![insert_entry(build_mount(1, "/a", "/ufs/a"))],
+                entry: insert_entry(build_mount(1, "/b", "/ufs/b")),
+                expected: OutcomeKind::Stale,
+                expected_table: vec![(1, "/a", "/ufs/a")],
+                expected_next_id: Some(2),
+            },
+            AddCase {
+                name: "duplicate cv path is rejected",
+                setup: vec![insert_entry(build_mount(1, "/a", "/ufs/a"))],
+                entry: insert_entry(build_mount(2, "/a", "/ufs/b")),
+                expected: OutcomeKind::Stale,
+                expected_table: vec![(1, "/a", "/ufs/a")],
+                expected_next_id: Some(2),
+            },
+            AddCase {
+                name: "duplicate ufs path is rejected",
+                setup: vec![insert_entry(build_mount(1, "/a", "/ufs/a"))],
+                entry: insert_entry(build_mount(2, "/b", "/ufs/a")),
+                expected: OutcomeKind::Stale,
+                expected_table: vec![(1, "/a", "/ufs/a")],
+                expected_next_id: Some(2),
+            },
+        ];
+
+        for case in cases {
+            let mgr = test_mount_manager();
+            apply_setup(&mgr, case.setup);
+
+            let outcome = mgr.apply_mount(case.entry).unwrap();
+
+            assert_outcome(case.name, outcome, case.expected);
+            assert_mount_table(&mgr, &case.expected_table);
+            if let Some(next_id) = case.expected_next_id {
+                assert_eq!(mgr.next_mount_id(), next_id, "case {}", case.name);
+                assert_eq!(
+                    mgr.store.get_next_mount_id().unwrap(),
+                    next_id,
+                    "case {}",
+                    case.name
+                );
+            }
+        }
     }
 
-    /// REGRESSION (post-P3.3): MountTableIndex::insert now removes prior
-    /// cv_path / ufs_path reverse mappings when a same mount_id is replaced.
-    /// Pre-P3.3 (now removed): the old reverse mappings stayed, so lookup by
-    /// the old paths still resolved to mount_id=N but pointed at the NEW
-    /// MountInfo (an inconsistent state).
+    #[test]
+    fn reserve_mount_id_cases() {
+        struct ReserveCase {
+            name: &'static str,
+            setup: Vec<MountEntry>,
+            reserve_count: usize,
+            expected_reserved_ids: Vec<u32>,
+            expected_table: Vec<(u32, &'static str, &'static str)>,
+            expected_committed_next_id: u32,
+            expected_reserved_next_id: u32,
+        }
+
+        let cases = vec![
+            ReserveCase {
+                name: "two reservations are monotonic",
+                setup: vec![],
+                reserve_count: 2,
+                expected_reserved_ids: vec![1, 2],
+                expected_table: vec![],
+                expected_committed_next_id: 1,
+                expected_reserved_next_id: 3,
+            },
+            ReserveCase {
+                name: "reservation skips existing explicit id",
+                setup: vec![insert_entry(build_mount(1, "/a", "/ufs/a"))],
+                reserve_count: 1,
+                expected_reserved_ids: vec![2],
+                expected_table: vec![(1, "/a", "/ufs/a")],
+                expected_committed_next_id: 2,
+                expected_reserved_next_id: 3,
+            },
+        ];
+
+        for case in cases {
+            let mgr = test_mount_manager();
+            apply_setup(&mgr, case.setup);
+
+            let mut reserved_ids = Vec::new();
+            for _ in 0..case.reserve_count {
+                let index = mgr.index.read().unwrap();
+                reserved_ids.push(mgr.reserve_next_mount_id(&index).unwrap());
+            }
+
+            assert_eq!(
+                reserved_ids, case.expected_reserved_ids,
+                "case {}",
+                case.name
+            );
+            assert_mount_table(&mgr, &case.expected_table);
+            assert_eq!(
+                mgr.next_mount_id(),
+                case.expected_committed_next_id,
+                "case {}",
+                case.name
+            );
+            assert_eq!(
+                mgr.reserved_next_mount_id(),
+                case.expected_reserved_next_id,
+                "case {}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn apply_mount_update_cases() {
+        struct UpdateCase {
+            name: &'static str,
+            setup: Vec<MountEntry>,
+            before: Vec<MountEntry>,
+            entry: MountEntry,
+            expected: OutcomeKind,
+            expected_table: Vec<(u32, &'static str, &'static str)>,
+            expected_next_id: Option<u32>,
+        }
+
+        let cases = vec![
+            UpdateCase {
+                name: "update success swaps paths in place",
+                setup: vec![insert_entry(build_mount(7, "/cv", "/ufs/old"))],
+                before: vec![],
+                entry: update_entry(7, "/cv", 1, build_mount(7, "/cv", "/ufs/new")),
+                expected: OutcomeKind::Applied,
+                expected_table: vec![(7, "/cv", "/ufs/new")],
+                expected_next_id: Some(8),
+            },
+            UpdateCase {
+                name: "conflicting replace keeps old mount",
+                setup: vec![
+                    insert_entry(build_mount(1, "/data", "/ufs/data")),
+                    insert_entry(build_mount(2, "/other", "/ufs/other")),
+                ],
+                before: vec![],
+                entry: update_entry(1, "/data", 1, build_mount(1, "/data", "/ufs/other")),
+                expected: OutcomeKind::Stale,
+                expected_table: vec![(1, "/data", "/ufs/data"), (2, "/other", "/ufs/other")],
+                expected_next_id: Some(3),
+            },
+            UpdateCase {
+                name: "stale version is rejected",
+                setup: vec![insert_entry(build_mount(1, "/a", "/ufs/a"))],
+                before: vec![update_entry(1, "/a", 1, build_mount(1, "/a", "/ufs/a2"))],
+                entry: update_entry(1, "/a", 1, build_mount(1, "/a", "/ufs/a3")),
+                expected: OutcomeKind::Stale,
+                expected_table: vec![(1, "/a", "/ufs/a2")],
+                expected_next_id: Some(2),
+            },
+            UpdateCase {
+                name: "stale mount id is rejected",
+                setup: vec![insert_entry(build_mount(1, "/a", "/ufs/a"))],
+                before: vec![],
+                entry: update_entry(2, "/a", 1, build_mount(1, "/a", "/ufs/a2")),
+                expected: OutcomeKind::Stale,
+                expected_table: vec![(1, "/a", "/ufs/a")],
+                expected_next_id: Some(2),
+            },
+            UpdateCase {
+                name: "missing cv path is not found",
+                setup: vec![],
+                before: vec![],
+                entry: update_entry(1, "/missing", 1, build_mount(1, "/missing", "/ufs/missing")),
+                expected: OutcomeKind::NotFound,
+                expected_table: vec![],
+                expected_next_id: Some(1),
+            },
+            UpdateCase {
+                name: "replacement mount id collision is rejected",
+                setup: vec![
+                    insert_entry(build_mount(1, "/a", "/ufs/a")),
+                    insert_entry(build_mount(2, "/b", "/ufs/b")),
+                ],
+                before: vec![],
+                entry: update_entry(1, "/a", 1, build_mount(2, "/a", "/ufs/a2")),
+                expected: OutcomeKind::Stale,
+                expected_table: vec![(1, "/a", "/ufs/a"), (2, "/b", "/ufs/b")],
+                expected_next_id: Some(3),
+            },
+        ];
+
+        for case in cases {
+            let mgr = test_mount_manager();
+            apply_setup(&mgr, case.setup);
+            apply_setup(&mgr, case.before);
+
+            let outcome = mgr.apply_mount(case.entry).unwrap();
+
+            assert_outcome(case.name, outcome, case.expected);
+            assert_mount_table(&mgr, &case.expected_table);
+            if let Some(next_id) = case.expected_next_id {
+                assert_eq!(mgr.next_mount_id(), next_id, "case {}", case.name);
+                assert_eq!(
+                    mgr.store.get_next_mount_id().unwrap(),
+                    next_id,
+                    "case {}",
+                    case.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn apply_unmount_cases() {
+        struct UnmountCase {
+            name: &'static str,
+            setup: Vec<MountEntry>,
+            before: Vec<MountEntry>,
+            entry: UnMountEntry,
+            expected: OutcomeKind,
+            expected_table: Vec<(u32, &'static str, &'static str)>,
+        }
+
+        let cases = vec![
+            UnmountCase {
+                name: "unmount success removes mount",
+                setup: vec![insert_entry(build_mount(1, "/a", "/ufs/a"))],
+                before: vec![],
+                entry: unmount_entry_with_version(1, "/a", 1),
+                expected: OutcomeKind::Applied,
+                expected_table: vec![],
+            },
+            UnmountCase {
+                name: "stale cv path is rejected",
+                setup: vec![insert_entry(build_mount(1, "/a", "/ufs/a"))],
+                before: vec![update_entry(1, "/a", 1, build_mount(1, "/b", "/ufs/b"))],
+                entry: unmount_entry_with_version(1, "/a", 1),
+                expected: OutcomeKind::Stale,
+                expected_table: vec![(1, "/b", "/ufs/b")],
+            },
+            UnmountCase {
+                name: "stale version is rejected",
+                setup: vec![insert_entry(build_mount(1, "/a", "/ufs/a"))],
+                before: vec![update_entry(1, "/a", 1, build_mount(1, "/a", "/ufs/a2"))],
+                entry: unmount_entry_with_version(1, "/a", 1),
+                expected: OutcomeKind::Stale,
+                expected_table: vec![(1, "/a", "/ufs/a2")],
+            },
+            UnmountCase {
+                name: "missing mount id is not found",
+                setup: vec![],
+                before: vec![],
+                entry: unmount_entry_with_version(99, "/missing", 1),
+                expected: OutcomeKind::NotFound,
+                expected_table: vec![],
+            },
+        ];
+
+        for case in cases {
+            let mgr = test_mount_manager();
+            apply_setup(&mgr, case.setup);
+            apply_setup(&mgr, case.before);
+
+            let outcome = mgr.apply_unmount(case.entry).unwrap();
+
+            assert_outcome(case.name, outcome, case.expected);
+            assert_mount_table(&mgr, &case.expected_table);
+        }
+    }
+
+    #[test]
+    fn restore_cases() {
+        enum RestoreCase {
+            ClearStaleRuntimeIndex,
+            RepairVersionFromMountRows,
+            RepairNextMountIdFromMountRows,
+        }
+
+        let cases = vec![
+            (
+                "clear stale runtime index",
+                RestoreCase::ClearStaleRuntimeIndex,
+            ),
+            (
+                "repair version from mount rows",
+                RestoreCase::RepairVersionFromMountRows,
+            ),
+            (
+                "repair next mount id from mount rows",
+                RestoreCase::RepairNextMountIdFromMountRows,
+            ),
+        ];
+
+        for (name, case) in cases {
+            match case {
+                RestoreCase::ClearStaleRuntimeIndex => {
+                    let mgr = test_mount_manager();
+                    mgr.unprotected_add_mount(build_mount(1, "/stale", "/ufs/stale"))
+                        .unwrap();
+                    assert_mount_table(&mgr, &[(1, "/stale", "/ufs/stale")]);
+
+                    mgr.restore().unwrap();
+
+                    assert_mount_table(&mgr, &[]);
+                }
+                RestoreCase::RepairVersionFromMountRows => {
+                    let store: Arc<dyn KvStore> = Arc::new(MemoryKvEngine::new());
+                    let mgr = test_mount_manager_with_store(store.clone());
+                    assert_eq!(
+                        mgr.apply_mount(insert_entry(build_mount(1, "/a", "/ufs/a")))
+                            .unwrap(),
+                        ApplyOutcome::Applied,
+                        "case {}",
+                        name
+                    );
+                    assert_eq!(mgr.version(), 1, "case {}", name);
+                    mgr.store.put_version(0).unwrap();
+
+                    let restored = test_mount_manager_with_store(store);
+                    restored.restore().unwrap();
+
+                    assert_eq!(restored.version(), 1, "case {}", name);
+                    assert_mount_table(&restored, &[(1, "/a", "/ufs/a")]);
+                }
+                RestoreCase::RepairNextMountIdFromMountRows => {
+                    let store: Arc<dyn KvStore> = Arc::new(MemoryKvEngine::new());
+                    let mgr = test_mount_manager_with_store(store.clone());
+                    assert_eq!(
+                        mgr.apply_mount(insert_entry(build_mount(9, "/a", "/ufs/a")))
+                            .unwrap(),
+                        ApplyOutcome::Applied,
+                        "case {}",
+                        name
+                    );
+                    assert_eq!(mgr.store.get_next_mount_id().unwrap(), 10, "case {}", name);
+                    mgr.store.put_next_mount_id(1).unwrap();
+
+                    let restored = test_mount_manager_with_store(store);
+                    restored.restore().unwrap();
+
+                    assert_eq!(restored.next_mount_id(), 10, "case {}", name);
+                    assert_eq!(
+                        restored.store.get_next_mount_id().unwrap(),
+                        1,
+                        "case {}",
+                        name
+                    );
+                    assert_mount_table(&restored, &[(9, "/a", "/ufs/a")]);
+                }
+            }
+        }
+    }
+
+    /// MountTableIndex::insert removes prior cv_path / ufs_path reverse mappings
+    /// when a same mount_id is replaced in place.
     #[test]
     fn mount_index_insert_cleans_old_reverse_mappings() {
-        let mgr = test_mount_manager();
-
-        let original = build_mount(7, "/old/cv", "/old/ufs");
-        let replacement = build_mount(7, "/new/cv", "/new/ufs");
-
-        mgr.apply_mount(original).unwrap();
-        // Sanity: original is reachable by old paths.
-        let by_cv = mgr
-            .get_mount_info(&curvine_common::fs::Path::from_str("/old/cv").unwrap())
-            .unwrap();
-        assert!(
-            by_cv.is_some(),
-            "original should be reachable by old cv path"
-        );
+        let mut index = MountTableIndex::new();
+        index.insert(build_mount(7, "/old/cv", "/old/ufs"));
+        assert!(index.get_by_cv_path("/old/cv").is_some());
 
         // Re-insert same mount_id with completely different paths.
-        mgr.apply_mount(replacement).unwrap();
+        index.insert(build_mount(7, "/new/cv", "/new/ufs"));
 
-        // Post-P3.3: lookup by old paths returns None (clean reverse mappings).
-        let stale_by_cv = mgr
-            .get_mount_info(&curvine_common::fs::Path::from_str("/old/cv").unwrap())
-            .unwrap();
-        assert!(
-            stale_by_cv.is_none(),
-            "post-P3.3: old cv path should no longer resolve"
-        );
-
-        // New paths resolve correctly to the replacement MountInfo.
-        let by_id = mgr.get_mount_info_by_id(7).unwrap();
+        // Old paths no longer resolve; new paths point at the replacement.
+        assert!(index.get_by_cv_path("/old/cv").is_none());
+        assert!(index.get_by_ufs_path("/old/ufs").is_none());
+        let by_id = index.get_by_id(7).expect("id resolves");
         assert_eq!(by_id.cv_path, "/new/cv");
         assert_eq!(by_id.ufs_path, "/new/ufs");
-        let by_new_cv = mgr
-            .get_mount_info(&curvine_common::fs::Path::from_str("/new/cv").unwrap())
-            .unwrap()
-            .expect("new cv path resolves");
-        assert_eq!(by_new_cv.cv_path, "/new/cv");
     }
 }
