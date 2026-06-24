@@ -19,10 +19,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// In-memory mount table index.
-///
-/// P5.3: stores `Arc<MountInfo>` so reads from RPC handlers / heartbeat paths
-/// share a single allocation across callers (cheap clone of Arc rather than
-/// the underlying string-heavy `MountInfo`).
 pub struct MountTableIndex {
     ufs2mountid: HashMap<String, u32>,
     mountpath2id: HashMap<String, u32>,
@@ -40,11 +36,8 @@ impl MountTableIndex {
 
     /// Insert (or replace) a mount entry. If `mount_id` is already present
     /// with different paths, the old cv_path / ufs_path reverse mappings are
-    /// removed first so they don't leak (P3.3 fix for §7.2).
+    /// removed first.
     pub fn insert(&mut self, info: MountInfo) {
-        // Clean up old reverse mappings for the same mount_id before installing
-        // the new ones — otherwise lookups by old paths would resolve to a
-        // mount_id whose MountInfo no longer matches.
         if let Some(old) = self.mountid2entry.get(&info.mount_id) {
             if old.cv_path != info.cv_path {
                 self.mountpath2id.remove(&old.cv_path);
@@ -88,16 +81,32 @@ impl MountTableIndex {
             .cloned()
     }
 
-    pub fn contains_id(&self, mount_id: u32) -> bool {
-        self.mountid2entry.contains_key(&mount_id)
-    }
-
     pub fn get_all(&self) -> Vec<Arc<MountInfo>> {
         self.mountid2entry.values().cloned().collect()
     }
 
+    pub fn clear(&mut self) {
+        self.ufs2mountid.clear();
+        self.mountpath2id.clear();
+        self.mountid2entry.clear();
+    }
+
     pub fn check_conflict(&self, cv_path: &str, ufs_path: &str) -> FsResult<()> {
+        self.check_conflict_excluding(cv_path, ufs_path, None)
+    }
+
+    /// Prefix-conflict check that ignores the entry being replaced (`exclude_id`),
+    /// so an in-place update against its own paths is not treated as a conflict.
+    pub fn check_conflict_excluding(
+        &self,
+        cv_path: &str,
+        ufs_path: &str,
+        exclude_id: Option<u32>,
+    ) -> FsResult<()> {
         for info in self.mountid2entry.values() {
+            if Some(info.mount_id) == exclude_id {
+                continue;
+            }
             if Path::has_prefix(cv_path, &info.cv_path) {
                 return Err(FsError::mount_path_conflict(format!(
                     "mount point {} is a prefix of {}",

@@ -25,15 +25,12 @@ use std::sync::Arc;
 pub struct CreateMountBody {
     pub cv_path: String,
     pub ufs_path: String,
+    #[serde(alias = "namespace_name")]
+    pub namespace: String,
     #[serde(default)]
     pub properties: std::collections::HashMap<String, String>,
-    pub ttl_ms: Option<i64>,
-    pub ttl_action: Option<String>,
     pub write_type: Option<String>,
-    pub replicas: Option<i32>,
-    pub consistency_strategy: Option<String>,
     pub mount_type: Option<String>,
-    pub block_size: Option<i64>,
     pub provider: Option<String>,
 }
 
@@ -53,27 +50,14 @@ pub async fn create_mount_handler(
         return ApiResponse::<()>::error(err.code().into(), err.to_string(), err.status_code());
     }
 
-    let mut builder = state::MountOptionsBuilder::new();
-    builder = builder.set_properties(body.properties);
-    if let Some(t) = body.ttl_ms {
-        builder = builder.ttl_ms(t);
+    if body.namespace.trim().is_empty() {
+        let err = MountError::namespace_required();
+        return ApiResponse::<()>::error(err.code().into(), err.to_string(), err.status_code());
     }
-    if let Some(ref s) = body.ttl_action {
-        if let Ok(ta) = state::TtlAction::try_from(s.as_str()) {
-            builder = builder.ttl_action(ta);
-        }
-    }
-    if let Some(ref s) = body.consistency_strategy {
-        if let Ok(cs) = state::ConsistencyStrategy::try_from(s.as_str()) {
-            builder = builder.consistency_strategy(cs);
-        }
-    }
-    if let Some(b) = body.block_size {
-        builder = builder.block_size(b);
-    }
-    if let Some(r) = body.replicas {
-        builder = builder.replicas(r);
-    }
+
+    let mut builder = state::MountOptionsBuilder::new()
+        .set_properties(body.properties)
+        .namespace_name(body.namespace);
     if let Some(ref s) = body.mount_type {
         builder = builder.mount_type(str_to_mount_type(s));
     }

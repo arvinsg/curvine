@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{KvPair, KvStore};
+use super::{KvPair, KvStore, KvWrite};
 use orpc::CommonResult;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -82,5 +82,20 @@ impl KvStore for MemoryKvEngine {
             })
             .collect();
         Ok(items)
+    }
+
+    fn write_batch(&self, ops: Vec<KvWrite>) -> CommonResult<()> {
+        let mut data = self.data.lock().unwrap();
+        for op in ops {
+            match op {
+                KvWrite::Put { ns, key, value } => {
+                    data.insert(Self::full_key(&ns, &key), value);
+                }
+                KvWrite::Delete { ns, key } => {
+                    data.remove(&Self::full_key(&ns, &key));
+                }
+            }
+        }
+        Ok(())
     }
 }

@@ -15,7 +15,7 @@
 use crate::master::SyncFsDir;
 use curvine_common::conf::{UfsConf, UfsConfBuilder};
 use curvine_common::fs::Path;
-use curvine_common::state::{MountInfo, MountOptions};
+use curvine_common::state::{MountInfo, MountOptions, INVALID_NAMESPACE_ID};
 use curvine_common::FsResult;
 use log::info;
 use orpc::{err_box, try_option};
@@ -134,7 +134,9 @@ impl MountTable {
 
         self.check_conflict(cv_path, ufs_path)?;
 
-        let info = mnt_opt.clone().to_info(mount_id, cv_path, ufs_path);
+        let info = mnt_opt
+            .clone()
+            .to_info(mount_id, cv_path, ufs_path, INVALID_NAMESPACE_ID);
         self.unprotected_add_mount(info.clone())?;
 
         let mut fs_dir = self.fs_dir.write();

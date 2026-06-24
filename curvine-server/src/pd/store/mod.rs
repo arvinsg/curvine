@@ -27,15 +27,33 @@ pub const PREFIX_CONFIG: u8 = 0x10;
 pub const PREFIX_NODE: u8 = 0x20;
 pub const PREFIX_MOUNT_VERSION: u8 = 0x40;
 pub const PREFIX_MOUNT: u8 = 0x41;
+pub const PREFIX_MOUNT_NEXT_ID: u8 = 0x42;
 pub const PREFIX_ROUTE_VERSION: u8 = 0x50;
 pub const PREFIX_ROUTE: u8 = 0x51;
+pub const PREFIX_NAMESPACE: u8 = 0x60;
+pub const PREFIX_NAMESPACE_NAME: u8 = 0x61;
+pub const PREFIX_NAMESPACE_NEXT_ID: u8 = 0x62;
 
 // ---- Key Prefixes for CF_DATA ----
 pub const PREFIX_BG_INFO: u8 = 0x01;
 pub const PREFIX_BG_NEXT_ID: u8 = 0x02;
 pub const PREFIX_BG_TABLE: u8 = 0x03;
+pub const PREFIX_BG_TABLE_NEXT_ID: u8 = 0x04;
 
 pub type KvPair = (Vec<u8>, Vec<u8>);
+
+#[derive(Debug, Clone)]
+pub enum KvWrite {
+    Put {
+        ns: String,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    Delete {
+        ns: String,
+        key: Vec<u8>,
+    },
+}
 
 /// Namespace-aware KV store abstraction.
 pub trait KvStore: Send + Sync {
@@ -46,6 +64,8 @@ pub trait KvStore: Send + Sync {
     fn delete(&self, ns: &str, key: &[u8]) -> CommonResult<()>;
 
     fn scan_prefix(&self, ns: &str, prefix: &[u8]) -> CommonResult<Vec<KvPair>>;
+
+    fn write_batch(&self, ops: Vec<KvWrite>) -> CommonResult<()>;
 
     fn exists(&self, ns: &str, key: &[u8]) -> CommonResult<bool> {
         Ok(self.get(ns, key)?.is_some())

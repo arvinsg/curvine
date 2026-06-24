@@ -25,6 +25,9 @@ pub enum MountError {
     PathQueryRequired,
 
     #[error("{0}")]
+    InvalidArgument(String),
+
+    #[error("{0}")]
     InvalidPath(String),
 
     /// Mount path (cv_path or ufs_path) already exists in mount table
@@ -36,6 +39,12 @@ pub enum MountError {
     MountPathConflict(String),
 
     #[error("{0}")]
+    NotFound(String),
+
+    #[error("{0}")]
+    StaleEntry(String),
+
+    #[error("{0}")]
     InternalError(String),
 }
 
@@ -44,9 +53,12 @@ impl MountError {
         match self {
             MountError::CvUfsRequired => "CV_UFS_REQUIRED",
             MountError::PathQueryRequired => "PATH_REQUIRED",
+            MountError::InvalidArgument(_) => "INVALID_ARGUMENT",
             MountError::InvalidPath(_) => "INVALID_PATH",
             MountError::MountPathExists(_) => "MOUNT_PATH_EXISTS",
             MountError::MountPathConflict(_) => "MOUNT_PATH_CONFLICT",
+            MountError::NotFound(_) => "NOT_FOUND",
+            MountError::StaleEntry(_) => "STALE_ENTRY",
             MountError::InternalError(_) => "INTERNAL_ERROR",
         }
     }
@@ -55,10 +67,12 @@ impl MountError {
         match self {
             MountError::CvUfsRequired
             | MountError::PathQueryRequired
+            | MountError::InvalidArgument(_)
             | MountError::InvalidPath(_) => StatusCode::BAD_REQUEST,
-            MountError::MountPathExists(_) | MountError::MountPathConflict(_) => {
-                StatusCode::CONFLICT
-            }
+            MountError::MountPathExists(_)
+            | MountError::MountPathConflict(_)
+            | MountError::StaleEntry(_) => StatusCode::CONFLICT,
+            MountError::NotFound(_) => StatusCode::NOT_FOUND,
             MountError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -67,14 +81,22 @@ impl MountError {
     pub fn from_fs_error(e: FsError) -> Self {
         let msg = e.to_string();
         match &e {
+            FsError::InvalidArgument(_) => MountError::InvalidArgument(msg),
+            FsError::InvalidPath(_) => MountError::InvalidPath(msg),
             FsError::MountPathExists(_) => MountError::MountPathExists(msg),
             FsError::MountPathConflict(_) => MountError::MountPathConflict(msg),
+            FsError::NotFound(_) => MountError::NotFound(msg),
+            FsError::StaleEntry(_) => MountError::StaleEntry(msg),
             _ => MountError::InternalError(msg),
         }
     }
 
     pub fn cv_ufs_required() -> Self {
         MountError::CvUfsRequired
+    }
+
+    pub fn namespace_required() -> Self {
+        MountError::InvalidArgument("namespace must be specified".to_string())
     }
 
     pub fn path_query_required() -> Self {

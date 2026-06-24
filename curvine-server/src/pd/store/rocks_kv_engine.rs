@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{KvPair, KvStore};
+use super::{KvPair, KvStore, KvWrite};
 use arc_swap::ArcSwap;
-use curvine_common::rocksdb::{DBConf, DBEngine};
+use curvine_common::rocksdb::{DBConf, DBEngine, WriteBatch};
 use orpc::common::{FileUtils, Utils};
 use orpc::CommonResult;
 use std::sync::Arc;
@@ -81,6 +81,18 @@ impl KvStore for RocksKvEngine {
             items.push((k.to_vec(), v.to_vec()));
         }
         Ok(items)
+    }
+
+    fn write_batch(&self, ops: Vec<KvWrite>) -> CommonResult<()> {
+        let db = self.db.load();
+        let mut batch = WriteBatch::new(&db);
+        for op in ops {
+            match op {
+                KvWrite::Put { ns, key, value } => batch.put_cf(&ns, key, value)?,
+                KvWrite::Delete { ns, key } => batch.delete_cf(&ns, key)?,
+            }
+        }
+        batch.commit()
     }
 }
 

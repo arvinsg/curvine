@@ -16,11 +16,8 @@ use crate::util::*;
 use clap::Parser;
 use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem};
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::{
-    ConsistencyStrategy, MountOptions, MountType, Provider, StorageType, TtlAction, WriteType,
-};
+use curvine_common::state::{MountOptions, MountType, Provider, WriteType};
 use curvine_common::utils::ProtoUtils;
-use orpc::common::{ByteUnit, DurationUnit};
 use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
 
@@ -44,28 +41,6 @@ pub struct MountCommand {
     #[arg(long, default_value = "cst")]
     mnt_type: String,
 
-    #[arg(long, default_value = "always")]
-    consistency_strategy: String,
-
-    #[arg(long, default_value = "7d")]
-    ttl_ms: String,
-
-    #[arg(
-        long,
-        default_value = "delete",
-        help = "TTL expiration action when file expires:\n  none - No action\n  delete - Delete file\n  persist - Export to UFS (skip if exists), keep CV cache\n  evict - Export to UFS (skip if exists), delete CV cache\n  flush - Force export to UFS (overwrite), delete CV cache"
-    )]
-    ttl_action: String,
-
-    #[arg(long)]
-    replicas: Option<i32>,
-
-    #[arg(long)]
-    block_size: Option<String>,
-
-    #[arg(short, long)]
-    storage_type: Option<String>,
-
     #[arg(
         long,
         default_value = "async_through",
@@ -78,6 +53,9 @@ pub struct MountCommand {
         help = "UFS provider: auto, oss-hdfs, opendal. Controls which implementation to use for the given scheme."
     )]
     provider: Option<String>,
+
+    #[arg(long, default_value = "default")]
+    namespace: String,
 
     #[arg(long, default_value_t = false)]
     check: bool,
@@ -244,32 +222,15 @@ impl MountCommand {
 
     pub fn to_mnt_opts(&self) -> CommonResult<MountOptions> {
         let mnt_type = MountType::try_from(self.mnt_type.as_str())?;
-        let consistency_strategy =
-            ConsistencyStrategy::try_from(self.consistency_strategy.as_str())?;
-        let ttl_ms = DurationUnit::from_str(self.ttl_ms.as_str())?.as_millis() as i64;
-        let ttl_action = TtlAction::try_from(self.ttl_action.as_str())?;
+        let write_type = WriteType::try_from(self.write_type.as_str())?;
         let conf_map = self.get_config_map()?;
 
         let mut opts = MountOptions::builder()
             .update(self.update)
             .set_properties(conf_map)
             .mount_type(mnt_type)
-            .consistency_strategy(consistency_strategy)
-            .ttl_ms(ttl_ms)
-            .ttl_action(ttl_action);
-
-        if let Some(replicas) = self.replicas {
-            opts = opts.replicas(replicas);
-        }
-        if let Some(block_size) = self.block_size.as_ref() {
-            opts = opts.block_size(ByteUnit::from_str(block_size.as_str())?.as_byte() as i64);
-        }
-        if let Some(storage_type) = self.storage_type.as_ref() {
-            opts = opts.storage_type(StorageType::try_from(storage_type.as_str())?);
-        }
-
-        let write_type = WriteType::try_from(self.write_type.as_str())?;
-        opts = opts.write_type(write_type);
+            .write_type(write_type)
+            .namespace_name(self.namespace.clone());
 
         if let Some(provider_str) = self.provider.as_ref() {
             let provider = Provider::try_from(provider_str.as_str())?;
