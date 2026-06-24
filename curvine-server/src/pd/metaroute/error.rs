@@ -16,7 +16,7 @@ use axum::http::StatusCode;
 use thiserror::Error;
 
 #[derive(Debug, Error, Clone)]
-pub enum MetaError {
+pub enum MetaRouteError {
     #[error("path must not be empty")]
     PathEmpty,
 
@@ -33,42 +33,42 @@ pub enum MetaError {
     InternalError(String),
 }
 
-impl MetaError {
+impl MetaRouteError {
     pub fn code(&self) -> &'static str {
         match self {
-            MetaError::PathEmpty | MetaError::PathRequired => "INVALID_INPUT",
-            MetaError::RouteError(_) => "ROUTE_ERROR",
-            MetaError::GroupNotFound(_) => "NOT_FOUND",
-            MetaError::InternalError(_) => "INTERNAL_ERROR",
+            MetaRouteError::PathEmpty | MetaRouteError::PathRequired => "INVALID_INPUT",
+            MetaRouteError::RouteError(_) => "ROUTE_ERROR",
+            MetaRouteError::GroupNotFound(_) => "NOT_FOUND",
+            MetaRouteError::InternalError(_) => "INTERNAL_ERROR",
         }
     }
 
     pub fn status_code(&self) -> StatusCode {
         match self {
-            MetaError::PathEmpty | MetaError::PathRequired => StatusCode::BAD_REQUEST,
-            MetaError::RouteError(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            MetaError::GroupNotFound(_) => StatusCode::NOT_FOUND,
-            MetaError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            MetaRouteError::PathEmpty | MetaRouteError::PathRequired => StatusCode::BAD_REQUEST,
+            MetaRouteError::RouteError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            MetaRouteError::GroupNotFound(_) => StatusCode::NOT_FOUND,
+            MetaRouteError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
     pub fn path_empty() -> Self {
-        MetaError::PathEmpty
+        MetaRouteError::PathEmpty
     }
 
     pub fn path_required() -> Self {
-        MetaError::PathRequired
+        MetaRouteError::PathRequired
     }
 
     pub fn route_error(e: impl ToString) -> Self {
-        MetaError::RouteError(e.to_string())
+        MetaRouteError::RouteError(e.to_string())
     }
 
     pub fn group_not_found(group_id: u64) -> Self {
-        MetaError::GroupNotFound(group_id)
+        MetaRouteError::GroupNotFound(group_id)
     }
 
     pub fn internal_error(e: impl ToString) -> Self {
-        MetaError::InternalError(e.to_string())
+        MetaRouteError::InternalError(e.to_string())
     }
 }

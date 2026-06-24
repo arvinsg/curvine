@@ -17,6 +17,6 @@ pub(crate) mod http_handler;
 mod manager;
 mod store;
 
-pub use error::MetaError;
-pub use manager::MetaManager;
-pub use store::RouteStore;
+pub use error::MetaRouteError;
+pub use manager::MetaRouteManager;
+pub use store::MetaRouteStore;

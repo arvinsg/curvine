@@ -14,7 +14,7 @@
 
 use crate::pd::http::ApiResponse;
 use crate::pd::http_handler::PdHttpHandler;
-use crate::pd::meta::MetaError;
+use crate::pd::metaroute::MetaRouteError;
 use axum::{
     extract::{Path as PathParam, Query},
     response::IntoResponse,
@@ -28,7 +28,7 @@ use std::sync::Arc;
 pub async fn get_path_route_handler(
     Extension(instance): Extension<Arc<PdHttpHandler>>,
 ) -> impl IntoResponse {
-    let mm = instance.cluster_manager.meta_manager();
+    let mm = instance.cluster_manager.metaroute_manager();
     ApiResponse::success(mm.get_path_route_table())
 }
 
@@ -44,10 +44,10 @@ pub async fn post_path_route_handler(
     Json(body): Json<AddOrUpdatePathRouteBody>,
 ) -> impl IntoResponse {
     if body.path.is_empty() {
-        let err = MetaError::path_empty();
+        let err = MetaRouteError::path_empty();
         return ApiResponse::<()>::error(err.code().into(), err.to_string(), err.status_code());
     }
-    let mm = instance.cluster_manager.meta_manager();
+    let mm = instance.cluster_manager.metaroute_manager();
     let entry = PathRouteEntry {
         path: body.path,
         group_id: body.group_id,
@@ -58,7 +58,7 @@ pub async fn post_path_route_handler(
     match mm.add_route(entry) {
         Ok(()) => ApiResponse::<()>::success_with_status_code(axum::http::StatusCode::OK),
         Err(e) => {
-            let err = MetaError::route_error(e);
+            let err = MetaRouteError::route_error(e);
             ApiResponse::<()>::error(err.code().into(), err.to_string(), err.status_code())
         }
     }
@@ -85,15 +85,15 @@ pub async fn delete_path_route_handler(
     let path = match &params.path {
         Some(p) if !p.is_empty() => p.clone(),
         _ => {
-            let err = MetaError::path_required();
+            let err = MetaRouteError::path_required();
             return ApiResponse::<()>::error(err.code().into(), err.to_string(), err.status_code());
         }
     };
-    let mm = instance.cluster_manager.meta_manager();
+    let mm = instance.cluster_manager.metaroute_manager();
     match mm.remove_route(&path) {
         Ok(()) => ApiResponse::<()>::success_with_status_code(axum::http::StatusCode::NO_CONTENT),
         Err(e) => {
-            let err = MetaError::route_error(e);
+            let err = MetaRouteError::route_error(e);
             ApiResponse::<()>::error(err.code().into(), err.to_string(), err.status_code())
         }
     }
@@ -103,7 +103,7 @@ pub async fn delete_path_route_handler(
 pub async fn list_meta_groups_handler(
     Extension(instance): Extension<Arc<PdHttpHandler>>,
 ) -> impl IntoResponse {
-    let mm = instance.cluster_manager.meta_manager();
+    let mm = instance.cluster_manager.metaroute_manager();
     ApiResponse::success(mm.get_active_groups())
 }
 
@@ -112,12 +112,12 @@ pub async fn get_meta_group_handler(
     Extension(instance): Extension<Arc<PdHttpHandler>>,
     PathParam(group_id): PathParam<u64>,
 ) -> impl IntoResponse {
-    let mm = instance.cluster_manager.meta_manager();
+    let mm = instance.cluster_manager.metaroute_manager();
     let groups = mm.get_active_groups();
     match groups.into_iter().find(|g| g.group_id == group_id) {
         Some(g) => ApiResponse::success(g),
         None => {
-            let err = crate::pd::meta::MetaError::group_not_found(group_id);
+            let err = crate::pd::metaroute::MetaRouteError::group_not_found(group_id);
             ApiResponse::<NodeGroupInfo>::error(
                 err.code().into(),
                 err.to_string(),
