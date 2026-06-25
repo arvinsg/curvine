@@ -16,7 +16,6 @@ pub mod app_storage;
 pub mod apply_outcome;
 pub mod client;
 pub mod entry;
-pub mod leader;
 
 pub use app_storage::PdAppStorage;
 pub use apply_outcome::ApplyOutcome;
@@ -26,6 +25,3 @@ pub use entry::{
     MountUpdateEntry, NamespaceCreateEntry, NodeEntry, PathRouteAddEntry, PathRouteRemoveEntry,
     PdEntry, UnMountEntry,
 };
-#[cfg(test)]
-pub use leader::AlwaysLeader;
-pub use leader::{LeaderChecker, RaftLeaderChecker};

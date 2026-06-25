@@ -12,58 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `ApplyOutcome` is the structured result returned from `apply_*` functions in
-//! every PD module. It is serialized into the `Vec<u8>` carried by Raft's
-//! `ProposeResponse.apply_result` and deserialized on the client side, so that
-//! propose callers can distinguish:
-//!
-//! - `Applied` — apply succeeded; in-memory state was mutated.
-//! - `SkippedNoop` — apply was idempotent: target state already matches; no mutation needed.
-//! - `SkippedStale` — apply rejected by CAS guard; entry is stale relative to
-//!   current state. Caller should treat as soft conflict and let upper-layer
-//!   scheduling retry on a fresh snapshot (do NOT loop in propose path).
-//! - `NotFound` — target object (pool/bg/mount/...) does not exist; entry
-//!   refers to a key that was deleted or never existed.
-//!
-//! See `docs/pd-raft-consistency.md` §17 for the design contract.
-
 use curvine_common::utils::SerdeUtils;
 use curvine_common::{FsError, FsResult};
 use serde::{Deserialize, Serialize};
 
 /// Structured result of a single `apply_*` invocation in PD modules.
-///
-/// Wire format: serialized via `SerdeUtils` and carried in
-/// `ProposeResponse.apply_result`. An empty byte slice on the wire is
-/// interpreted as `Applied` for forward compatibility with leaders that
-/// have not been upgraded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApplyOutcome {
-    /// Apply succeeded; in-memory state was mutated.
+    /// Apply succeeded.
     Applied,
 
     /// Apply was a no-op because the target state already matches the entry.
     /// Caller should treat this as success (idempotent).
     SkippedNoop,
 
-    /// Apply was rejected by an explicit CAS guard (epoch / version / state
-    /// mismatch). The entry is stale; do not loop in the propose path.
+    /// Apply was rejected by an explicit CAS guard (epoch / version / state mismatch).
     SkippedStale { reason: String },
 
-    /// Target object does not exist. The entry refers to a key that was
-    /// deleted or never existed.
+    /// Target object does not exist.
     NotFound { reason: String },
 }
 
 impl ApplyOutcome {
-    /// Convenience constructor for stale outcomes.
     pub fn stale(reason: impl Into<String>) -> Self {
         Self::SkippedStale {
             reason: reason.into(),
         }
     }
 
-    /// Convenience constructor for not-found outcomes.
     pub fn not_found(reason: impl Into<String>) -> Self {
         Self::NotFound {
             reason: reason.into(),
@@ -75,13 +51,12 @@ impl ApplyOutcome {
         matches!(self, ApplyOutcome::Applied | ApplyOutcome::SkippedNoop)
     }
 
-    /// Serialize to bytes for Raft `ProposeResponse.apply_result`.
+    /// Serialize to bytes for Raft.
     pub fn encode(&self) -> FsResult<Vec<u8>> {
         SerdeUtils::serialize(self).map_err(Into::into)
     }
 
-    /// Decode from `ProposeResponse.apply_result` bytes. An empty slice is
-    /// interpreted as `Applied` for forward compatibility with un-upgraded leaders.
+    /// Decode from `ProposeResponse.apply_result` bytes.
     pub fn decode(bytes: &[u8]) -> FsResult<Self> {
         if bytes.is_empty() {
             return Ok(ApplyOutcome::Applied);
@@ -90,14 +65,7 @@ impl ApplyOutcome {
     }
 
     /// Convert this outcome into a propose-path `Result`. Successful outcomes
-    /// (Applied / SkippedNoop) become `Ok(())`; conflict outcomes become typed
-    /// `FsError`. Use this in propose paths that follow the §17 template:
-    ///
-    /// ```ignore
-    /// match journal_client.propose_with_result(entry)? {
-    ///     outcome => outcome.into_propose_result("save_pool")?,
-    /// }
-    /// ```
+    /// (Applied / SkippedNoop) become `Ok(())`.
     pub fn into_propose_result(self, kind: &str) -> FsResult<()> {
         match self {
             ApplyOutcome::Applied | ApplyOutcome::SkippedNoop => Ok(()),

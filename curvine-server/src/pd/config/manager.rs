@@ -245,7 +245,7 @@ impl ConfigManager {
         let key = entry.info.key.clone();
         let outcome = self
             .journal_client
-            .propose_as_leader_with_result(PdEntry::SetConfig(entry))?;
+            .propose(PdEntry::SetConfig(entry))?;
         match outcome {
             ApplyOutcome::Applied | ApplyOutcome::SkippedNoop => Ok(SetConfigResponse {
                 success: true,
