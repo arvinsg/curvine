@@ -526,16 +526,12 @@ impl ProtoUtils {
             cv_path: info.cv_path,
             ufs_path: info.ufs_path,
             mount_id: info.mount_id,
+            namespace_id: info.namespace_id as u32,
             properties: info.properties,
-            ttl_ms: info.ttl_ms,
-            ttl_action: info.ttl_action.into(),
-            consistency_strategy: info.consistency_strategy.into(),
-            storage_type: info.storage_type.map(|v| v.into()),
-            block_size: info.block_size,
-            replicas: info.replicas,
             mount_type: info.mount_type.into(),
             write_type: info.write_type.into(),
             provider: info.provider.map(|v| v.into()),
+            version: Some(info.version),
         }
     }
 
@@ -544,16 +540,12 @@ impl ProtoUtils {
             cv_path: info.cv_path,
             ufs_path: info.ufs_path,
             mount_id: info.mount_id,
+            namespace_id: info.namespace_id as NamespaceId,
             properties: info.properties,
-            ttl_ms: info.ttl_ms,
-            ttl_action: info.ttl_action.into(),
-            consistency_strategy: info.consistency_strategy.into(),
-            storage_type: info.storage_type.map(|x| x.into()),
-            block_size: info.block_size,
-            replicas: info.replicas,
             mount_type: info.mount_type.into(),
             write_type: WriteType::from(info.write_type),
             provider: info.provider.map(|x| x.into()),
+            version: info.version.unwrap_or_default(),
         }
     }
 
@@ -561,16 +553,11 @@ impl ProtoUtils {
         MountOptionsProto {
             update: opts.update,
             add_properties: opts.add_properties,
-            ttl_ms: opts.ttl_ms,
-            ttl_action: opts.ttl_action.map(|v| v.into()),
-            consistency_strategy: opts.consistency_strategy.map(|v| v.into()),
-            storage_type: opts.storage_type.map(|v| v.into()),
-            block_size: opts.block_size,
-            replicas: opts.replicas,
             mount_type: opts.mount_type.into(),
             remove_properties: opts.remove_properties,
             write_type: opts.write_type.into(),
             provider: opts.provider.map(|v| v.into()),
+            namespace_name: opts.namespace_name,
         }
     }
 
@@ -578,16 +565,11 @@ impl ProtoUtils {
         MountOptions {
             update: opts.update,
             add_properties: opts.add_properties,
-            ttl_ms: opts.ttl_ms,
-            ttl_action: opts.ttl_action.map(TtlAction::from),
-            consistency_strategy: opts.consistency_strategy.map(ConsistencyStrategy::from),
-            storage_type: opts.storage_type.map(StorageType::from),
-            block_size: opts.block_size,
-            replicas: opts.replicas,
             mount_type: MountType::from(opts.mount_type),
             remove_properties: opts.remove_properties,
             write_type: opts.write_type.into(),
             provider: opts.provider.map(Provider::from),
+            namespace_name: opts.namespace_name,
         }
     }
 
@@ -750,20 +732,22 @@ impl ProtoUtils {
     pub fn replica_state_to_pb(s: ReplicaState) -> i32 {
         match s {
             ReplicaState::Pending => 0,
-            ReplicaState::Syncing => 1,
-            ReplicaState::Active => 2,
-            ReplicaState::Lost => 3,
-            ReplicaState::Offline => 4,
+            ReplicaState::Recovering => 1,
+            ReplicaState::Syncing => 2,
+            ReplicaState::Active => 3,
+            ReplicaState::Sealed => 4,
+            ReplicaState::Draining => 5,
         }
     }
 
     pub fn replica_state_from_pb(v: i32) -> FsResult<ReplicaState> {
         match v {
             0 => Ok(ReplicaState::Pending),
-            1 => Ok(ReplicaState::Syncing),
-            2 => Ok(ReplicaState::Active),
-            3 => Ok(ReplicaState::Lost),
-            4 => Ok(ReplicaState::Offline),
+            1 => Ok(ReplicaState::Recovering),
+            2 => Ok(ReplicaState::Syncing),
+            3 => Ok(ReplicaState::Active),
+            4 => Ok(ReplicaState::Sealed),
+            5 => Ok(ReplicaState::Draining),
             _ => Err(Self::invalid_proto(format!("unknown replica_state={}", v))),
         }
     }
@@ -775,7 +759,7 @@ impl ProtoUtils {
             BGState::Active => 2,
             BGState::Degraded => 3,
             BGState::Recovering => 4,
-            BGState::Rebalancing => 5,
+            BGState::Sealed => 5,
             BGState::Deleting => 6,
         }
     }
@@ -787,7 +771,7 @@ impl ProtoUtils {
             2 => Ok(BGState::Active),
             3 => Ok(BGState::Degraded),
             4 => Ok(BGState::Recovering),
-            5 => Ok(BGState::Rebalancing),
+            5 => Ok(BGState::Sealed),
             6 => Ok(BGState::Deleting),
             _ => Err(Self::invalid_proto(format!("unknown bg_state={}", v))),
         }
@@ -796,21 +780,38 @@ impl ProtoUtils {
     pub fn bg_op_state_to_pb(s: BGOpState) -> i32 {
         match s {
             BGOpState::Idle => 0,
-            BGOpState::Recovering => 1,
+            BGOpState::Repairing => 1,
             BGOpState::Rebalancing => 2,
-            BGOpState::LeaseBalancing => 3,
-            BGOpState::Deleting => 4,
+            BGOpState::PrimaryTransfer => 3,
+            BGOpState::Sealing => 4,
+            BGOpState::Deleting => 5,
         }
     }
 
     pub fn bg_op_state_from_pb(v: i32) -> FsResult<BGOpState> {
         match v {
             0 => Ok(BGOpState::Idle),
-            1 => Ok(BGOpState::Recovering),
+            1 => Ok(BGOpState::Repairing),
             2 => Ok(BGOpState::Rebalancing),
-            3 => Ok(BGOpState::LeaseBalancing),
-            4 => Ok(BGOpState::Deleting),
+            3 => Ok(BGOpState::PrimaryTransfer),
+            4 => Ok(BGOpState::Sealing),
+            5 => Ok(BGOpState::Deleting),
             _ => Err(Self::invalid_proto(format!("unknown bg_op_state={}", v))),
+        }
+    }
+
+    pub fn bg_kind_to_pb(kind: BGKind) -> u32 {
+        match kind {
+            BGKind::Hash => 0,
+            BGKind::Capacity => 1,
+        }
+    }
+
+    pub fn bg_kind_from_pb(v: u32) -> FsResult<BGKind> {
+        match v {
+            0 => Ok(BGKind::Hash),
+            1 => Ok(BGKind::Capacity),
+            _ => Err(Self::invalid_proto(format!("unknown bg_kind={}", v))),
         }
     }
 
@@ -994,6 +995,8 @@ impl ProtoUtils {
             bg_id: report.bg_id,
             state: Self::replica_state_to_pb(report.state),
             stats: Some(Self::bg_stats_to_pb(&report.stats)),
+            isr_remove_candidates: report.isr_remove_candidates.clone(),
+            primary_unhealthy: Some(report.primary_unhealthy),
         }
     }
 
@@ -1002,6 +1005,8 @@ impl ProtoUtils {
             bg_id: report.bg_id,
             state: Self::replica_state_from_pb(report.state)?,
             stats: report.stats.map(Self::bg_stats_from_pb).unwrap_or_default(),
+            isr_remove_candidates: report.isr_remove_candidates,
+            primary_unhealthy: report.primary_unhealthy.unwrap_or(false),
         })
     }
 
@@ -1320,19 +1325,19 @@ impl ProtoUtils {
         })
     }
 
-    pub fn bg_lease_to_pb(lease: &BGLease) -> BgLeaseProto {
-        BgLeaseProto {
-            node_id: lease.node_id,
-            epoch: lease.epoch,
-            grant_time_ms: lease.grant_time_ms,
+    pub fn bg_primary_to_pb(primary: &BGPrimary) -> BgPrimaryProto {
+        BgPrimaryProto {
+            node_id: primary.node_id,
+            epoch: primary.epoch,
+            grant_time_ms: primary.grant_time_ms,
         }
     }
 
-    pub fn bg_lease_from_pb(lease: BgLeaseProto) -> BGLease {
-        BGLease {
-            node_id: lease.node_id,
-            epoch: lease.epoch,
-            grant_time_ms: lease.grant_time_ms,
+    pub fn bg_primary_from_pb(primary: BgPrimaryProto) -> BGPrimary {
+        BGPrimary {
+            node_id: primary.node_id,
+            epoch: primary.epoch,
+            grant_time_ms: primary.grant_time_ms,
         }
     }
 
@@ -1357,24 +1362,30 @@ impl ProtoUtils {
     pub fn block_group_info_to_pb(bg: &BlockGroupInfo) -> BlockGroupInfoProto {
         BlockGroupInfoProto {
             bg_id: bg.bg_id,
-            table_id: bg.table_id,
+            table_id: bg.table_id as u32,
             bg_epoch: bg.bg_epoch,
             replica_set: bg.replica_set.clone(),
             state: Self::bg_state_to_pb(bg.state),
             op_state: Self::bg_op_state_to_pb(bg.op_state),
-            lease_owner: bg.lease_owner.as_ref().map(Self::bg_lease_to_pb),
+            primary: bg.primary.as_ref().map(Self::bg_primary_to_pb),
+            kind: Self::bg_kind_to_pb(bg.kind),
+            isr: bg.isr.clone(),
         }
     }
 
     pub fn block_group_info_from_pb(bg: BlockGroupInfoProto) -> FsResult<BlockGroupInfo> {
         Ok(BlockGroupInfo {
             bg_id: bg.bg_id,
-            table_id: bg.table_id,
+            table_id: u16::try_from(bg.table_id).map_err(|_| {
+                Self::invalid_proto(format!("table_id out of range: {}", bg.table_id))
+            })?,
+            kind: Self::bg_kind_from_pb(bg.kind)?,
             bg_epoch: bg.bg_epoch,
             replica_set: bg.replica_set,
+            isr: bg.isr,
             state: Self::bg_state_from_pb(bg.state)?,
             op_state: Self::bg_op_state_from_pb(bg.op_state)?,
-            lease_owner: bg.lease_owner.map(Self::bg_lease_from_pb),
+            primary: bg.primary.map(Self::bg_primary_from_pb),
             stats: Default::default(),
         })
     }
@@ -1382,7 +1393,7 @@ impl ProtoUtils {
     pub fn block_group_info_view_to_pb(bg: &BlockGroupInfoView) -> BlockGroupInfoViewProto {
         BlockGroupInfoViewProto {
             bg_id: bg.bg_id,
-            table_id: bg.table_id,
+            table_id: bg.table_id as u32,
             bg_epoch: bg.bg_epoch,
             replica_set: bg
                 .replica_set
@@ -1391,7 +1402,9 @@ impl ProtoUtils {
                 .collect(),
             state: Self::bg_state_to_pb(bg.state),
             op_state: Self::bg_op_state_to_pb(bg.op_state),
-            lease_owner: bg.lease_owner.as_ref().map(Self::bg_lease_to_pb),
+            primary: bg.primary.as_ref().map(Self::bg_primary_to_pb),
+            kind: Self::bg_kind_to_pb(bg.kind),
+            isr: bg.isr.clone(),
         }
     }
 
@@ -1404,48 +1417,136 @@ impl ProtoUtils {
         }
         Ok(BlockGroupInfoView {
             bg_id: bg.bg_id,
-            table_id: bg.table_id,
+            table_id: u16::try_from(bg.table_id).map_err(|_| {
+                Self::invalid_proto(format!("table_id out of range: {}", bg.table_id))
+            })?,
+            kind: Self::bg_kind_from_pb(bg.kind)?,
             bg_epoch: bg.bg_epoch,
             replica_set: replicas,
+            isr: bg.isr,
             state: Self::bg_state_from_pb(bg.state)?,
             op_state: Self::bg_op_state_from_pb(bg.op_state)?,
-            lease_owner: bg.lease_owner.map(Self::bg_lease_from_pb),
+            primary: bg.primary.map(Self::bg_primary_from_pb),
+        })
+    }
+
+    pub fn block_group_route_view_to_pb(bg: &BlockGroupRouteView) -> BlockGroupRouteViewProto {
+        BlockGroupRouteViewProto {
+            bg_id: bg.bg_id,
+            table_id: bg.table_id as u32,
+            bg_epoch: bg.bg_epoch,
+            serving_replicas: bg
+                .serving_replicas
+                .iter()
+                .map(Self::replica_info_to_pb)
+                .collect(),
+            state: Self::bg_state_to_pb(bg.state),
+            primary: bg.primary.as_ref().map(Self::bg_primary_to_pb),
+            kind: Self::bg_kind_to_pb(bg.kind),
+        }
+    }
+
+    pub fn block_group_route_view_from_pb(
+        bg: BlockGroupRouteViewProto,
+    ) -> FsResult<BlockGroupRouteView> {
+        let mut serving_replicas = Vec::with_capacity(bg.serving_replicas.len());
+        for replica in bg.serving_replicas {
+            serving_replicas.push(Self::replica_info_from_pb(replica)?);
+        }
+        Ok(BlockGroupRouteView {
+            bg_id: bg.bg_id,
+            table_id: u16::try_from(bg.table_id).map_err(|_| {
+                Self::invalid_proto(format!("table_id out of range: {}", bg.table_id))
+            })?,
+            kind: Self::bg_kind_from_pb(bg.kind)?,
+            bg_epoch: bg.bg_epoch,
+            serving_replicas,
+            state: Self::bg_state_from_pb(bg.state)?,
+            primary: bg.primary.map(Self::bg_primary_from_pb),
         })
     }
 
     pub fn bg_table_summary_to_pb(summary: &BGTableSummary) -> BgTableSummaryProto {
-        BgTableSummaryProto {
-            table_id: summary.table_id,
-            bucket_count: summary.bucket_count,
-            epoch: summary.epoch,
-            last_rebuild_ms: summary.last_rebuild_ms,
-            buckets: summary
-                .buckets
-                .iter()
-                .map(Self::block_group_info_view_to_pb)
-                .collect(),
-            pool_type: summary.pool_type.code() as u32,
-            replica_count: summary.replica_count as u32,
+        match summary {
+            BGTableSummary::Hash(s) => BgTableSummaryProto {
+                table_id: s.table_id as u32,
+                bucket_count: s.bucket_count,
+                epoch: s.epoch,
+                last_rebuild_ms: s.last_rebuild_ms,
+                buckets: s
+                    .buckets
+                    .iter()
+                    .map(Self::block_group_route_view_to_pb)
+                    .collect(),
+                pool_type: s.pool_type.code() as u32,
+                replica_count: s.replica_count as u32,
+                kind: Self::bg_kind_to_pb(BGKind::Hash),
+                active_bgs: vec![],
+                cache_replica_policy: Some(Self::cache_replica_policy_to_pb(
+                    &s.cache_replica_policy,
+                )),
+            },
+            BGTableSummary::Capacity(s) => BgTableSummaryProto {
+                table_id: s.table_id as u32,
+                bucket_count: 0,
+                epoch: s.epoch,
+                last_rebuild_ms: 0,
+                buckets: vec![],
+                pool_type: s.pool_type.code() as u32,
+                replica_count: s.replica_count as u32,
+                kind: Self::bg_kind_to_pb(BGKind::Capacity),
+                active_bgs: s
+                    .active_bgs
+                    .iter()
+                    .map(Self::block_group_route_view_to_pb)
+                    .collect(),
+                cache_replica_policy: None,
+            },
         }
     }
 
     pub fn bg_table_summary_from_pb(summary: BgTableSummaryProto) -> FsResult<BGTableSummary> {
-        let mut buckets = Vec::with_capacity(summary.buckets.len());
-        for bucket in summary.buckets {
-            buckets.push(Self::block_group_info_view_from_pb(bucket)?);
-        }
         let pool_type = PoolType::from_code(summary.pool_type as u16).ok_or_else(|| {
             Self::invalid_proto(format!("unknown pool_type={}", summary.pool_type))
         })?;
-        Ok(BGTableSummary {
-            table_id: summary.table_id,
-            pool_type,
-            replica_count: summary.replica_count as u16,
-            bucket_count: summary.bucket_count,
-            epoch: summary.epoch,
-            last_rebuild_ms: summary.last_rebuild_ms,
-            buckets,
-        })
+        let table_id = u16::try_from(summary.table_id).map_err(|_| {
+            Self::invalid_proto(format!("table_id out of range: {}", summary.table_id))
+        })?;
+        match Self::bg_kind_from_pb(summary.kind)? {
+            BGKind::Hash => {
+                let mut buckets = Vec::with_capacity(summary.buckets.len());
+                for bucket in summary.buckets {
+                    buckets.push(Self::block_group_route_view_from_pb(bucket)?);
+                }
+                Ok(BGTableSummary::Hash(HashBGTableSummary {
+                    table_id,
+                    pool_type,
+                    replica_count: summary.replica_count as u16,
+                    bucket_count: summary.bucket_count,
+                    epoch: summary.epoch,
+                    last_rebuild_ms: summary.last_rebuild_ms,
+                    cache_replica_policy: summary
+                        .cache_replica_policy
+                        .map(Self::cache_replica_policy_from_pb)
+                        .transpose()?
+                        .unwrap_or_default(),
+                    buckets,
+                }))
+            }
+            BGKind::Capacity => {
+                let mut active_bgs = Vec::with_capacity(summary.active_bgs.len());
+                for bg in summary.active_bgs {
+                    active_bgs.push(Self::block_group_route_view_from_pb(bg)?);
+                }
+                Ok(BGTableSummary::Capacity(CapacityBGTableSummary {
+                    table_id,
+                    pool_type,
+                    replica_count: summary.replica_count as u16,
+                    epoch: summary.epoch,
+                    active_bgs,
+                }))
+            }
+        }
     }
 
     pub fn worker_heartbeat_response_to_pb(
@@ -1499,7 +1600,6 @@ impl ProtoUtils {
             group_id: entry.group_id,
             create_time_ms: entry.create_time_ms,
             update_time_ms: entry.update_time_ms,
-            expected_table_version: 0,
         }
     }
 
@@ -1676,7 +1776,11 @@ impl ProtoUtils {
             error: resp.error.clone(),
             epoch: resp.epoch,
             mount_version: resp.mount_version,
-            table_epochs: resp.table_epochs.clone(),
+            table_epochs: resp
+                .table_epochs
+                .iter()
+                .map(|(k, v)| (*k as u32, *v))
+                .collect(),
             worker,
             meta,
             task,
@@ -1709,7 +1813,16 @@ impl ProtoUtils {
             error: resp.error,
             epoch: resp.epoch,
             mount_version: resp.mount_version,
-            table_epochs: resp.table_epochs,
+            table_epochs: resp
+                .table_epochs
+                .into_iter()
+                .map(|(k, v)| {
+                    let key = u16::try_from(k).map_err(|_| {
+                        Self::invalid_proto(format!("table_id out of range: {}", k))
+                    })?;
+                    Ok((key, v))
+                })
+                .collect::<FsResult<_>>()?,
             payload,
         })
     }
@@ -1722,6 +1835,259 @@ impl ProtoUtils {
 
     pub fn register_response_from_pb(resp: NodeRegisterResponse) -> FsResult<HeartbeatResponse> {
         Self::heartbeat_response_from_pb(resp.response)
+    }
+
+    pub fn label_match_to_pb(label: &LabelMatch) -> LabelMatchProto {
+        LabelMatchProto {
+            key: label.key.clone(),
+            value: label.value.clone(),
+        }
+    }
+
+    pub fn label_match_from_pb(label: LabelMatchProto) -> LabelMatch {
+        LabelMatch {
+            key: label.key,
+            value: label.value,
+        }
+    }
+
+    pub fn pool_type_to_pb(pool: PoolType) -> String {
+        pool.as_str().to_string()
+    }
+
+    pub fn pool_type_from_pb(pool: &str) -> FsResult<PoolType> {
+        PoolType::try_from(pool).map_err(|e| FsError::common(e.to_string()))
+    }
+
+    pub fn cache_ack_policy_to_pb(policy: &CacheAckPolicy) -> (i32, Option<u32>) {
+        match policy {
+            CacheAckPolicy::One => (CacheAckPolicyProto::One as i32, None),
+            CacheAckPolicy::Majority => (CacheAckPolicyProto::Majority as i32, None),
+            CacheAckPolicy::AtLeast(n) => (CacheAckPolicyProto::AtLeast as i32, Some(*n as u32)),
+        }
+    }
+
+    pub fn cache_ack_policy_from_pb(
+        policy: i32,
+        at_least: Option<u32>,
+    ) -> FsResult<CacheAckPolicy> {
+        match policy {
+            x if x == CacheAckPolicyProto::One as i32 => Ok(CacheAckPolicy::One),
+            x if x == CacheAckPolicyProto::Majority as i32 => Ok(CacheAckPolicy::Majority),
+            x if x == CacheAckPolicyProto::AtLeast as i32 => {
+                let n = at_least.ok_or_else(|| {
+                    Self::invalid_proto("cache ack policy AtLeast requires at_least".to_string())
+                })?;
+                if n == 0 || n > u16::MAX as u32 {
+                    return Err(Self::invalid_proto(format!(
+                        "cache ack at_least out of range: {}",
+                        n
+                    )));
+                }
+                Ok(CacheAckPolicy::AtLeast(n as u16))
+            }
+            _ => Err(Self::invalid_proto(format!(
+                "unknown cache_ack_policy={}",
+                policy
+            ))),
+        }
+    }
+
+    pub fn cache_read_policy_to_pb(policy: &CacheReadPolicy) -> i32 {
+        match policy {
+            CacheReadPolicy::LocalFirst => CacheReadPolicyProto::LocalFirst as i32,
+            CacheReadPolicy::PrimaryFirst => CacheReadPolicyProto::PrimaryFirst as i32,
+            CacheReadPolicy::Random => CacheReadPolicyProto::Random as i32,
+        }
+    }
+
+    pub fn cache_read_policy_from_pb(policy: i32) -> FsResult<CacheReadPolicy> {
+        match policy {
+            x if x == CacheReadPolicyProto::LocalFirst as i32 => Ok(CacheReadPolicy::LocalFirst),
+            x if x == CacheReadPolicyProto::PrimaryFirst as i32 => {
+                Ok(CacheReadPolicy::PrimaryFirst)
+            }
+            x if x == CacheReadPolicyProto::Random as i32 => Ok(CacheReadPolicy::Random),
+            _ => Err(Self::invalid_proto(format!(
+                "unknown cache_read_policy={}",
+                policy
+            ))),
+        }
+    }
+
+    pub fn cache_replica_policy_to_pb(policy: &CacheReplicaPolicy) -> CacheReplicaPolicyProto {
+        let (ack_policy, at_least) = Self::cache_ack_policy_to_pb(&policy.ack_policy);
+        CacheReplicaPolicyProto {
+            ack_policy,
+            read_policy: Self::cache_read_policy_to_pb(&policy.read_policy),
+            min_isr: policy.min_isr as u32,
+            at_least,
+        }
+    }
+
+    pub fn cache_replica_policy_from_pb(
+        policy: CacheReplicaPolicyProto,
+    ) -> FsResult<CacheReplicaPolicy> {
+        if policy.min_isr == 0 || policy.min_isr > u16::MAX as u32 {
+            return Err(Self::invalid_proto(format!(
+                "cache min_isr out of range: {}",
+                policy.min_isr
+            )));
+        }
+        Ok(CacheReplicaPolicy {
+            ack_policy: Self::cache_ack_policy_from_pb(policy.ack_policy, policy.at_least)?,
+            read_policy: Self::cache_read_policy_from_pb(policy.read_policy)?,
+            min_isr: policy.min_isr as u16,
+        })
+    }
+
+    pub fn cache_tier_config_to_pb(config: &CacheTierConfig) -> CacheTierConfigProto {
+        CacheTierConfigProto {
+            pools: config
+                .pools
+                .iter()
+                .copied()
+                .map(Self::pool_type_to_pb)
+                .collect(),
+            replica_count: config.replica_count as u32,
+            bucket_count: config.bucket_count,
+            worker_labels: config
+                .worker_labels
+                .iter()
+                .map(Self::label_match_to_pb)
+                .collect(),
+        }
+    }
+
+    pub fn cache_tier_config_from_pb(config: CacheTierConfigProto) -> FsResult<CacheTierConfig> {
+        let mut pools = Vec::with_capacity(config.pools.len());
+        for pool in config.pools {
+            pools.push(Self::pool_type_from_pb(&pool)?);
+        }
+        Ok(CacheTierConfig {
+            pools,
+            replica_count: config.replica_count as u16,
+            bucket_count: config.bucket_count,
+            worker_labels: config
+                .worker_labels
+                .into_iter()
+                .map(Self::label_match_from_pb)
+                .collect(),
+        })
+    }
+
+    pub fn write_buffer_config_to_pb(config: &WriteBufferConfig) -> WriteBufferConfigProto {
+        WriteBufferConfigProto {
+            pool: Self::pool_type_to_pb(config.pool),
+            replica_count: config.replica_count as u32,
+            capacity_bg_size: config.capacity_bg_size,
+            min_active_bgs: config.min_active_bgs,
+            worker_labels: config
+                .worker_labels
+                .iter()
+                .map(Self::label_match_to_pb)
+                .collect(),
+        }
+    }
+
+    pub fn write_buffer_config_from_pb(
+        config: WriteBufferConfigProto,
+    ) -> FsResult<WriteBufferConfig> {
+        Ok(WriteBufferConfig {
+            pool: Self::pool_type_from_pb(&config.pool)?,
+            replica_count: config.replica_count as u16,
+            capacity_bg_size: config.capacity_bg_size,
+            min_active_bgs: config.min_active_bgs,
+            worker_labels: config
+                .worker_labels
+                .into_iter()
+                .map(Self::label_match_from_pb)
+                .collect(),
+        })
+    }
+
+    pub fn namespace_info_to_pb(info: &NamespaceInfo) -> NamespaceInfoProto {
+        NamespaceInfoProto {
+            id: info.id as u32,
+            name: info.name.clone(),
+            block_size: info.block_size,
+            cache_tier_tables: info.cache_tier_tables.iter().map(|id| *id as u32).collect(),
+            write_buffer_table: info.write_buffer_table.map(|id| id as u32),
+            cache_tier_config: Self::cache_tier_config_to_pb(&info.cache_tier_config),
+            write_buffer_config: info
+                .write_buffer_config
+                .as_ref()
+                .map(Self::write_buffer_config_to_pb),
+            cache_replica_policy: Self::cache_replica_policy_to_pb(&info.cache_replica_policy),
+            default_ttl_ms: info.default_ttl_ms,
+            ttl_action: info.ttl_action.into(),
+            version: info.version,
+            create_time_ms: info.create_time_ms,
+            update_time_ms: info.update_time_ms,
+            properties: info.properties.clone(),
+        }
+    }
+
+    pub fn namespace_info_from_pb(info: NamespaceInfoProto) -> FsResult<NamespaceInfo> {
+        Ok(NamespaceInfo {
+            id: info.id as NamespaceId,
+            name: info.name,
+            block_size: info.block_size,
+            cache_tier_tables: info
+                .cache_tier_tables
+                .into_iter()
+                .map(|id| id as TableId)
+                .collect(),
+            write_buffer_table: info.write_buffer_table.map(|id| id as TableId),
+            cache_tier_config: Self::cache_tier_config_from_pb(info.cache_tier_config)?,
+            write_buffer_config: info
+                .write_buffer_config
+                .map(Self::write_buffer_config_from_pb)
+                .transpose()?,
+            cache_replica_policy: Self::cache_replica_policy_from_pb(info.cache_replica_policy)?,
+            default_ttl_ms: info.default_ttl_ms,
+            ttl_action: info.ttl_action.into(),
+            version: info.version,
+            create_time_ms: info.create_time_ms,
+            update_time_ms: info.update_time_ms,
+            properties: info.properties,
+        })
+    }
+
+    pub fn create_namespace_request_to_pb(
+        request: &CreateNamespaceRequest,
+    ) -> CreateNamespaceRequestProto {
+        CreateNamespaceRequestProto {
+            name: request.name.clone(),
+            block_size: request.block_size,
+            cache_tier_config: Self::cache_tier_config_to_pb(&request.cache_tier_config),
+            write_buffer_config: request
+                .write_buffer_config
+                .as_ref()
+                .map(Self::write_buffer_config_to_pb),
+            cache_replica_policy: Self::cache_replica_policy_to_pb(&request.cache_replica_policy),
+            default_ttl_ms: request.default_ttl_ms,
+            ttl_action: request.ttl_action.into(),
+            properties: request.properties.clone(),
+        }
+    }
+
+    pub fn create_namespace_request_from_pb(
+        request: CreateNamespaceRequestProto,
+    ) -> FsResult<CreateNamespaceRequest> {
+        Ok(CreateNamespaceRequest {
+            name: request.name,
+            block_size: request.block_size,
+            cache_tier_config: Self::cache_tier_config_from_pb(request.cache_tier_config)?,
+            write_buffer_config: request
+                .write_buffer_config
+                .map(Self::write_buffer_config_from_pb)
+                .transpose()?,
+            cache_replica_policy: Self::cache_replica_policy_from_pb(request.cache_replica_policy)?,
+            default_ttl_ms: request.default_ttl_ms,
+            ttl_action: request.ttl_action.into(),
+            properties: request.properties,
+        })
     }
 
     pub fn meta_route_summary_to_pb(summary: &MetaRouteSummary) -> MetaRouteSummaryProto {
@@ -1849,6 +2215,7 @@ mod pd_proto_utils_tests {
                         block_count: 3,
                         last_report_ms: 4,
                     },
+                    ..Default::default()
                 }],
             }),
         }
@@ -1991,11 +2358,13 @@ mod pd_proto_utils_tests {
                 add_bgs: vec![BlockGroupInfo {
                     bg_id: 7,
                     table_id: 1,
+                    kind: crate::state::BGKind::Hash,
                     bg_epoch: 9,
                     replica_set: vec![10],
+                    isr: vec![10],
                     state: BGState::Active,
                     op_state: BGOpState::Idle,
-                    lease_owner: None,
+                    primary: None,
                     stats: Default::default(),
                 }],
                 remove_bgs: vec![8],
@@ -2014,6 +2383,57 @@ mod pd_proto_utils_tests {
             }
             _ => panic!("expected worker response"),
         }
+    }
+
+    #[test]
+    fn namespace_proto_round_trip() {
+        let mut properties = HashMap::new();
+        properties.insert("owner".to_string(), "test".to_string());
+        let req = CreateNamespaceRequest {
+            name: "ns1".to_string(),
+            block_size: 4 * 1024 * 1024,
+            cache_tier_config: CacheTierConfig {
+                pools: vec![PoolType::Ssd, PoolType::Hdd],
+                replica_count: 2,
+                bucket_count: 64,
+                worker_labels: vec![LabelMatch {
+                    key: "rack".to_string(),
+                    value: "r1".to_string(),
+                }],
+            },
+            write_buffer_config: None,
+            cache_replica_policy: CacheReplicaPolicy::default(),
+            default_ttl_ms: Some(3600),
+            ttl_action: TtlAction::Delete,
+            properties: properties.clone(),
+        };
+
+        let decoded_req = ProtoUtils::create_namespace_request_from_pb(
+            ProtoUtils::create_namespace_request_to_pb(&req),
+        )
+        .expect("round trip create namespace request");
+        assert_eq!(decoded_req, req);
+
+        let info = NamespaceInfo {
+            id: 1,
+            name: req.name.clone(),
+            block_size: req.block_size,
+            cache_tier_tables: vec![16, 17],
+            write_buffer_table: None,
+            cache_tier_config: req.cache_tier_config.clone(),
+            write_buffer_config: None,
+            cache_replica_policy: CacheReplicaPolicy::default(),
+            default_ttl_ms: req.default_ttl_ms,
+            ttl_action: req.ttl_action,
+            version: 1,
+            create_time_ms: 100,
+            update_time_ms: 200,
+            properties,
+        };
+        let decoded_info =
+            ProtoUtils::namespace_info_from_pb(ProtoUtils::namespace_info_to_pb(&info))
+                .expect("round trip namespace info");
+        assert_eq!(decoded_info, info);
     }
 
     #[test]

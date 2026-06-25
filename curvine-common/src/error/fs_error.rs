@@ -62,6 +62,7 @@ pub enum ErrorKind {
     MountPathConflict = 25,
     StaleEntry = 26,
     NotFound = 27,
+    InvalidArgument = 28,
 
     #[num_enum(default)]
     Common = 10000,
@@ -178,6 +179,10 @@ pub enum FsError {
     #[error("{0}")]
     NotFound(ErrorImpl<StringError>),
 
+    // Caller provided an invalid argument.
+    #[error("{0}")]
+    InvalidArgument(ErrorImpl<StringError>),
+
     // Other errors that are not defined.
     #[error("{0}")]
     Common(ErrorImpl<StringError>),
@@ -257,6 +262,10 @@ impl FsError {
         Self::NotFound(ErrorImpl::with_source(msg.into().into()))
     }
 
+    pub fn invalid_argument(msg: impl Into<String>) -> Self {
+        Self::InvalidArgument(ErrorImpl::with_source(msg.into().into()))
+    }
+
     pub fn file_exists(path: impl AsRef<str>) -> Self {
         let msg = format!("{}  already exists", path.as_ref());
         Self::FileAlreadyExists(ErrorImpl::with_source(msg.into()))
@@ -328,6 +337,7 @@ impl FsError {
             FsError::MountPathConflict(_) => ErrorKind::MountPathConflict,
             FsError::StaleEntry(_) => ErrorKind::StaleEntry,
             FsError::NotFound(_) => ErrorKind::NotFound,
+            FsError::InvalidArgument(_) => ErrorKind::InvalidArgument,
             FsError::Common(_) => ErrorKind::Common,
         }
     }
@@ -446,6 +456,7 @@ impl ErrorExt for FsError {
             FsError::MountPathConflict(e) => FsError::MountPathConflict(e.ctx(ctx)),
             FsError::StaleEntry(e) => FsError::StaleEntry(e.ctx(ctx)),
             FsError::NotFound(e) => FsError::NotFound(e.ctx(ctx)),
+            FsError::InvalidArgument(e) => FsError::InvalidArgument(e.ctx(ctx)),
             FsError::Common(e) => FsError::Common(e.ctx(ctx)),
         }
     }
@@ -479,6 +490,7 @@ impl ErrorExt for FsError {
             FsError::MountPathConflict(e) => e.encode(ErrorKind::MountPathConflict),
             FsError::StaleEntry(e) => e.encode(ErrorKind::StaleEntry),
             FsError::NotFound(e) => e.encode(ErrorKind::NotFound),
+            FsError::InvalidArgument(e) => e.encode(ErrorKind::InvalidArgument),
             FsError::Common(e) => e.encode(ErrorKind::Common),
         }
     }
@@ -515,6 +527,7 @@ impl ErrorExt for FsError {
             ErrorKind::MountPathConflict => FsError::MountPathConflict(de.into_string()),
             ErrorKind::StaleEntry => FsError::StaleEntry(de.into_string()),
             ErrorKind::NotFound => FsError::NotFound(de.into_string()),
+            ErrorKind::InvalidArgument => FsError::InvalidArgument(de.into_string()),
             ErrorKind::Common => FsError::Common(de.into_string()),
         }
     }

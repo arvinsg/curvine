@@ -85,6 +85,11 @@ pub enum RpcCode {
     // pd node register / heartbeat.
     NodeRegister = 105,
     NodeHeartbeat = 106,
+
+    // pd namespace interface.
+    CreateNamespace = 107,
+    GetNamespace = 108,
+    ListNamespaces = 109,
 }
 
 impl RpcCode {
@@ -141,6 +146,9 @@ impl RpcCode {
             RpcCode::GetMetaRouteSummary => "GetMetaRouteSummary",
             RpcCode::NodeRegister => "NodeRegister",
             RpcCode::NodeHeartbeat => "NodeHeartbeat",
+            RpcCode::CreateNamespace => "CreateNamespace",
+            RpcCode::GetNamespace => "GetNamespace",
+            RpcCode::ListNamespaces => "ListNamespaces",
         }
     }
 

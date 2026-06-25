@@ -56,21 +56,13 @@ impl JobContext {
         mnt: &MountInfo,
         client_conf: &ClientConf,
     ) -> Self {
-        let replicas = job_conf
-            .replicas
-            .unwrap_or(mnt.replicas.unwrap_or(client_conf.replicas));
-
-        let block_size = job_conf
-            .block_size
-            .unwrap_or(mnt.block_size.unwrap_or(client_conf.block_size));
-
-        let storage_type = job_conf
-            .storage_type
-            .unwrap_or(mnt.storage_type.unwrap_or(client_conf.storage_type));
-
-        let ttl_ms = job_conf.ttl_ms.unwrap_or(mnt.ttl_ms);
-
-        let ttl_action = job_conf.ttl_action.unwrap_or(mnt.ttl_action);
+        // TODO(new-namespace): load job policy should be resolved from NamespaceInfo.
+        // The legacy mount table no longer carries block/TTL/replica policy.
+        let replicas = job_conf.replicas.unwrap_or(client_conf.replicas);
+        let block_size = job_conf.block_size.unwrap_or(client_conf.block_size);
+        let storage_type = job_conf.storage_type.unwrap_or(client_conf.storage_type);
+        let ttl_ms = job_conf.ttl_ms.unwrap_or(client_conf.ttl_ms);
+        let ttl_action = job_conf.ttl_action.unwrap_or(client_conf.ttl_action);
 
         let job = LoadJobInfo {
             job_id,

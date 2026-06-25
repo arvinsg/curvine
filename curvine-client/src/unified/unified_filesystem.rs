@@ -21,9 +21,8 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
-    ConsistencyStrategy, CreateFileOpts, FileAllocOpts, FileLock, FileStatus, LoadJobCommand,
-    LoadJobResult, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags,
-    SetAttrOpts, WriteType,
+    CreateFileOpts, FileAllocOpts, FileLock, FileStatus, LoadJobCommand, LoadJobResult, MasterInfo,
+    MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts, WriteType,
 };
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
@@ -234,18 +233,16 @@ impl UnifiedFileSystem {
             return Ok(CacheValidity::Valid);
         }
 
-        if mount.info.consistency_strategy == ConsistencyStrategy::None {
+        // TODO(new-namespace): cache consistency policy now belongs to NamespaceInfo.
+        // Until the unified client is namespace-aware, use the conservative check.
+        let ufs_status = mount.ufs.get_status(ufs_path).await?;
+        if cv_status.len == ufs_status.len
+            && cv_status.storage_policy.ufs_mtime != 0
+            && cv_status.storage_policy.ufs_mtime == ufs_status.mtime
+        {
             Ok(CacheValidity::Valid)
         } else {
-            let ufs_status = mount.ufs.get_status(ufs_path).await?;
-            if cv_status.len == ufs_status.len
-                && cv_status.storage_policy.ufs_mtime != 0
-                && cv_status.storage_policy.ufs_mtime == ufs_status.mtime
-            {
-                Ok(CacheValidity::Valid)
-            } else {
-                Ok(CacheValidity::Invalid)
-            }
+            Ok(CacheValidity::Invalid)
         }
     }
 

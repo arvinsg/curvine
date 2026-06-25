@@ -207,16 +207,19 @@ impl Display for GetMountTableResponse {
 
         // Calculate the maximum width of each column
         let mut id_width = 2; //length of "ID"
+        let mut ns_width = 9; // length of "Namespace"
         let mut curvine_width = 12; //length of "Curvine Path"
         let mut ufs_width = 8; //length of "UFS Path"
         for mnt in &self.mount_table {
             id_width = id_width.max(mnt.mount_id.to_string().len());
+            ns_width = ns_width.max(mnt.namespace_id.to_string().len());
             curvine_width = curvine_width.max(mnt.cv_path.len());
             ufs_width = ufs_width.max(mnt.ufs_path.len());
         }
 
         // For the sake of beauty, add some filling
         id_width += 2;
+        ns_width += 2;
         curvine_width += 2;
         ufs_width += 2;
 
@@ -226,18 +229,21 @@ impl Display for GetMountTableResponse {
         // Top border
         write!(f, "+")?;
         write!(f, "{:-^width$}+", "", width = id_width)?;
+        write!(f, "{:-^width$}+", "", width = ns_width)?;
         write!(f, "{:-^width$}+", "", width = curvine_width)?;
         writeln!(f, "{:-^width$}+", "", width = ufs_width)?;
 
         // Title line
         write!(f, "|")?;
         write!(f, " {:<width$}|", "ID", width = id_width - 1)?;
+        write!(f, " {:<width$}|", "Namespace", width = ns_width - 1)?;
         write!(f, " {:<width$}|", "Curvine Path", width = curvine_width - 1)?;
         writeln!(f, " {:<width$}|", "UFS Path", width = ufs_width - 1)?;
 
         // Dividing line
         write!(f, "+")?;
         write!(f, "{:-^width$}+", "", width = id_width)?;
+        write!(f, "{:-^width$}+", "", width = ns_width)?;
         write!(f, "{:-^width$}+", "", width = curvine_width)?;
         writeln!(f, "{:-^width$}+", "", width = ufs_width)?;
 
@@ -245,6 +251,12 @@ impl Display for GetMountTableResponse {
         for mnt in &self.mount_table {
             write!(f, "|")?;
             write!(f, " {:<width$}|", mnt.mount_id, width = id_width - 1)?;
+            write!(
+                f,
+                " {:<width$}|",
+                mnt.namespace_id.to_string(),
+                width = ns_width - 1
+            )?;
             write!(f, " {:<width$}|", mnt.cv_path, width = curvine_width - 1)?;
             writeln!(f, " {:<width$}|", mnt.ufs_path, width = ufs_width - 1)?;
         }
@@ -252,6 +264,7 @@ impl Display for GetMountTableResponse {
         // The lower border
         write!(f, "+")?;
         write!(f, "{:-^width$}+", "", width = id_width)?;
+        write!(f, "{:-^width$}+", "", width = ns_width)?;
         write!(f, "{:-^width$}+", "", width = curvine_width)?;
         writeln!(f, "{:-^width$}+", "", width = ufs_width)?;
 
