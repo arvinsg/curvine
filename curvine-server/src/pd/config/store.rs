@@ -37,34 +37,12 @@ impl ConfigStore {
         buf
     }
 
-    pub fn get(&self, key: &str) -> CommonResult<Option<ConfigInfo>> {
-        let db_key = self.make_key(key);
-        match self.store.get(NS, &db_key)? {
-            Some(data) => {
-                let item: ConfigInfo = Serde::deserialize(&data)?;
-                Ok(Some(item))
-            }
-            None => Ok(None),
-        }
-    }
-
     pub fn set(&self, item: &ConfigInfo) -> CommonResult<()> {
         let db_key = self.make_key(&item.key);
         let data = Serde::serialize(item)?;
         self.store.put(NS, &db_key, &data)?;
         info!("Set config: {} (version: {})", item.key, item.version);
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub fn delete(&self, key: &str) -> CommonResult<bool> {
-        let db_key = self.make_key(key);
-        if !self.store.exists(NS, &db_key)? {
-            return Ok(false);
-        }
-        self.store.delete(NS, &db_key)?;
-        info!("Deleted config: {}", key);
-        Ok(true)
     }
 
     pub fn list(&self, prefix: &str, limit: Option<u32>) -> CommonResult<Vec<ConfigInfo>> {
@@ -80,6 +58,29 @@ impl ConfigStore {
             }
         }
         Ok(items)
+    }
+
+    #[cfg(test)]
+    pub fn get(&self, key: &str) -> CommonResult<Option<ConfigInfo>> {
+        let db_key = self.make_key(key);
+        match self.store.get(NS, &db_key)? {
+            Some(data) => {
+                let item: ConfigInfo = Serde::deserialize(&data)?;
+                Ok(Some(item))
+            }
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn delete(&self, key: &str) -> CommonResult<bool> {
+        let db_key = self.make_key(key);
+        if !self.store.exists(NS, &db_key)? {
+            return Ok(false);
+        }
+        self.store.delete(NS, &db_key)?;
+        info!("Deleted config: {}", key);
+        Ok(true)
     }
 }
 

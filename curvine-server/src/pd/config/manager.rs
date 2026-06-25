@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex, RwLock};
 /// Cache for dynamic config items: registry + current effective values.
 struct DynamicConfigCache {
     registry: HashMap<String, DynamicConfigItem>,
+    conf_overrides: HashMap<String, String>,
     values: RwLock<HashMap<String, ConfigInfo>>,
 }
 
@@ -40,12 +41,25 @@ impl DynamicConfigCache {
             registry.insert(item.key.to_string(), item.clone());
         }
 
+        let values = Self::load_values(config_store, &registry, &conf_overrides)?;
+        Ok(Self {
+            registry,
+            conf_overrides,
+            values: RwLock::new(values),
+        })
+    }
+
+    fn load_values(
+        config_store: &ConfigStore,
+        registry: &HashMap<String, DynamicConfigItem>,
+        conf_overrides: &HashMap<String, String>,
+    ) -> FsResult<HashMap<String, ConfigInfo>> {
         let mut values: HashMap<String, ConfigInfo> = HashMap::new();
-        for (key, item) in &registry {
-            let mut effective = item.default.to_string();
-            if let Some(conf_v) = conf_overrides.get(key) {
-                effective = conf_v.clone();
-            }
+        for (key, item) in registry {
+            let effective = conf_overrides
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| item.default.to_string());
             values.insert(
                 key.clone(),
                 ConfigInfo {
@@ -57,15 +71,20 @@ impl DynamicConfigCache {
             );
         }
 
-        let persisted = config_store.list("", None)?;
-        for item in persisted {
-            values.insert(item.key.clone(), item);
+        for item in config_store.list("", None)? {
+            if registry.contains_key(&item.key) {
+                values.insert(item.key.clone(), item);
+            } else {
+                warn!("Ignore unknown persisted config key={}", item.key);
+            }
         }
+        Ok(values)
+    }
 
-        Ok(Self {
-            registry,
-            values: RwLock::new(values),
-        })
+    fn reload(&self, config_store: &ConfigStore) -> FsResult<()> {
+        let values = Self::load_values(config_store, &self.registry, &self.conf_overrides)?;
+        *self.values.write().unwrap() = values;
+        Ok(())
     }
 
     fn is_valid_key(&self, key: &str) -> bool {
@@ -76,14 +95,17 @@ impl DynamicConfigCache {
         self.values.read().unwrap().get(key).cloned()
     }
 
-    fn keys_with_prefix(&self, prefix: &str) -> Vec<(String, ConfigInfo)> {
-        self.values
+    fn keys_with_prefix(&self, prefix: &str) -> Vec<ConfigInfo> {
+        let mut items: Vec<ConfigInfo> = self
+            .values
             .read()
             .unwrap()
             .iter()
             .filter(|(k, _)| k.starts_with(prefix))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+            .map(|(_, v)| v.clone())
+            .collect();
+        items.sort_by(|a, b| a.key.cmp(&b.key));
+        items
     }
 
     fn update_from_kv(&self, item: &ConfigInfo) {
@@ -109,10 +131,7 @@ impl ConfigManager {
     ) -> Self {
         let config_store = Arc::new(ConfigStore::new(store));
         let dynamic_cache = DynamicConfigCache::new(&config_store, conf_dynamic_config)
-            .unwrap_or_else(|_| DynamicConfigCache {
-                registry: HashMap::new(),
-                values: RwLock::new(HashMap::new()),
-            });
+            .expect("failed to initialize dynamic config cache");
         Self {
             config_store,
             journal_client,
@@ -125,19 +144,49 @@ impl ConfigManager {
         self.dynamic_cache.is_valid_key(key)
     }
 
-    pub fn apply_set_config(&self, item: &ConfigInfo) -> FsResult<ApplyOutcome> {
-        if let Some(existing) = self.config_store.get(&item.key)? {
-            if existing.version >= item.version {
-                warn!(
-                    "Apply set config: {} skipped (existing version {} >= {})",
-                    item.key, existing.version, item.version
-                );
-                return Ok(ApplyOutcome::stale(format!(
-                    "version mismatch: current={}, entry={}",
-                    existing.version, item.version
-                )));
-            }
+    pub fn restore(&self) -> FsResult<()> {
+        self.dynamic_cache.reload(&self.config_store)
+    }
+
+    pub fn apply_set_config(&self, entry: &ConfigEntry) -> FsResult<ApplyOutcome> {
+        let item = &entry.info;
+        if !self.is_valid_key(&item.key) {
+            warn!("Apply set config skipped: unknown key: {}", item.key);
+            return Ok(ApplyOutcome::not_found(unknown_key_error(&item.key)));
         }
+
+        let Some(current) = self.dynamic_cache.get(&item.key) else {
+            return Ok(ApplyOutcome::not_found(format!(
+                "config key {} is not initialized",
+                item.key
+            )));
+        };
+        let Some(expected_new_version) = entry.expected_version.checked_add(1) else {
+            return Ok(ApplyOutcome::stale(format!(
+                "version overflow: expected:{}",
+                entry.expected_version
+            )));
+        };
+        if item.version != expected_new_version {
+            return Ok(ApplyOutcome::stale(format!(
+                "entry version mismatch: expected_new {}, entry {}",
+                expected_new_version, item.version
+            )));
+        }
+        if current.version == item.version && current.value == item.value {
+            return Ok(ApplyOutcome::SkippedNoop);
+        }
+        if current.version != entry.expected_version {
+            warn!(
+                "Apply set config: {} skipped (current version {} != expected {})",
+                item.key, current.version, entry.expected_version
+            );
+            return Ok(ApplyOutcome::stale(format!(
+                "version mismatch: current={}, expected={}",
+                current.version, entry.expected_version
+            )));
+        }
+
         info!("Apply set config: {}", item.key);
         self.config_store.set(item)?;
         self.dynamic_cache.update_from_kv(item);
@@ -193,12 +242,7 @@ impl ConfigManager {
         info!("List config with prefix: {}", req.prefix);
         let limit = req.limit.unwrap_or(1000).min(10000) as usize;
 
-        let mut items: Vec<ConfigInfo> = self
-            .dynamic_cache
-            .keys_with_prefix(&req.prefix)
-            .into_iter()
-            .map(|(_, info)| info)
-            .collect();
+        let mut items: Vec<ConfigInfo> = self.dynamic_cache.keys_with_prefix(&req.prefix);
         if items.len() > limit {
             items.truncate(limit);
         }
@@ -216,21 +260,21 @@ impl ConfigManager {
 
         let _guard = self.set_lock.lock().unwrap();
 
+        let now = LocalTime::mills();
         let mut item = ProtoUtils::set_config_request_to_config_info(req);
+        let expected_version = current.version;
+        let version = expected_version
+            .checked_add(1)
+            .ok_or_else(|| FsError::common(format!("config {} version overflow", item.key)))?;
+        item.version = version;
+        item.mtime = now;
 
-        if let Some(existing) = self.dynamic_cache.get(&item.key) {
-            item.version = existing.version + 1;
-        }
-
-        // #6 fix: use propose_with_result so apply-side stale skip surfaces as
-        // an Err. Pre-#6 used plain propose(), client got success+version even
-        // when apply silently skipped (stale version).
         let key = item.key.clone();
-        let version = item.version;
         let outcome = self
             .journal_client
             .propose_as_leader_with_result(PdEntry::SetConfig(ConfigEntry {
-                op_ms: LocalTime::mills(),
+                op_ms: now,
+                expected_version,
                 info: item,
             }))?;
         match outcome {
