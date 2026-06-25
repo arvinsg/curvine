@@ -292,14 +292,14 @@ impl JournalLoader {
 }
 
 impl AppStorage for JournalLoader {
-    fn apply(&self, is_leader: bool, message: &[u8]) -> RaftResult<Vec<u8>> {
+    fn apply(&self, is_leader: bool, message: &[u8]) -> RaftResult<()> {
         match self.apply0(is_leader, message) {
-            Ok(_) => Ok(Vec::new()),
+            Ok(_) => Ok(()),
 
             Err(e) => {
                 if self.ignore_replay_error {
                     error!("journal apply {}", e);
-                    Ok(Vec::new())
+                    Ok(())
                 } else {
                     Err(e)
                 }

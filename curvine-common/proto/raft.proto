@@ -68,12 +68,6 @@ message ProposeRequest {
 }
 
 message ProposeResponse {
-    // Bytes returned by the application's `AppStorage::apply` for this entry.
-    // Optional for backward compatibility: pre-upgrade leaders return no bytes,
-    // and clients that ignore this field continue to work as before.
-    // PD layer interprets this as an `ApplyOutcome` (see pd/journal/apply_outcome.rs);
-    // empty bytes are decoded as `ApplyOutcome::Applied` for forward compatibility.
-    optional bytes apply_result = 1;
 }
 
 message RaftRequest {

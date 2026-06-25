@@ -82,11 +82,11 @@ where
     K: DeserializeOwned + Sized + Serialize + Clone + Hash + Eq + Send + Sync + 'static,
     V: DeserializeOwned + Sized + Serialize + Clone + Send + Sync + 'static,
 {
-    fn apply(&self, _: bool, message: &[u8]) -> RaftResult<Vec<u8>> {
+    fn apply(&self, _: bool, message: &[u8]) -> RaftResult<()> {
         let mut map = self.write()?;
         let pairs: (K, V) = SerdeUtils::deserialize(message)?;
         map.insert(pairs.0, pairs.1);
-        Ok(Vec::new())
+        Ok(())
     }
 
     fn create_snapshot(&self, node_id: u64, snapshot_id: u64) -> RaftResult<SnapshotData> {
@@ -161,13 +161,13 @@ where
     K: Serialize + DeserializeOwned + Clone + Sync + Send + 'static,
     V: Serialize + DeserializeOwned + Clone + Sync + Send + 'static,
 {
-    fn apply(&self, _: bool, message: &[u8]) -> RaftResult<Vec<u8>> {
+    fn apply(&self, _: bool, message: &[u8]) -> RaftResult<()> {
         let db = self.lock()?;
         let pairs: (K, V) = SerdeUtils::deserialize(message)?;
         let k = SerdeUtils::serialize(&pairs.0)?;
         let v = SerdeUtils::serialize(&pairs.1)?;
         db.put(k, v)?;
-        Ok(Vec::new())
+        Ok(())
     }
 
     // Create a snapshot.

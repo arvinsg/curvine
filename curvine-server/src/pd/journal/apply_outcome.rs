@@ -51,12 +51,12 @@ impl ApplyOutcome {
         matches!(self, ApplyOutcome::Applied | ApplyOutcome::SkippedNoop)
     }
 
-    /// Serialize to bytes for Raft.
+    /// Serialize to bytes for a future PD-local apply-result channel.
     pub fn encode(&self) -> FsResult<Vec<u8>> {
         SerdeUtils::serialize(self).map_err(Into::into)
     }
 
-    /// Decode from `ProposeResponse.apply_result` bytes.
+    /// Decode from a future PD-local apply-result byte payload.
     pub fn decode(bytes: &[u8]) -> FsResult<Self> {
         if bytes.is_empty() {
             return Ok(ApplyOutcome::Applied);
@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn empty_bytes_decode_as_applied() {
-        // Forward-compat: un-upgraded leaders return empty apply_result.
+        // Empty payloads are treated as Applied for phase-A compatibility.
         assert_eq!(ApplyOutcome::decode(&[]).unwrap(), ApplyOutcome::Applied);
     }
 

@@ -62,12 +62,15 @@ impl Client {
     pub fn propose(&self, entry: PdEntry) -> FsResult<ApplyOutcome> {
         self.ensure_leader()?;
         let data = Serde::serialize(&entry)?;
-        let apply_result = self.raft_client.block_on_send_propose(data)?;
-        ApplyOutcome::decode(&apply_result)
+        self.raft_client.block_on_send_propose(data)?;
+        Ok(ApplyOutcome::Applied)
     }
 
     pub fn propose_without_result(&self, entry: PdEntry) -> FsResult<()> {
-        self.propose(entry).map(|_| ())
+        self.ensure_leader()?;
+        let data = Serde::serialize(&entry)?;
+        self.raft_client.block_on_send_propose(data)?;
+        Ok(())
     }
 }
 

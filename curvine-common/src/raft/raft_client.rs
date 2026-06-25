@@ -76,34 +76,14 @@ impl RaftClient {
     }
 
     // Send application layer messages.
-    pub async fn send_propose(&self, data: Vec<u8>) -> RaftResult<Vec<u8>> {
+    pub async fn send_propose(&self, data: Vec<u8>) -> RaftResult<()> {
         let req = ProposeRequest { data };
-        let resp: ProposeResponse = self.leader_rpc(RaftCode::Propose, req).await?;
-        Ok(resp.apply_result.unwrap_or_default())
+        let _: ProposeResponse = self.leader_rpc(RaftCode::Propose, req).await?;
+        Ok(())
     }
 
-    pub fn block_on_send_propose(&self, data: Vec<u8>) -> RaftResult<Vec<u8>> {
-        // #2 fix: detect tokio runtime context and use the right block-on
-        // primitive. Calling `Runtime::block_on` from within a tokio task
-        // panics ("Cannot start a runtime from within a runtime"). PD's async
-        // tasks (operator_loop / event_loop / liveness_loop) do call this
-        // method indirectly via PD module functions, so without this guard
-        // any propose from those paths would panic.
-        //
-        // - Inside tokio context (any worker or spawn_blocking thread):
-        //   `block_in_place` tells the multi_thread runtime that this thread
-        //   is going to block, allowing other tasks to migrate to siblings;
-        //   `Handle::block_on` then runs our future on this thread without
-        //   spinning up a new runtime. Multi_thread runtime is required —
-        //   curvine's AsyncRuntime always uses `Builder::new_multi_thread()`.
-        // - Outside tokio context (orpc spawn_blocking with no installed
-        //   handle, or unit tests with bare threads): fall back to our owned
-        //   runtime's `block_on`, which is safe to call from a non-tokio
-        //   thread.
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(self.send_propose(data))),
-            Err(_) => self.rt.block_on(self.send_propose(data)),
-        }
+    pub fn block_on_send_propose(&self, data: Vec<u8>) -> RaftResult<()> {
+        self.rt.block_on(self.send_propose(data))
     }
 
     // Join the cluster.

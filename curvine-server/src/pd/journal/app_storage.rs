@@ -68,9 +68,9 @@ impl PdAppStorage {
         }
     }
 
-    fn apply_entry(&self, is_leader: bool, message: &[u8]) -> RaftResult<Vec<u8>> {
+    fn apply_entry(&self, is_leader: bool, message: &[u8]) -> RaftResult<()> {
         if message.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         let pd_entry: PdEntry = Serde::deserialize(message)?;
@@ -84,16 +84,13 @@ impl PdAppStorage {
                 info!("Apply noop entry");
             }
             PdEntry::SetConfig(entry) => {
-                let outcome = self.config_manager.apply_set_config(&entry)?;
-                return Ok(outcome.encode()?);
+                let _ = self.config_manager.apply_set_config(&entry)?;
             }
             PdEntry::Mount(entry) => {
-                let outcome = self.mount_manager.apply_mount(entry)?;
-                return Ok(outcome.encode()?);
+                let _ = self.mount_manager.apply_mount(entry)?;
             }
             PdEntry::Unmount(entry) => {
-                let outcome = self.mount_manager.apply_unmount(entry)?;
-                return Ok(outcome.encode()?);
+                let _ = self.mount_manager.apply_unmount(entry)?;
             }
             PdEntry::RegisterNode(entry) => {
                 info!(
@@ -135,10 +132,9 @@ impl PdAppStorage {
                     "Apply CreateNamespace id={}, name={}",
                     entry.namespace.id, entry.namespace.name
                 );
-                let outcome = self
+                let _ = self
                     .namespace_manager
                     .apply_create_namespace(&entry, is_leader)?;
-                return Ok(outcome.encode()?);
             }
             PdEntry::CreateBG(entry) => {
                 info!("Apply CreateBG bg_id={}", entry.info.bg_id);
@@ -150,20 +146,18 @@ impl PdAppStorage {
                     "Apply UpdateBG bg_id={}, expected_epoch={}, new_epoch={}",
                     entry.bg_id, entry.expected_bg_epoch, entry.new_bg_epoch
                 );
-                let outcome = self
+                let _ = self
                     .bg_manager
                     .apply_update_bg_with_role(&entry, is_leader)?;
-                return Ok(outcome.encode()?);
             }
             PdEntry::DeleteBG(ref entry) => {
                 info!(
                     "Apply DeleteBG bg_id={}, expected_epoch={}",
                     entry.bg_id, entry.expected_bg_epoch
                 );
-                let outcome = self
+                let _ = self
                     .bg_manager
                     .apply_delete_bg_with_role(entry, is_leader)?;
-                return Ok(outcome.encode()?);
             }
             PdEntry::BatchBG(entry) => {
                 info!(
@@ -172,10 +166,9 @@ impl PdAppStorage {
                     entry.creates.len(),
                     entry.updates.len()
                 );
-                let outcome = self
+                let _ = self
                     .bg_manager
                     .apply_batch_bg_with_role(&entry, is_leader)?;
-                return Ok(outcome.encode()?);
             }
             PdEntry::BumpTableEpoch(entry) => {
                 info!("Apply BumpTableEpoch updates={}", entry.updates.len());
@@ -187,25 +180,23 @@ impl PdAppStorage {
                     "Apply AddPathRoute path={}, expected_table_version={}",
                     entry.route.path, entry.expected_table_version
                 );
-                let outcome = self.metaroute_manager.apply_add_route(entry)?;
-                return Ok(outcome.encode()?);
+                let _ = self.metaroute_manager.apply_add_route(entry)?;
             }
             PdEntry::RemovePathRoute(ref entry) => {
                 info!(
                     "Apply RemovePathRoute path={}, expected_table_version={}",
                     entry.path, entry.expected_table_version
                 );
-                let outcome = self.metaroute_manager.apply_remove_route(entry)?;
-                return Ok(outcome.encode()?);
+                let _ = self.metaroute_manager.apply_remove_route(entry)?;
             }
         }
 
-        Ok(Vec::new())
+        Ok(())
     }
 }
 
 impl AppStorage for PdAppStorage {
-    fn apply(&self, is_leader: bool, message: &[u8]) -> RaftResult<Vec<u8>> {
+    fn apply(&self, is_leader: bool, message: &[u8]) -> RaftResult<()> {
         self.apply_entry(is_leader, message)
     }
 

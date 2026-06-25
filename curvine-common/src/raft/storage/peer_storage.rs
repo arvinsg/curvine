@@ -77,7 +77,7 @@ where
         self.log_store.set_conf_state(conf_state)
     }
 
-    pub fn apply_propose(&self, is_leader: bool, data: &[u8]) -> RaftResult<Vec<u8>> {
+    pub fn apply_propose(&self, is_leader: bool, data: &[u8]) -> RaftResult<()> {
         self.app_store.apply(is_leader, data)
     }
 
