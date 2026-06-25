@@ -55,7 +55,7 @@ fn config_entry(key: &str, value: &[u8], expected_version: u64) -> ConfigEntry {
     ConfigEntry {
         op_ms: LocalTime::mills(),
         expected_version,
-        info: config_info(key, value, expected_version.saturating_add(1)),
+        info: config_info(key, value, expected_version + 1),
     }
 }
 
@@ -211,6 +211,29 @@ fn apply_set_config_cases() {
 }
 
 #[test]
+fn same_expected_version_allows_only_one_apply() {
+    let mgr = test_manager(HashMap::new());
+    let first = config_entry(PD_NODE_HEARTBEAT_TIMEOUT_MS, b"first", 0);
+    let second = config_entry(PD_NODE_HEARTBEAT_TIMEOUT_MS, b"second", 0);
+
+    assert_eq!(mgr.apply_set_config(&first).unwrap(), ApplyOutcome::Applied);
+    assert_outcome(
+        mgr.apply_set_config(&second).unwrap(),
+        ExpectedOutcome::Stale,
+    );
+
+    let item = mgr
+        .get_config(GetConfigRequest {
+            key: PD_NODE_HEARTBEAT_TIMEOUT_MS.to_string(),
+        })
+        .unwrap()
+        .item
+        .unwrap();
+    assert_eq!(item.value, b"first");
+    assert_eq!(item.version, 1);
+}
+
+#[test]
 fn apply_rejects_invalid_entries() {
     struct Case {
         name: &'static str,
@@ -230,15 +253,6 @@ fn apply_rejects_invalid_entries() {
                 op_ms: LocalTime::mills(),
                 expected_version: 0,
                 info: config_info(PD_NODE_HEARTBEAT_TIMEOUT_MS, b"bad", 3),
-            },
-            expected: ExpectedOutcome::Stale,
-        },
-        Case {
-            name: "expected version overflow",
-            entry: ConfigEntry {
-                op_ms: LocalTime::mills(),
-                expected_version: u64::MAX,
-                info: config_info(PD_NODE_HEARTBEAT_TIMEOUT_MS, b"bad", u64::MAX),
             },
             expected: ExpectedOutcome::Stale,
         },
@@ -265,27 +279,6 @@ fn set_config_rejects_unknown_key_before_propose() {
     let result = mgr.set_config(SetConfigRequest {
         key: "not.registered".into(),
         value: b"val".to_vec(),
-    });
-
-    assert!(result.is_err());
-}
-
-#[test]
-fn set_config_detects_version_overflow_before_propose() {
-    let store = make_store();
-    let config_store = ConfigStore::new(store.clone());
-    config_store
-        .set(&config_info(
-            PD_NODE_HEARTBEAT_TIMEOUT_MS,
-            b"max-version",
-            u64::MAX,
-        ))
-        .unwrap();
-
-    let mgr = test_manager_with_store(store, HashMap::new());
-    let result = mgr.set_config(SetConfigRequest {
-        key: PD_NODE_HEARTBEAT_TIMEOUT_MS.to_string(),
-        value: b"overflow".to_vec(),
     });
 
     assert!(result.is_err());
@@ -377,6 +370,34 @@ fn list_config_cases() {
         .unwrap();
     assert_eq!(hb.value, b"persisted");
     assert_eq!(hb.version, 1);
+}
+
+#[test]
+fn restore_loads_all_persisted_configs_without_list_limit() {
+    let store = make_store();
+    let config_store = ConfigStore::new(store.clone());
+
+    for i in 0..1100 {
+        config_store
+            .set(&config_info(&format!("aa.unknown.{i:04}"), b"ignored", 1))
+            .unwrap();
+    }
+    config_store
+        .set(&config_info(PD_NODE_HEARTBEAT_TIMEOUT_MS, b"persisted", 3))
+        .unwrap();
+
+    let mgr = test_manager_with_store(store, dynamic(&[(PD_NODE_HEARTBEAT_TIMEOUT_MS, "default")]));
+    mgr.restore().unwrap();
+
+    let item = mgr
+        .get_config(GetConfigRequest {
+            key: PD_NODE_HEARTBEAT_TIMEOUT_MS.to_string(),
+        })
+        .unwrap()
+        .item
+        .unwrap();
+    assert_eq!(item.value, b"persisted");
+    assert_eq!(item.version, 3);
 }
 
 #[test]

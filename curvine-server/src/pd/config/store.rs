@@ -45,17 +45,23 @@ impl ConfigStore {
         Ok(())
     }
 
-    pub fn list(&self, prefix: &str, limit: Option<u32>) -> CommonResult<Vec<ConfigInfo>> {
+    pub fn list_all(&self, prefix: &str) -> CommonResult<Vec<ConfigInfo>> {
         let search_prefix = self.make_key(prefix);
-        let limit = limit.unwrap_or(1000).min(10000) as usize;
         let pairs = self.store.scan_prefix(NS, &search_prefix)?;
-        let mut items = Vec::with_capacity(pairs.len().min(limit));
+        let mut items = Vec::with_capacity(pairs.len());
         for (_key, value) in pairs {
             let config_item: ConfigInfo = Serde::deserialize(&value)?;
             items.push(config_item);
-            if items.len() >= limit {
-                break;
-            }
+        }
+        Ok(items)
+    }
+
+    #[cfg(test)]
+    pub fn list(&self, prefix: &str, limit: Option<u32>) -> CommonResult<Vec<ConfigInfo>> {
+        let limit = limit.unwrap_or(1000).min(10000) as usize;
+        let mut items = self.list_all(prefix)?;
+        if items.len() > limit {
+            items.truncate(limit);
         }
         Ok(items)
     }

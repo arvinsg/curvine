@@ -25,53 +25,74 @@ use curvine_common::{FsError, FsResult};
 use log::{info, warn};
 use orpc::common::LocalTime;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
-/// Cache for dynamic config items: registry + current effective values.
+/// Cache for dynamic config items.
 struct DynamicConfigCache {
     registry: HashMap<String, DynamicConfigItem>,
-    conf_overrides: HashMap<String, String>,
+    config_defaults: HashMap<String, ConfigInfo>,
     values: RwLock<HashMap<String, ConfigInfo>>,
 }
 
 impl DynamicConfigCache {
-    fn new(config_store: &ConfigStore, conf_overrides: HashMap<String, String>) -> FsResult<Self> {
-        let mut registry = HashMap::new();
-        for item in DYNAMIC_CONFIG_ITEMS {
-            registry.insert(item.key.to_string(), item.clone());
-        }
-
-        let values = Self::load_values(config_store, &registry, &conf_overrides)?;
+    fn new(
+        config_store: &ConfigStore,
+        config_overrides: HashMap<String, String>,
+    ) -> FsResult<Self> {
+        let registry = Self::build_registry();
+        let config_defaults = Self::build_config_defaults(&registry, config_overrides);
+        let values = Self::load_values(config_store, &registry, &config_defaults)?;
         Ok(Self {
             registry,
-            conf_overrides,
+            config_defaults,
             values: RwLock::new(values),
         })
     }
 
-    fn load_values(
-        config_store: &ConfigStore,
+    fn build_registry() -> HashMap<String, DynamicConfigItem> {
+        let mut registry = HashMap::new();
+        for item in DYNAMIC_CONFIG_ITEMS {
+            registry.insert(item.key.to_string(), item.clone());
+        }
+        registry
+    }
+
+    fn build_config_defaults(
         registry: &HashMap<String, DynamicConfigItem>,
-        conf_overrides: &HashMap<String, String>,
-    ) -> FsResult<HashMap<String, ConfigInfo>> {
-        let mut values: HashMap<String, ConfigInfo> = HashMap::new();
+        config_overrides: HashMap<String, String>,
+    ) -> HashMap<String, ConfigInfo> {
+        for key in config_overrides.keys() {
+            if !registry.contains_key(key) {
+                warn!("Ignore unknown bootstrap dynamic config key={}", key);
+            }
+        }
+
+        let mut defaults = HashMap::new();
         for (key, item) in registry {
-            let effective = conf_overrides
+            let value = config_overrides
                 .get(key)
                 .cloned()
                 .unwrap_or_else(|| item.default.to_string());
-            values.insert(
+            defaults.insert(
                 key.clone(),
                 ConfigInfo {
                     key: key.clone(),
-                    value: effective.into_bytes(),
+                    value: value.into_bytes(),
                     version: 0,
                     mtime: 0,
                 },
             );
         }
+        defaults
+    }
 
-        for item in config_store.list("", None)? {
+    fn load_values(
+        config_store: &ConfigStore,
+        registry: &HashMap<String, DynamicConfigItem>,
+        config_defaults: &HashMap<String, ConfigInfo>,
+    ) -> FsResult<HashMap<String, ConfigInfo>> {
+        let mut values = config_defaults.clone();
+        for item in config_store.list_all("")? {
             if registry.contains_key(&item.key) {
                 values.insert(item.key.clone(), item);
             } else {
@@ -82,7 +103,7 @@ impl DynamicConfigCache {
     }
 
     fn reload(&self, config_store: &ConfigStore) -> FsResult<()> {
-        let values = Self::load_values(config_store, &self.registry, &self.conf_overrides)?;
+        let values = Self::load_values(config_store, &self.registry, &self.config_defaults)?;
         *self.values.write().unwrap() = values;
         Ok(())
     }
@@ -120,7 +141,6 @@ pub struct ConfigManager {
     config_store: Arc<ConfigStore>,
     journal_client: Arc<journal::Client>,
     dynamic_cache: DynamicConfigCache,
-    set_lock: Mutex<()>,
 }
 
 impl ConfigManager {
@@ -136,7 +156,6 @@ impl ConfigManager {
             config_store,
             journal_client,
             dynamic_cache,
-            set_lock: Mutex::new(()),
         }
     }
 
@@ -149,47 +168,13 @@ impl ConfigManager {
     }
 
     pub fn apply_set_config(&self, entry: &ConfigEntry) -> FsResult<ApplyOutcome> {
-        let item = &entry.info;
-        if !self.is_valid_key(&item.key) {
-            warn!("Apply set config skipped: unknown key: {}", item.key);
-            return Ok(ApplyOutcome::not_found(unknown_key_error(&item.key)));
+        if let Err(outcome) = self.validate_apply_entry(entry) {
+            return Ok(outcome);
         }
 
-        let Some(current) = self.dynamic_cache.get(&item.key) else {
-            return Ok(ApplyOutcome::not_found(format!(
-                "config key {} is not initialized",
-                item.key
-            )));
-        };
-        let Some(expected_new_version) = entry.expected_version.checked_add(1) else {
-            return Ok(ApplyOutcome::stale(format!(
-                "version overflow: expected:{}",
-                entry.expected_version
-            )));
-        };
-        if item.version != expected_new_version {
-            return Ok(ApplyOutcome::stale(format!(
-                "entry version mismatch: expected_new {}, entry {}",
-                expected_new_version, item.version
-            )));
-        }
-        if current.version == item.version && current.value == item.value {
-            return Ok(ApplyOutcome::SkippedNoop);
-        }
-        if current.version != entry.expected_version {
-            warn!(
-                "Apply set config: {} skipped (current version {} != expected {})",
-                item.key, current.version, entry.expected_version
-            );
-            return Ok(ApplyOutcome::stale(format!(
-                "version mismatch: current={}, expected={}",
-                current.version, entry.expected_version
-            )));
-        }
-
-        info!("Apply set config: {}", item.key);
-        self.config_store.set(item)?;
-        self.dynamic_cache.update_from_kv(item);
+        info!("Apply set config: {}", entry.info.key);
+        self.config_store.set(&entry.info)?;
+        self.dynamic_cache.update_from_kv(&entry.info);
         Ok(ApplyOutcome::Applied)
     }
 
@@ -253,30 +238,14 @@ impl ConfigManager {
     }
 
     pub fn set_config(&self, req: SetConfigRequest) -> FsResult<SetConfigResponse> {
-        if !self.is_valid_key(&req.key) {
-            return Err(FsError::common(unknown_key_error(&req.key)));
-        }
         info!("Set config: {}", req.key);
 
-        let _guard = self.set_lock.lock().unwrap();
-
-        let now = LocalTime::mills();
-        let mut item = ProtoUtils::set_config_request_to_config_info(req);
-        let expected_version = current.version;
-        let version = expected_version
-            .checked_add(1)
-            .ok_or_else(|| FsError::common(format!("config {} version overflow", item.key)))?;
-        item.version = version;
-        item.mtime = now;
-
-        let key = item.key.clone();
+        let entry = self.build_set_entry(req)?;
+        let version = entry.info.version;
+        let key = entry.info.key.clone();
         let outcome = self
             .journal_client
-            .propose_as_leader_with_result(PdEntry::SetConfig(ConfigEntry {
-                op_ms: now,
-                expected_version,
-                info: item,
-            }))?;
+            .propose_as_leader_with_result(PdEntry::SetConfig(entry))?;
         match outcome {
             ApplyOutcome::Applied | ApplyOutcome::SkippedNoop => Ok(SetConfigResponse {
                 success: true,
@@ -287,5 +256,64 @@ impl ConfigManager {
             }
             ApplyOutcome::NotFound { reason } => Err(FsError::not_found(reason)),
         }
+    }
+
+    fn build_set_entry(&self, req: SetConfigRequest) -> FsResult<ConfigEntry> {
+        if !self.is_valid_key(&req.key) {
+            return Err(FsError::common(unknown_key_error(&req.key)));
+        }
+
+        let now = LocalTime::mills();
+        let mut item = ProtoUtils::set_config_request_to_config_info(req);
+        let current = self.dynamic_cache.get(&item.key).ok_or_else(|| {
+            FsError::not_found(format!("config key {} is not initialized", item.key))
+        })?;
+        let expected_version = current.version;
+        let version = expected_version + 1;
+        item.version = version;
+        item.mtime = now;
+
+        Ok(ConfigEntry {
+            op_ms: now,
+            expected_version,
+            info: item,
+        })
+    }
+
+    fn validate_apply_entry(&self, entry: &ConfigEntry) -> Result<(), ApplyOutcome> {
+        let item = &entry.info;
+        if !self.is_valid_key(&item.key) {
+            warn!("Apply set config skipped: unknown key: {}", item.key);
+            return Err(ApplyOutcome::not_found(unknown_key_error(&item.key)));
+        }
+
+        let Some(current) = self.dynamic_cache.get(&item.key) else {
+            return Err(ApplyOutcome::not_found(format!(
+                "config key {} is not initialized",
+                item.key
+            )));
+        };
+        let expected_new_version = entry.expected_version + 1;
+        if item.version != expected_new_version {
+            return Err(ApplyOutcome::stale(format!(
+                "entry version mismatch: expected_new={}, entry={}",
+                expected_new_version, item.version
+            )));
+        }
+        if current.version == item.version && current.value == item.value {
+            return Err(ApplyOutcome::SkippedNoop);
+        }
+        if current.version != entry.expected_version {
+            warn!(
+                "Apply set config: {} skipped (current version {} != expected {})",
+                item.key, current.version, entry.expected_version
+            );
+            return Err(ApplyOutcome::stale(format!(
+                "version mismatch: current={}, expected={}",
+                current.version, entry.expected_version
+            )));
+        }
+
+        Ok(())
     }
 }
