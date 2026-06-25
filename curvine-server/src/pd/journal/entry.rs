@@ -12,34 +12,50 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::BGLease;
 use curvine_common::state::{
-    BlockGroupInfo, ConfigInfo, MountInfo, NodeInfo, NodePayload, NodeState, PathRouteEntry,
+    BGPrimary, BgId, BlockGroupInfo, ConfigInfo, MountInfo, NamespaceId, NamespaceInfo, NodeInfo,
+    NodePayload, NodeState, PathRouteEntry, TableId,
 };
 use serde::{Deserialize, Serialize};
 
-// mount
 #[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct MountEntry {
+pub enum MountEntry {
+    Add(MountAddEntry),
+    Update(MountUpdateEntry),
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct MountAddEntry {
     pub(crate) op_ms: u64,
     pub(crate) info: MountInfo,
 }
 
-// umount
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct MountUpdateEntry {
+    pub(crate) op_ms: u64,
+    pub(crate) expected_mount_id: u32,
+    pub(crate) expected_cv_path: String,
+    pub(crate) expected_version: u64,
+    pub(crate) info: MountInfo,
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct UnMountEntry {
     pub(crate) op_ms: u64,
     pub(crate) id: u32,
+    pub(crate) expected_cv_path: String,
+    pub(crate) expected_version: u64,
 }
 
 // config
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct ConfigEntry {
     pub(crate) op_ms: u64,
+    pub(crate) expected_version: u64,
     pub(crate) info: ConfigInfo,
 }
 
-/// Node entry (Raft log) — used for both registration and periodic save
+/// Node entry — used for both registration and periodic save
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct NodeEntry {
     pub op_ms: u64,
@@ -52,7 +68,7 @@ pub enum NodePayloadUpdate {
     Replace(NodePayload),
 }
 
-/// Strong-semantic node state update with epoch/state CAS.
+/// node state update with epoch/state CAS.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct UpdateNodeStateEntry {
     pub op_ms: u64,
@@ -100,21 +116,15 @@ pub struct BGEntry {
     pub info: BlockGroupInfo,
 }
 
-/// BG update entry (Raft log).
-///
-/// `expected_bg_epoch` is the bg_epoch the proposer observed when the entry
-/// was constructed. apply uses it as a CAS guard:
-///   - existing.bg_epoch == expected_bg_epoch  → accept
-///   - existing.bg_epoch != expected_bg_epoch  → SkippedStale (concurrent update)
-/// `new_bg_epoch` MUST be strictly greater than `existing.bg_epoch`. apply
-/// also rejects non-monotonic entries as SkippedStale.
+/// BG update entry.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct BGUpdateEntry {
     pub op_ms: u64,
-    pub bg_id: u32,
+    pub bg_id: BgId,
     pub state: Option<curvine_common::state::BGState>,
     pub replica_set: Option<Vec<u32>>,
-    pub lease_owner: Option<BGLease>,
+    pub isr: Option<Vec<u32>>,
+    pub primary: Option<BGPrimary>,
     /// BG epoch the proposer based this entry on. `serde(default)` keeps
     /// pre-P2.1 logs decodable: legacy entries decode with expected_bg_epoch=0
     /// and rely on the `new_bg_epoch > info.bg_epoch` monotonicity check.
@@ -122,22 +132,27 @@ pub struct BGUpdateEntry {
     pub expected_bg_epoch: u64,
     pub new_bg_epoch: u64,
     /// Table whose route epoch should be bumped at apply time if this BG mutation succeeds.
-    pub bump_table_epoch: Option<u32>,
+    pub bump_table_epoch: Option<TableId>,
 }
 
 /// Batch BG entry (Raft log) — atomically applies table + multiple BG creates/updates.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct BatchBGEntry {
     pub op_ms: u64,
+    /// Legacy single-table create field. New namespace creation uses `tables`.
     pub table: Option<super::super::bg::BGTable>,
+    #[serde(default)]
+    pub tables: Vec<super::super::bg::BGTable>,
     pub creates: Vec<BlockGroupInfo>,
     pub updates: Vec<BGUpdateEntry>,
     /// If present, updates the next BG ID counter atomically with other changes.
     #[serde(default)]
-    pub next_bg_id: Option<u32>,
+    pub next_bg_id: Option<BgId>,
+    #[serde(default)]
+    pub next_table_id: Option<TableId>,
     #[serde(default)]
     /// Table whose route epoch should be bumped at apply time if this batch mutates route-visible state.
-    pub bump_table_epoch: Option<u32>,
+    pub bump_table_epoch: Option<TableId>,
     /// P2.3: when `table` is set and this is true, apply requires the table to
     /// NOT already exist. Used by `create_table` to prevent two concurrent
     /// creates with the same `(pool_type, replica_count)` from clobbering each
@@ -157,8 +172,8 @@ pub struct BatchBGEntry {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct BGDeleteEntry {
     pub op_ms: u64,
-    pub bg_id: u32,
-    pub table_id: u32,
+    pub bg_id: BgId,
+    pub table_id: TableId,
     /// BG epoch the proposer based the delete on. `serde(default)` keeps
     /// pre-P2.2 logs decodable.
     #[serde(default)]
@@ -169,9 +184,23 @@ pub struct BGDeleteEntry {
 /// this entry only publishes a monotonically increasing route epoch.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct TableEpochUpdate {
-    pub table_id: u32,
+    pub table_id: TableId,
     pub expected_epoch: u64,
     pub new_epoch: u64,
+}
+
+/// Namespace create entry (Raft log). This atomically materializes the
+/// NamespaceInfo and its initial Hash BGTable(s). Capacity BGTable creation is
+/// intentionally rejected in phase 1 and reserved for write acceleration.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct NamespaceCreateEntry {
+    pub op_ms: u64,
+    pub namespace: NamespaceInfo,
+    pub bg_batch: BatchBGEntry,
+    pub expected_next_namespace_id: NamespaceId,
+    pub next_namespace_id: NamespaceId,
+    pub expected_next_bg_id: BgId,
+    pub next_bg_id: BgId,
 }
 
 /// Batch table epoch bump entry (Raft log).
@@ -181,12 +210,28 @@ pub struct BumpTableEpochEntry {
     pub updates: Vec<TableEpochUpdate>,
 }
 
+/// Add or update one static MetaRoute path rule with table-version CAS.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct PathRouteAddEntry {
+    pub op_ms: u64,
+    pub route: PathRouteEntry,
+    pub expected_table_version: u64,
+}
+
+/// Remove one static MetaRoute path rule with table-version CAS.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct PathRouteRemoveEntry {
+    pub op_ms: u64,
+    pub path: String,
+    pub expected_table_version: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum PdEntry {
     Noop,
     SetConfig(ConfigEntry),
     Mount(MountEntry),
-    Unmount(u32),
+    Unmount(UnMountEntry),
 
     // Node management
     RegisterNode(NodeEntry),
@@ -196,6 +241,9 @@ pub enum PdEntry {
     HeartbeatCheckpoint(HeartbeatCheckpointEntry),
     DeleteNode(DeleteNodeEntry),
 
+    // Namespace management
+    CreateNamespace(NamespaceCreateEntry),
+
     // BG management
     CreateBG(BGEntry),
     UpdateBG(BGUpdateEntry),
@@ -204,8 +252,8 @@ pub enum PdEntry {
     BumpTableEpoch(BumpTableEpochEntry),
 
     // Path route (MetaNode Federation static mode)
-    AddPathRoute(PathRouteEntry),
-    RemovePathRoute(String),
+    AddPathRoute(PathRouteAddEntry),
+    RemovePathRoute(PathRouteRemoveEntry),
 }
 
 impl PdEntry {
@@ -221,6 +269,7 @@ impl PdEntry {
             PdEntry::BatchUpdateNodeState(_) => "batch_update_node_state",
             PdEntry::HeartbeatCheckpoint(_) => "heartbeat_checkpoint",
             PdEntry::DeleteNode(_) => "delete_node",
+            PdEntry::CreateNamespace(_) => "create_namespace",
             PdEntry::CreateBG(_) => "create_bg",
             PdEntry::UpdateBG(_) => "update_bg",
             PdEntry::DeleteBG(_) => "delete_bg",

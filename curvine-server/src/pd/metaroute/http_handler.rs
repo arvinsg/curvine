@@ -53,7 +53,6 @@ pub async fn post_path_route_handler(
         group_id: body.group_id,
         create_time_ms: 0,
         update_time_ms: 0,
-        expected_table_version: 0,
     };
     match mm.add_route(entry) {
         Ok(()) => ApiResponse::<()>::success_with_status_code(axum::http::StatusCode::OK),

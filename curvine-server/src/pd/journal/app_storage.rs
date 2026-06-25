@@ -15,8 +15,9 @@
 use crate::pd::bg::BGManager;
 use crate::pd::config::ConfigManager;
 use crate::pd::journal::entry::PdEntry;
-use crate::pd::meta::MetaManager;
+use crate::pd::metaroute::MetaRouteManager;
 use crate::pd::mount::MountManager;
+use crate::pd::namespace::NamespaceManager;
 use crate::pd::node::NodeManager;
 use crate::pd::pd_server::Pd;
 use crate::pd::pool::PoolManager;
@@ -38,7 +39,8 @@ pub struct PdAppStorage {
     node_manager: Arc<NodeManager>,
     pool_manager: Arc<PoolManager>,
     bg_manager: Arc<BGManager>,
-    meta_manager: Arc<MetaManager>,
+    namespace_manager: Arc<NamespaceManager>,
+    metaroute_manager: Arc<MetaRouteManager>,
 }
 
 impl PdAppStorage {
@@ -50,7 +52,8 @@ impl PdAppStorage {
         node_manager: Arc<NodeManager>,
         pool_manager: Arc<PoolManager>,
         bg_manager: Arc<BGManager>,
-        meta_manager: Arc<MetaManager>,
+        namespace_manager: Arc<NamespaceManager>,
+        metaroute_manager: Arc<MetaRouteManager>,
     ) -> Self {
         Self {
             engine,
@@ -60,7 +63,8 @@ impl PdAppStorage {
             node_manager,
             pool_manager,
             bg_manager,
-            meta_manager,
+            namespace_manager,
+            metaroute_manager,
         }
     }
 
@@ -80,15 +84,15 @@ impl PdAppStorage {
                 info!("Apply noop entry");
             }
             PdEntry::SetConfig(entry) => {
-                let outcome = self.config_manager.apply_set_config(&entry.info)?;
+                let outcome = self.config_manager.apply_set_config(&entry)?;
                 return Ok(outcome.encode()?);
             }
             PdEntry::Mount(entry) => {
-                let outcome = self.mount_manager.apply_mount(entry.info)?;
+                let outcome = self.mount_manager.apply_mount(entry)?;
                 return Ok(outcome.encode()?);
             }
-            PdEntry::Unmount(mount_id) => {
-                let outcome = self.mount_manager.apply_unmount(mount_id)?;
+            PdEntry::Unmount(entry) => {
+                let outcome = self.mount_manager.apply_unmount(entry)?;
                 return Ok(outcome.encode()?);
             }
             PdEntry::RegisterNode(entry) => {
@@ -125,6 +129,16 @@ impl PdAppStorage {
                     entry.node_id, entry.expected_epoch, entry.expected_state
                 );
                 self.node_manager.apply_delete_node(&entry)?;
+            }
+            PdEntry::CreateNamespace(entry) => {
+                info!(
+                    "Apply CreateNamespace id={}, name={}",
+                    entry.namespace.id, entry.namespace.name
+                );
+                let outcome = self
+                    .namespace_manager
+                    .apply_create_namespace(&entry, is_leader)?;
+                return Ok(outcome.encode()?);
             }
             PdEntry::CreateBG(entry) => {
                 info!("Apply CreateBG bg_id={}", entry.info.bg_id);
@@ -171,23 +185,21 @@ impl PdAppStorage {
             PdEntry::AddPathRoute(ref entry) => {
                 info!(
                     "Apply AddPathRoute path={}, expected_table_version={}",
-                    entry.path, entry.expected_table_version
+                    entry.route.path, entry.expected_table_version
                 );
-                let outcome = self.meta_manager.apply_add_route(entry)?;
+                let outcome = self.metaroute_manager.apply_add_route(entry)?;
                 return Ok(outcome.encode()?);
             }
-            PdEntry::RemovePathRoute(ref path) => {
-                info!("Apply RemovePathRoute path={}", path);
-                let outcome = self.meta_manager.apply_remove_route(path)?;
+            PdEntry::RemovePathRoute(ref entry) => {
+                info!(
+                    "Apply RemovePathRoute path={}, expected_table_version={}",
+                    entry.path, entry.expected_table_version
+                );
+                let outcome = self.metaroute_manager.apply_remove_route(entry)?;
                 return Ok(outcome.encode()?);
             }
         }
 
-        // For now, modules return FsResult<()> and we surface no structured
-        // outcome. An empty byte slice on the wire is decoded as
-        // `ApplyOutcome::Applied` by the propose caller (see
-        // `pd/journal/apply_outcome.rs`). Per-module migrations in P1/P2/P3
-        // will replace `Ok(Vec::new())` with `outcome.encode()?`.
         Ok(Vec::new())
     }
 }
@@ -223,12 +235,14 @@ impl AppStorage for PdAppStorage {
         self.engine.restore(&files.dir)?;
         info!("Restored store from snapshot checkpoint {}", files.dir);
 
-        self.mount_manager.restore()?;
+        self.config_manager.restore()?;
         self.node_manager.restore()?;
         self.pool_manager.restore()?;
         self.bg_manager.restore()?;
         self.bg_manager.reset_runtime_route_state_after_snapshot();
-        self.meta_manager.restore()?;
+        self.namespace_manager.restore()?;
+        self.mount_manager.restore()?;
+        self.metaroute_manager.restore()?;
         Ok(())
     }
 
