@@ -27,25 +27,20 @@ use std::fs::read_to_string;
 /// MetaNode-related config: service mode and federation routing.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct MetaNodeConf {
-    /// Service mode: "proxy" | "shard" | "federation". Only federation is implemented.
+    /// Service mode: "proxy" | "shard" | "federation".
     #[serde(default)]
     pub mode: String,
 
-    /// Federation route mode: "static" or "hash". Used when mode = "federation".
+    /// Optional Federation hash level.
     #[serde(default)]
-    pub route_mode: String,
-
-    /// Federation hash level (1-based path component). Used when route_mode = "hash".
-    #[serde(default)]
-    pub hash_level: u8,
+    pub federation_hash_level: Option<u8>,
 }
 
 impl Default for MetaNodeConf {
     fn default() -> Self {
         Self {
             mode: "federation".to_string(),
-            route_mode: "hash".to_string(),
-            hash_level: 2,
+            federation_hash_level: None,
         }
     }
 }

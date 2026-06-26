@@ -40,17 +40,13 @@ impl MetaRouteStore {
     }
 
     pub fn apply_add_route(&self, entry: &PathRouteEntry, version: u64) -> CommonResult<()> {
-        self.store.write_batch(vec![
-            self.route_put_op(entry)?,
-            self.version_op(version),
-        ])
+        self.store
+            .write_batch(vec![self.route_put_op(entry)?, self.version_op(version)])
     }
 
     pub fn apply_remove_route(&self, path: &str, version: u64) -> CommonResult<()> {
-        self.store.write_batch(vec![
-            self.route_delete_op(path),
-            self.version_op(version),
-        ])
+        self.store
+            .write_batch(vec![self.route_delete_op(path), self.version_op(version)])
     }
 
     pub fn get_path_route(&self, path: &str) -> CommonResult<Option<PathRouteEntry>> {
@@ -81,11 +77,6 @@ impl MetaRouteStore {
             .map(|v| decode_u64("path route version", &v))
             .transpose()
             .map(|v| v.unwrap_or(0))
-    }
-
-    #[cfg(test)]
-    pub fn put_path_route_version(&self, version: u64) -> CommonResult<()> {
-        self.store.put(NS, &VERSION_KEY, &version.to_be_bytes())
     }
 
     fn put_op(&self, key: Vec<u8>, value: Vec<u8>) -> KvWrite {
