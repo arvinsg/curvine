@@ -426,9 +426,7 @@ impl MountManager {
 
     /// Leader-fenced propose + ApplyOutcome translation.
     fn propose_mount(&self, entry: MountEntry, cv_path: String, kind: &str) -> FsResult<()> {
-        let outcome = self
-            .journal_client
-            .propose_as_leader_with_result(PdEntry::Mount(entry))?;
+        let outcome = self.journal_client.propose(PdEntry::Mount(entry))?;
         match outcome {
             ApplyOutcome::Applied | ApplyOutcome::SkippedNoop => Ok(()),
             ApplyOutcome::SkippedStale { reason } => {
@@ -460,9 +458,7 @@ impl MountManager {
             expected_cv_path: cv_path.to_string(),
             expected_version,
         };
-        let outcome = self
-            .journal_client
-            .propose_as_leader_with_result(PdEntry::Unmount(entry))?;
+        let outcome = self.journal_client.propose(PdEntry::Unmount(entry))?;
         match outcome {
             ApplyOutcome::Applied | ApplyOutcome::SkippedNoop => Ok(()),
             ApplyOutcome::SkippedStale { reason } => {
