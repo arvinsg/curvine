@@ -20,6 +20,7 @@ pub enum NodeEventType {
     HeartbeatResumed,
     Lost,
     Offline,
+    Blacklisted,
     DecommissionStarted,
     DecommissionFinished,
 }
@@ -31,6 +32,7 @@ impl NodeEventType {
             NodeEventType::HeartbeatResumed => "heartbeat_resumed",
             NodeEventType::Lost => "lost",
             NodeEventType::Offline => "offline",
+            NodeEventType::Blacklisted => "blacklisted",
             NodeEventType::DecommissionStarted => "decommission_started",
             NodeEventType::DecommissionFinished => "decommission_finished",
         }

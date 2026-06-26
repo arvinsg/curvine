@@ -12,48 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::HeartbeatHandler;
-use curvine_common::state::{
-    HeartbeatPayload, HeartbeatRequest, HeartbeatResponsePayload, NodeInfo, NodePayload, NodeState,
-    NodeType, RegisterRequest, WorkerHeartbeatResponse,
-};
+use super::NodeHandler;
+use curvine_common::state::{HeartbeatPayload, HeartbeatRequest, NodeInfo, NodePayload, NodeType};
 use curvine_common::{FsError, FsResult};
 
-pub struct WorkerHeartbeatHandler;
+pub struct WorkerNodeHandler;
 
-impl WorkerHeartbeatHandler {
+impl WorkerNodeHandler {
     pub fn new() -> Self {
         Self
     }
 }
 
-impl Default for WorkerHeartbeatHandler {
+impl Default for WorkerNodeHandler {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl HeartbeatHandler for WorkerHeartbeatHandler {
-    fn supported_node_type(&self) -> NodeType {
+impl NodeHandler for WorkerNodeHandler {
+    fn node_type(&self) -> NodeType {
         NodeType::Worker
-    }
-
-    fn build_node_info(&self, req: &RegisterRequest) -> FsResult<NodeInfo> {
-        let payload = match &req.payload {
-            NodePayload::Worker(p) => p.clone(),
-            _ => return Err(FsError::common("expected Worker payload")),
-        };
-
-        Ok(NodeInfo {
-            base: req.base.clone(),
-            epoch: 0,
-            state: NodeState::Starting,
-            last_heartbeat_ms: 0,
-            state_since_ms: orpc::common::LocalTime::mills(),
-            last_persist_ms: 0,
-            sys_stats: Default::default(),
-            payload: NodePayload::Worker(payload),
-        })
     }
 
     fn process_heartbeat(&self, node: &mut NodeInfo, req: &HeartbeatRequest) -> FsResult<bool> {
@@ -80,15 +59,5 @@ impl HeartbeatHandler for WorkerHeartbeatHandler {
         }
 
         Ok(false)
-    }
-
-    fn build_heartbeat_response(
-        &self,
-        _node: &NodeInfo,
-        _req: &HeartbeatRequest,
-    ) -> FsResult<HeartbeatResponsePayload> {
-        Ok(HeartbeatResponsePayload::Worker(
-            WorkerHeartbeatResponse::default(),
-        ))
     }
 }

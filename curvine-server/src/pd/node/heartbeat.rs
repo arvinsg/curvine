@@ -12,26 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::{
-    HeartbeatRequest, HeartbeatResponsePayload, NodeInfo, NodeType, RegisterRequest,
-};
-use curvine_common::FsResult;
+use curvine_common::state::{HeartbeatRequest, NodeInfo, NodeState, NodeType, RegisterRequest};
+use curvine_common::{FsError, FsResult};
 
-/// Handler for a specific node type (Worker or Meta...).
-pub trait HeartbeatHandler: Send + Sync {
+/// Handler for type-specific node registration and heartbeat runtime updates.
+pub trait NodeHandler: Send + Sync {
     /// Returns the node type this handler supports.
-    fn supported_node_type(&self) -> NodeType;
+    fn node_type(&self) -> NodeType;
 
     /// Build initial NodeInfo from a registration request.
-    fn build_node_info(&self, req: &RegisterRequest) -> FsResult<NodeInfo>;
+    fn build_node_info(&self, req: &RegisterRequest) -> FsResult<NodeInfo> {
+        if req.base.node_type != self.node_type() {
+            return Err(FsError::common(format!(
+                "node_type mismatch: expected {:?}, got {:?}",
+                self.node_type(),
+                req.base.node_type
+            )));
+        }
 
-    /// Process heartbeat: update role-specific fields on the in-memory node.
+        Ok(NodeInfo {
+            base: req.base.clone(),
+            epoch: 0,
+            state: NodeState::Starting,
+            last_heartbeat_ms: 0,
+            state_since_ms: orpc::common::LocalTime::mills(),
+            last_persist_ms: 0,
+            sys_stats: Default::default(),
+            payload: req.payload.clone(),
+        })
+    }
+
+    /// Process heartbeat: update role-specific runtime fields on the in-memory node.
+    /// Returns true when persistent payload fields changed and need a Raft update.
     fn process_heartbeat(&self, node: &mut NodeInfo, req: &HeartbeatRequest) -> FsResult<bool>;
-
-    /// Build the role-specific part of the heartbeat response payload.
-    fn build_heartbeat_response(
-        &self,
-        node: &NodeInfo,
-        req: &HeartbeatRequest,
-    ) -> FsResult<HeartbeatResponsePayload>;
 }

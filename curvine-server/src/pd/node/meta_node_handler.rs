@@ -12,47 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::HeartbeatHandler;
-use curvine_common::state::{
-    HeartbeatPayload, HeartbeatRequest, HeartbeatResponsePayload, MetaHeartbeatResponse, NodeInfo,
-    NodePayload, NodeState, NodeType, RegisterRequest,
-};
+use super::NodeHandler;
+use curvine_common::state::{HeartbeatPayload, HeartbeatRequest, NodeInfo, NodePayload, NodeType};
 use curvine_common::{FsError, FsResult};
 
-pub struct MetaHeartbeatHandler;
+pub struct MetaNodeHandler;
 
-impl MetaHeartbeatHandler {
+impl MetaNodeHandler {
     pub fn new() -> Self {
         Self
     }
 }
 
-impl Default for MetaHeartbeatHandler {
+impl Default for MetaNodeHandler {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl HeartbeatHandler for MetaHeartbeatHandler {
-    fn supported_node_type(&self) -> NodeType {
+impl NodeHandler for MetaNodeHandler {
+    fn node_type(&self) -> NodeType {
         NodeType::Meta
-    }
-
-    fn build_node_info(&self, req: &RegisterRequest) -> FsResult<NodeInfo> {
-        let payload = match &req.payload {
-            NodePayload::Meta(p) => p.clone(),
-            _ => return Err(FsError::common("expected Meta payload")),
-        };
-        Ok(NodeInfo {
-            base: req.base.clone(),
-            epoch: 0,
-            state: NodeState::Starting,
-            last_heartbeat_ms: 0,
-            state_since_ms: orpc::common::LocalTime::mills(),
-            last_persist_ms: 0,
-            sys_stats: Default::default(),
-            payload: NodePayload::Meta(payload),
-        })
     }
 
     fn process_heartbeat(&self, node: &mut NodeInfo, req: &HeartbeatRequest) -> FsResult<bool> {
@@ -94,16 +74,5 @@ impl HeartbeatHandler for MetaHeartbeatHandler {
         }
 
         Ok(changed)
-    }
-
-    fn build_heartbeat_response(
-        &self,
-        _node: &NodeInfo,
-        _req: &HeartbeatRequest,
-    ) -> FsResult<HeartbeatResponsePayload> {
-        Ok(HeartbeatResponsePayload::Meta(MetaHeartbeatResponse {
-            path_route_update: None,
-            node_group_update: None,
-        }))
     }
 }

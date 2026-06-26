@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::HeartbeatHandler;
+use super::NodeHandler;
 use curvine_common::state::NodeType;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Registry of heartbeat handlers by node type.
 pub struct HandlerRegistry {
-    handlers: HashMap<NodeType, Arc<dyn HeartbeatHandler>>,
+    handlers: HashMap<NodeType, Arc<dyn NodeHandler>>,
 }
 
 impl HandlerRegistry {
@@ -29,13 +29,13 @@ impl HandlerRegistry {
         }
     }
 
-    pub fn register(&mut self, handler: Arc<dyn HeartbeatHandler>) {
-        let node_type = handler.supported_node_type();
+    pub fn register(&mut self, handler: Arc<dyn NodeHandler>) {
+        let node_type = handler.node_type();
         self.handlers.insert(node_type, handler);
     }
 
     /// Get handler by node type as a trait object reference.
-    pub fn get(&self, node_type: NodeType) -> Option<&(dyn HeartbeatHandler + 'static)> {
+    pub fn get(&self, node_type: NodeType) -> Option<&(dyn NodeHandler + 'static)> {
         self.handlers.get(&node_type).map(|h| h.as_ref())
     }
 
