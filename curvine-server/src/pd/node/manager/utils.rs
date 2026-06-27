@@ -87,66 +87,10 @@ impl NodeManager {
         }
     }
 
-    // todo
-    pub(super) fn same_node_incarnation(existing: &NodeInfo, node: &NodeInfo) -> bool {
-        existing.epoch == node.epoch
-            && existing.state == node.state
-            && Self::same_node_base(&existing.base, &node.base)
-            && Self::same_persistent_payload(&existing.payload, &node.payload)
-    }
-
-    // todo
-    pub(super) fn same_node_base(
-        left: &curvine_common::state::NodeBase,
-        right: &curvine_common::state::NodeBase,
-    ) -> bool {
-        left.node_id == right.node_id
-            && left.node_type == right.node_type
-            && left.address == right.address
-            && left.labels == right.labels
-            && left.software_version == right.software_version
-            && left.startup_time_ms == right.startup_time_ms
-    }
-
-    // todo
-    pub(super) fn same_persistent_node_state(left: &NodeInfo, right: &NodeInfo) -> bool {
-        Self::same_node_base(&left.base, &right.base)
-            && left.epoch == right.epoch
-            && left.state == right.state
-            && left.state_since_ms == right.state_since_ms
-            && left.last_heartbeat_ms == right.last_heartbeat_ms
-            && Self::same_persistent_payload(&left.payload, &right.payload)
-    }
-
-    // todo
-    pub(super) fn same_persistent_payload(left: &NodePayload, right: &NodePayload) -> bool {
-        match (left, right) {
-            (NodePayload::Worker(l), NodePayload::Worker(r)) => {
-                l.storage_specs.len() == r.storage_specs.len()
-                    && l.storage_specs.iter().all(|(id, left_spec)| {
-                        r.storage_specs.get(id).is_some_and(|right_spec| {
-                            left_spec.dir_id == right_spec.dir_id
-                                && left_spec.storage_id == right_spec.storage_id
-                                && left_spec.failed == right_spec.failed
-                                && left_spec.storage_type == right_spec.storage_type
-                                && left_spec.dir_path == right_spec.dir_path
-                        })
-                    })
-            }
-            (NodePayload::Meta(l), NodePayload::Meta(r)) => {
-                l.group_id == r.group_id
-                    && l.peers.len() == r.peers.len()
-                    && l.peers.iter().zip(&r.peers).all(|(a, b)| {
-                        a.node_id == b.node_id
-                            && a.address == b.address
-                            && a.is_leader == b.is_leader
-                    })
-                    && l.rw_policy == r.rw_policy
-                    && l.group_epoch == r.group_epoch
-            }
-            (NodePayload::Task(_), NodePayload::Task(_)) => true,
-            _ => false,
-        }
+    #[cfg(test)]
+    pub fn test_insert_node(&self, node: NodeInfo) {
+        let mut index = self.index.write().unwrap();
+        index.insert(node);
     }
 
     pub(super) fn is_valid_state_transition(from: NodeState, to: NodeState) -> bool {
