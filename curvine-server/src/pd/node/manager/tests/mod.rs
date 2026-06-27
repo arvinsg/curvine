@@ -12,24 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod event;
-mod heartbeat;
-mod index;
-mod manager;
-#[cfg(test)]
-mod manager_tests;
-mod meta_node_handler;
-mod registry;
-mod store;
-mod task_node_handler;
-mod worker_node_handler;
+mod fixtures;
 
-pub use event::{NodeEvent, NodeEventType};
-pub use heartbeat::NodeHandler;
-pub use index::NodeIndex;
-pub use manager::NodeManager;
-pub use meta_node_handler::MetaNodeHandler;
-pub use registry::HandlerRegistry;
-pub use store::NodeStore;
-pub use task_node_handler::TaskNodeHandler;
-pub use worker_node_handler::WorkerNodeHandler;
+mod apply_tests;
+mod liveness_tests;
+mod query_tests;
+mod register_tests;

@@ -12,24 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod event;
-mod heartbeat;
-mod index;
-mod manager;
-#[cfg(test)]
-mod manager_tests;
-mod meta_node_handler;
-mod registry;
-mod store;
-mod task_node_handler;
-mod worker_node_handler;
+use super::fixtures::*;
+use curvine_common::state::{NodeState, NodeType};
 
-pub use event::{NodeEvent, NodeEventType};
-pub use heartbeat::NodeHandler;
-pub use index::NodeIndex;
-pub use manager::NodeManager;
-pub use meta_node_handler::MetaNodeHandler;
-pub use registry::HandlerRegistry;
-pub use store::NodeStore;
-pub use task_node_handler::TaskNodeHandler;
-pub use worker_node_handler::WorkerNodeHandler;
+#[test]
+fn detect_heartbeat_timeout_ignores_non_live() {
+    let mgr = test_manager();
+    let mut node = make_node(1, NodeType::Worker, NodeState::Lost);
+    node.last_heartbeat_ms = 1000;
+    insert_node(&mgr, &node);
+
+    let timed_out = mgr.detect_heartbeat_timeout(20_000, 5_000);
+    assert!(timed_out.is_empty());
+
+    let updated = mgr.get_node(1).unwrap();
+    assert_eq!(updated.state, NodeState::Lost);
+}
