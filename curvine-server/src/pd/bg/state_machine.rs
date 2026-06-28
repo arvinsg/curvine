@@ -12,56 +12,74 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::BGState;
+use curvine_common::state::{BGKind, BGState};
 use curvine_common::{FsError, FsResult};
 
-/// Validate and execute BG state transitions:
+/// Validate persisted BG state transitions.
 ///
-/// ```text
-/// Init ──assign──> Assigned/Active
-///                        │
-///                        ├──worker lost──> Degraded ──recover──> Recovering ──done──> Active
-///                        │
-///                        ├──table balance──> Rebalancing ──done──> Active
-///                        │
-///                        └──delete cmd──> Deleting
-/// ```
-pub fn validate_transition(current: BGState, target: BGState) -> FsResult<()> {
-    let valid = match (current, target) {
-        (BGState::Init, BGState::Assigned) => true,
-        (BGState::Assigned, BGState::Active) => true,
-        (BGState::Assigned, BGState::Degraded) => true,
-        (BGState::Active, BGState::Degraded) => true,
-        (BGState::Active, BGState::Rebalancing) => true,
-        (BGState::Degraded, BGState::Recovering) => true,
-        (BGState::Recovering, BGState::Active) => true,
-        (BGState::Rebalancing, BGState::Active) => true,
-        (_, BGState::Deleting) => true,
-        _ => false,
+/// Hash BG uses Active/Degraded to expose health and never enters Sealed.
+/// Capacity BG keeps a simple lifecycle: Active -> Sealed -> Deleting, where
+/// Sealed is the fail-fast write-buffer boundary and must never reopen.
+pub fn validate_transition(kind: BGKind, current: BGState, target: BGState) -> FsResult<()> {
+    if current == target {
+        return Ok(());
+    }
+    let valid = match kind {
+        BGKind::Hash => valid_hash_transition(current, target),
+        BGKind::Capacity => valid_capacity_transition(current, target),
     };
     if valid {
         Ok(())
     } else {
         Err(FsError::common(format!(
-            "invalid BG state transition: {:?} -> {:?}",
-            current, target
+            "invalid {:?} BG state transition: {:?} -> {:?}",
+            kind, current, target
         )))
     }
 }
 
-fn next_states(state: BGState) -> Vec<BGState> {
-    match state {
-        BGState::Init => vec![BGState::Assigned, BGState::Deleting],
-        BGState::Assigned => vec![BGState::Active, BGState::Degraded, BGState::Deleting],
-        BGState::Active => vec![BGState::Degraded, BGState::Rebalancing, BGState::Deleting],
-        BGState::Degraded => vec![BGState::Recovering, BGState::Deleting],
-        BGState::Recovering => vec![BGState::Active, BGState::Deleting],
-        BGState::Rebalancing => vec![BGState::Active, BGState::Deleting],
-        BGState::Deleting => vec![],
+fn valid_hash_transition(current: BGState, target: BGState) -> bool {
+    matches!(
+        (current, target),
+        (BGState::Init, BGState::Active)
+            | (BGState::Init, BGState::Degraded)
+            | (BGState::Init, BGState::Deleting)
+            | (BGState::Active, BGState::Degraded)
+            | (BGState::Active, BGState::Deleting)
+            | (BGState::Degraded, BGState::Active)
+            | (BGState::Degraded, BGState::Deleting)
+    )
+}
+
+fn valid_capacity_transition(current: BGState, target: BGState) -> bool {
+    matches!(
+        (current, target),
+        (BGState::Init, BGState::Active)
+            | (BGState::Init, BGState::Deleting)
+            | (BGState::Active, BGState::Sealed)
+            | (BGState::Sealed, BGState::Deleting)
+    )
+}
+
+fn next_states(kind: BGKind, state: BGState) -> &'static [BGState] {
+    match kind {
+        BGKind::Hash => match state {
+            BGState::Init => &[BGState::Active, BGState::Degraded, BGState::Deleting],
+            BGState::Active => &[BGState::Degraded, BGState::Deleting],
+            BGState::Degraded => &[BGState::Active, BGState::Deleting],
+            BGState::Sealed | BGState::Deleting => &[],
+        },
+        BGKind::Capacity => match state {
+            BGState::Init => &[BGState::Active, BGState::Deleting],
+            BGState::Active => &[BGState::Sealed],
+            BGState::Degraded => &[],
+            BGState::Sealed => &[BGState::Deleting],
+            BGState::Deleting => &[],
+        },
     }
 }
 
-pub fn is_reachable(current: BGState, target: BGState) -> bool {
+pub fn is_reachable(kind: BGKind, current: BGState, target: BGState) -> bool {
     if current == target {
         return true;
     }
@@ -72,11 +90,11 @@ pub fn is_reachable(current: BGState, target: BGState) -> bool {
             continue;
         }
         visited.push(s);
-        for next in next_states(s) {
-            if next == target {
+        for next in next_states(kind, s) {
+            if *next == target {
                 return true;
             }
-            stack.push(next);
+            stack.push(*next);
         }
     }
     false
@@ -87,43 +105,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn valid_transitions() {
-        assert!(validate_transition(BGState::Init, BGState::Assigned).is_ok());
-        assert!(validate_transition(BGState::Assigned, BGState::Active).is_ok());
-        assert!(validate_transition(BGState::Assigned, BGState::Degraded).is_ok());
-        assert!(validate_transition(BGState::Active, BGState::Degraded).is_ok());
-        assert!(validate_transition(BGState::Active, BGState::Rebalancing).is_ok());
-        assert!(validate_transition(BGState::Degraded, BGState::Recovering).is_ok());
-        assert!(validate_transition(BGState::Recovering, BGState::Active).is_ok());
-        assert!(validate_transition(BGState::Rebalancing, BGState::Active).is_ok());
+    fn hash_transitions_allow_degraded_but_do_not_allow_sealed() {
+        assert!(validate_transition(BGKind::Hash, BGState::Init, BGState::Active).is_ok());
+        assert!(validate_transition(BGKind::Hash, BGState::Active, BGState::Degraded).is_ok());
+        assert!(validate_transition(BGKind::Hash, BGState::Degraded, BGState::Active).is_ok());
+        assert!(validate_transition(BGKind::Hash, BGState::Degraded, BGState::Deleting).is_ok());
+        assert!(validate_transition(BGKind::Hash, BGState::Active, BGState::Sealed).is_err());
+        assert!(validate_transition(BGKind::Hash, BGState::Sealed, BGState::Deleting).is_err());
+        assert!(!is_reachable(
+            BGKind::Hash,
+            BGState::Active,
+            BGState::Sealed
+        ));
     }
 
     #[test]
-    fn any_to_deleting() {
-        assert!(validate_transition(BGState::Init, BGState::Deleting).is_ok());
-        assert!(validate_transition(BGState::Assigned, BGState::Deleting).is_ok());
-        assert!(validate_transition(BGState::Active, BGState::Deleting).is_ok());
-        assert!(validate_transition(BGState::Degraded, BGState::Deleting).is_ok());
-        assert!(validate_transition(BGState::Recovering, BGState::Deleting).is_ok());
-        assert!(validate_transition(BGState::Rebalancing, BGState::Deleting).is_ok());
+    fn capacity_transitions_allow_seal_but_not_reopen() {
+        assert!(validate_transition(BGKind::Capacity, BGState::Init, BGState::Active).is_ok());
+        assert!(validate_transition(BGKind::Capacity, BGState::Active, BGState::Sealed).is_ok());
+        assert!(validate_transition(BGKind::Capacity, BGState::Active, BGState::Degraded).is_err());
+        assert!(validate_transition(BGKind::Capacity, BGState::Sealed, BGState::Deleting).is_ok());
+        assert!(validate_transition(BGKind::Capacity, BGState::Sealed, BGState::Active).is_err());
+        assert!(!is_reachable(
+            BGKind::Capacity,
+            BGState::Sealed,
+            BGState::Active
+        ));
     }
 
     #[test]
-    fn invalid_transitions() {
-        assert!(validate_transition(BGState::Init, BGState::Degraded).is_err());
-        assert!(validate_transition(BGState::Init, BGState::Rebalancing).is_err());
-        assert!(validate_transition(BGState::Assigned, BGState::Init).is_err());
-        assert!(validate_transition(BGState::Degraded, BGState::Assigned).is_err());
-        assert!(validate_transition(BGState::Rebalancing, BGState::Degraded).is_err());
-    }
-
-    #[test]
-    fn reachability() {
-        assert!(is_reachable(BGState::Init, BGState::Assigned));
-        assert!(is_reachable(BGState::Assigned, BGState::Recovering));
-        assert!(is_reachable(BGState::Init, BGState::Deleting));
-        assert!(!is_reachable(BGState::Deleting, BGState::Init));
-        // Degraded can loop (Degraded <-> Recovering <-> Active) but never reaches Assigned.
-        assert!(!is_reachable(BGState::Degraded, BGState::Assigned));
+    fn deleting_is_terminal() {
+        for kind in [BGKind::Hash, BGKind::Capacity] {
+            assert!(validate_transition(kind, BGState::Init, BGState::Deleting).is_ok());
+            assert!(validate_transition(kind, BGState::Deleting, BGState::Active).is_err());
+        }
     }
 }
