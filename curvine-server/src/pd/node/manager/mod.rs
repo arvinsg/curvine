@@ -28,7 +28,7 @@ use super::store::NodeStore;
 use super::{HandlerRegistry, MetaNodeHandler, NodeHandler, TaskNodeHandler, WorkerNodeHandler};
 use crate::pd::config::ConfigManager;
 use crate::pd::journal;
-use crate::pd::journal::entry::NodePayloadUpdate;
+use crate::pd::journal::entry::NodePayloadPatch;
 use curvine_common::state::{NodeInfo, NodeState, NodeType};
 use curvine_common::{FsError, FsResult};
 use std::sync::{Arc, RwLock};
@@ -43,9 +43,8 @@ pub(super) struct HeartbeatPlan {
     pub(super) planned: NodeInfo,
     pub(super) old_state: NodeState,
     pub(super) state_changed: bool,
-    pub(super) critical_changed: bool,
     pub(super) need_checkpoint: bool,
-    pub(super) payload_update: Option<NodePayloadUpdate>,
+    pub(super) payload_patch: Option<NodePayloadPatch>,
 }
 
 pub struct NodeManager {

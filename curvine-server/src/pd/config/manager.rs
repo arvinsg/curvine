@@ -243,9 +243,7 @@ impl ConfigManager {
         let entry = self.build_set_entry(req)?;
         let version = entry.info.version;
         let key = entry.info.key.clone();
-        let outcome = self
-            .journal_client
-            .propose(PdEntry::SetConfig(entry))?;
+        let outcome = self.journal_client.propose(PdEntry::SetConfig(entry))?;
         match outcome {
             ApplyOutcome::Applied | ApplyOutcome::SkippedNoop => Ok(SetConfigResponse {
                 success: true,

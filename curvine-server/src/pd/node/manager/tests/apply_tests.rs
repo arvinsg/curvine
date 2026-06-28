@@ -14,20 +14,20 @@
 
 use super::fixtures::*;
 use crate::pd::journal::entry::{
-    DeleteNodeEntry, HeartbeatCheckpointEntry, NodePayloadUpdate, UpdateNodeStateEntry,
+    MetaNodePayloadPatch, NodePayloadPatch, RemoveNodeEntry, UpdateNodePayloadEntry,
+    UpdateNodeStatusEntry,
 };
-use curvine_common::state::{NodeInfo, NodePayload, NodeState, NodeType};
+use curvine_common::state::{NodeInfo, NodePayload, NodeState, NodeType, PeerInfo, RwPolicy};
 
 #[test]
-fn apply_update_node_state_cases() {
+fn apply_update_node_status_cases() {
     struct Case {
         name: &'static str,
-        seed: NodeInfo,
-        entry: UpdateNodeStateEntry,
+        seed: Option<NodeInfo>,
+        entry: UpdateNodeStatusEntry,
         expected_outcome: ExpectedOutcome,
-        expected_state: NodeState,
-        expected_epoch: u64,
-        expected_last_heartbeat_ms: u64,
+        expected_state: Option<NodeState>,
+        expected_last_heartbeat_ms: Option<u64>,
     }
 
     let mut live = make_node(1, NodeType::Worker, NodeState::Live);
@@ -37,166 +37,82 @@ fn apply_update_node_state_cases() {
     let mut epoch2 = live.clone();
     epoch2.epoch = 2;
 
-    let mut heartbeat_advanced = live.clone();
-    heartbeat_advanced.last_heartbeat_ms = 2_000;
+    let mut fresh_heartbeat = live.clone();
+    fresh_heartbeat.last_heartbeat_ms = 30_000;
+
+    let mut old_heartbeat = live.clone();
+    old_heartbeat.last_heartbeat_ms = 10;
 
     let cases = vec![
         Case {
-            name: "live to lost",
-            seed: live.clone(),
-            entry: update_entry(1, 1, Some(NodeState::Live), None, NodeState::Lost),
-            expected_outcome: ExpectedOutcome::Applied,
-            expected_state: NodeState::Lost,
-            expected_epoch: 1,
-            expected_last_heartbeat_ms: 1_000,
-        },
-        Case {
-            name: "reject stale epoch",
-            seed: epoch2,
-            entry: update_entry(1, 1, Some(NodeState::Live), None, NodeState::Lost),
-            expected_outcome: ExpectedOutcome::Stale,
-            expected_state: NodeState::Live,
-            expected_epoch: 2,
-            expected_last_heartbeat_ms: 1_000,
-        },
-        Case {
-            name: "reject stale state",
-            seed: live.clone(),
-            entry: update_entry(1, 1, Some(NodeState::Lost), None, NodeState::Offline),
-            expected_outcome: ExpectedOutcome::Stale,
-            expected_state: NodeState::Live,
-            expected_epoch: 1,
-            expected_last_heartbeat_ms: 1_000,
-        },
-        Case {
-            name: "idempotent already target state",
-            seed: live.clone(),
-            entry: update_entry(1, 1, Some(NodeState::Lost), None, NodeState::Live),
-            expected_outcome: ExpectedOutcome::Noop,
-            expected_state: NodeState::Live,
-            expected_epoch: 1,
-            expected_last_heartbeat_ms: 1_000,
-        },
-        Case {
-            name: "heartbeat fence accepts matching timestamp",
-            seed: live.clone(),
-            entry: update_entry(1, 1, Some(NodeState::Live), Some(1_000), NodeState::Lost),
-            expected_outcome: ExpectedOutcome::Applied,
-            expected_state: NodeState::Lost,
-            expected_epoch: 1,
-            expected_last_heartbeat_ms: 1_000,
-        },
-        Case {
-            name: "heartbeat fence skips advanced timestamp",
-            seed: heartbeat_advanced,
-            entry: update_entry(1, 1, Some(NodeState::Live), Some(1_000), NodeState::Lost),
-            expected_outcome: ExpectedOutcome::Noop,
-            expected_state: NodeState::Live,
-            expected_epoch: 1,
-            expected_last_heartbeat_ms: 2_000,
-        },
-    ];
-
-    for case in cases {
-        let mgr = test_manager();
-        insert_node(&mgr, &case.seed);
-        let outcome = mgr.apply_update_node_state(&case.entry).unwrap();
-        assert_outcome(outcome, case.expected_outcome);
-        let updated = mgr.get_node(1).unwrap();
-        assert_eq!(updated.state, case.expected_state, "{}", case.name);
-        assert_eq!(updated.epoch, case.expected_epoch, "{}", case.name);
-        assert_eq!(
-            updated.last_heartbeat_ms, case.expected_last_heartbeat_ms,
-            "{}",
-            case.name
-        );
-    }
-}
-
-#[test]
-fn apply_heartbeat_checkpoint_cases() {
-    struct Case {
-        name: &'static str,
-        seed: Option<NodeInfo>,
-        entry: HeartbeatCheckpointEntry,
-        expected_outcome: ExpectedOutcome,
-        expected_last_heartbeat_ms: Option<u64>,
-    }
-
-    let mut live = make_node(1, NodeType::Worker, NodeState::Live);
-    live.epoch = 1;
-    live.last_heartbeat_ms = 10;
-
-    let mut epoch2 = live.clone();
-    epoch2.epoch = 2;
-
-    let mut lost = live.clone();
-    lost.state = NodeState::Lost;
-
-    let cases = vec![
-        Case {
-            name: "checkpoint advances heartbeat",
+            name: "live to lost when heartbeat expired",
             seed: Some(live.clone()),
-            entry: HeartbeatCheckpointEntry {
-                op_ms: 20_000,
-                node_id: 1,
-                expected_epoch: 1,
-                expected_state: Some(NodeState::Live),
-                last_heartbeat_ms: 20,
-            },
+            entry: status_entry(80_000, 1, 1, NodeState::Live, Some(NodeState::Lost), None),
             expected_outcome: ExpectedOutcome::Applied,
-            expected_last_heartbeat_ms: Some(20),
+            expected_state: Some(NodeState::Lost),
+            expected_last_heartbeat_ms: Some(1_000),
+        },
+        Case {
+            name: "skip live to lost when heartbeat is still fresh at apply",
+            seed: Some(fresh_heartbeat),
+            entry: status_entry(80_000, 1, 1, NodeState::Live, Some(NodeState::Lost), None),
+            expected_outcome: ExpectedOutcome::Noop,
+            expected_state: Some(NodeState::Live),
+            expected_last_heartbeat_ms: Some(30_000),
         },
         Case {
             name: "reject stale epoch",
             seed: Some(epoch2),
-            entry: HeartbeatCheckpointEntry {
-                op_ms: 20_000,
-                node_id: 1,
-                expected_epoch: 1,
-                expected_state: Some(NodeState::Live),
-                last_heartbeat_ms: 999,
-            },
+            entry: status_entry(80_000, 1, 1, NodeState::Live, Some(NodeState::Lost), None),
             expected_outcome: ExpectedOutcome::Stale,
-            expected_last_heartbeat_ms: Some(10),
+            expected_state: Some(NodeState::Live),
+            expected_last_heartbeat_ms: Some(1_000),
         },
         Case {
             name: "reject stale state",
-            seed: Some(lost),
-            entry: HeartbeatCheckpointEntry {
-                op_ms: 20_000,
-                node_id: 1,
-                expected_epoch: 1,
-                expected_state: Some(NodeState::Live),
-                last_heartbeat_ms: 999,
-            },
+            seed: Some(live.clone()),
+            entry: status_entry(
+                20_000,
+                1,
+                1,
+                NodeState::Lost,
+                Some(NodeState::Offline),
+                None,
+            ),
             expected_outcome: ExpectedOutcome::Stale,
-            expected_last_heartbeat_ms: Some(10),
+            expected_state: Some(NodeState::Live),
+            expected_last_heartbeat_ms: Some(1_000),
         },
         Case {
-            name: "skip older heartbeat",
+            name: "idempotent already target state",
             seed: Some(live.clone()),
-            entry: HeartbeatCheckpointEntry {
-                op_ms: 20_000,
-                node_id: 1,
-                expected_epoch: 1,
-                expected_state: Some(NodeState::Live),
-                last_heartbeat_ms: 5,
-            },
+            entry: status_entry(20_000, 1, 1, NodeState::Lost, Some(NodeState::Live), None),
             expected_outcome: ExpectedOutcome::Noop,
+            expected_state: Some(NodeState::Live),
+            expected_last_heartbeat_ms: Some(1_000),
+        },
+        Case {
+            name: "heartbeat only advances monotonically",
+            seed: Some(old_heartbeat.clone()),
+            entry: status_entry(20_000, 1, 1, NodeState::Live, None, Some(20)),
+            expected_outcome: ExpectedOutcome::Applied,
+            expected_state: Some(NodeState::Live),
+            expected_last_heartbeat_ms: Some(20),
+        },
+        Case {
+            name: "heartbeat only skips older timestamp",
+            seed: Some(old_heartbeat),
+            entry: status_entry(20_000, 1, 1, NodeState::Live, None, Some(5)),
+            expected_outcome: ExpectedOutcome::Noop,
+            expected_state: Some(NodeState::Live),
             expected_last_heartbeat_ms: Some(10),
         },
         Case {
             name: "missing node",
             seed: None,
-            entry: HeartbeatCheckpointEntry {
-                op_ms: 20_000,
-                node_id: 1,
-                expected_epoch: 1,
-                expected_state: Some(NodeState::Live),
-                last_heartbeat_ms: 20,
-            },
+            entry: status_entry(20_000, 1, 1, NodeState::Live, None, Some(20)),
             expected_outcome: ExpectedOutcome::NotFound,
+            expected_state: None,
             expected_last_heartbeat_ms: None,
         },
     ];
@@ -206,26 +122,170 @@ fn apply_heartbeat_checkpoint_cases() {
         if let Some(seed) = &case.seed {
             insert_node(&mgr, seed);
         }
-        let outcome = mgr.apply_heartbeat_checkpoint(&case.entry).unwrap();
+        let outcome = mgr.apply_update_node_status(&case.entry).unwrap();
         assert_outcome(outcome, case.expected_outcome);
-        match case.expected_last_heartbeat_ms {
-            Some(expected) => assert_eq!(
-                mgr.get_node(1).unwrap().last_heartbeat_ms,
-                expected,
-                "{}",
-                case.name
-            ),
+        match case.expected_state {
+            Some(expected_state) => {
+                let updated = mgr.get_node(1).unwrap();
+                assert_eq!(updated.state, expected_state, "{}", case.name);
+                assert_eq!(
+                    updated.last_heartbeat_ms,
+                    case.expected_last_heartbeat_ms.unwrap(),
+                    "{}",
+                    case.name
+                );
+            }
             None => assert!(mgr.get_node(1).is_none(), "{}", case.name),
         }
     }
 }
 
 #[test]
-fn apply_delete_node_cases() {
+fn apply_update_node_payload_meta_cases() {
+    struct Case {
+        name: &'static str,
+        seed: NodeInfo,
+        patch: MetaNodePayloadPatch,
+        expected_outcome: ExpectedOutcome,
+        expected_group_epoch: u64,
+        expected_stats_inode_count: u64,
+    }
+
+    let peer = PeerInfo {
+        node_id: 1,
+        address: make_node(1, NodeType::Meta, NodeState::Live).base.address,
+        is_leader: Some(true),
+    };
+
+    let mut base = make_node(1, NodeType::Meta, NodeState::Live);
+    base.epoch = 1;
+    if let NodePayload::Meta(ref mut payload) = base.payload {
+        payload.group_id = 10;
+        payload.group_epoch = 1;
+        payload.peers = vec![peer.clone()];
+        payload.rw_policy = RwPolicy::LeaderOnly;
+        payload.stats.inode_count = 42;
+    }
+
+    let mut worker = make_node(1, NodeType::Worker, NodeState::Live);
+    worker.epoch = 1;
+
+    let cases = vec![
+        Case {
+            name: "apply newer meta payload",
+            seed: base.clone(),
+            patch: MetaNodePayloadPatch {
+                group_id: 10,
+                group_epoch: 2,
+                peers: vec![peer.clone()],
+                rw_policy: RwPolicy::LeaderWriteFollowerRead,
+            },
+            expected_outcome: ExpectedOutcome::Applied,
+            expected_group_epoch: 2,
+            expected_stats_inode_count: 42,
+        },
+        Case {
+            name: "skip older meta payload",
+            seed: base.clone(),
+            patch: MetaNodePayloadPatch {
+                group_id: 10,
+                group_epoch: 0,
+                peers: vec![peer.clone()],
+                rw_policy: RwPolicy::LeaderOnly,
+            },
+            expected_outcome: ExpectedOutcome::Noop,
+            expected_group_epoch: 1,
+            expected_stats_inode_count: 42,
+        },
+        Case {
+            name: "skip identical meta payload",
+            seed: base.clone(),
+            patch: MetaNodePayloadPatch {
+                group_id: 10,
+                group_epoch: 1,
+                peers: vec![peer.clone()],
+                rw_policy: RwPolicy::LeaderOnly,
+            },
+            expected_outcome: ExpectedOutcome::Noop,
+            expected_group_epoch: 1,
+            expected_stats_inode_count: 42,
+        },
+        Case {
+            name: "reject same epoch with changed content",
+            seed: base.clone(),
+            patch: MetaNodePayloadPatch {
+                group_id: 10,
+                group_epoch: 1,
+                peers: vec![peer.clone()],
+                rw_policy: RwPolicy::LeaderWriteFollowerRead,
+            },
+            expected_outcome: ExpectedOutcome::Stale,
+            expected_group_epoch: 1,
+            expected_stats_inode_count: 42,
+        },
+        Case {
+            name: "reject group mismatch",
+            seed: base.clone(),
+            patch: MetaNodePayloadPatch {
+                group_id: 11,
+                group_epoch: 2,
+                peers: vec![peer.clone()],
+                rw_policy: RwPolicy::LeaderOnly,
+            },
+            expected_outcome: ExpectedOutcome::Stale,
+            expected_group_epoch: 1,
+            expected_stats_inode_count: 42,
+        },
+        Case {
+            name: "reject payload type mismatch",
+            seed: worker,
+            patch: MetaNodePayloadPatch {
+                group_id: 10,
+                group_epoch: 2,
+                peers: vec![peer],
+                rw_policy: RwPolicy::LeaderOnly,
+            },
+            expected_outcome: ExpectedOutcome::Stale,
+            expected_group_epoch: 0,
+            expected_stats_inode_count: 0,
+        },
+    ];
+
+    for case in cases {
+        let mgr = test_manager();
+        insert_node(&mgr, &case.seed);
+        let outcome = mgr
+            .apply_update_node_payload(&UpdateNodePayloadEntry {
+                op_ms: 20_000,
+                node_id: 1,
+                expected_epoch: 1,
+                expected_state: NodeState::Live,
+                patch: NodePayloadPatch::Meta(case.patch),
+            })
+            .unwrap();
+        assert_outcome(outcome, case.expected_outcome);
+        let updated = mgr.get_node(1).unwrap();
+        if let NodePayload::Meta(payload) = updated.payload {
+            assert_eq!(
+                payload.group_epoch, case.expected_group_epoch,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                payload.stats.inode_count, case.expected_stats_inode_count,
+                "{}",
+                case.name
+            );
+        }
+    }
+}
+
+#[test]
+fn apply_remove_node_cases() {
     struct Case {
         name: &'static str,
         seed: Option<NodeInfo>,
-        entry: DeleteNodeEntry,
+        entry: RemoveNodeEntry,
         expected_outcome: ExpectedOutcome,
         should_exist: bool,
     }
@@ -238,13 +298,13 @@ fn apply_delete_node_cases() {
 
     let cases = vec![
         Case {
-            name: "delete decommission node",
+            name: "remove decommission node",
             seed: Some(decommission),
-            entry: DeleteNodeEntry {
+            entry: RemoveNodeEntry {
                 op_ms: 20_000,
                 node_id: 1,
                 expected_epoch: 1,
-                expected_state: Some(NodeState::Decommission),
+                expected_state: NodeState::Decommission,
             },
             expected_outcome: ExpectedOutcome::Applied,
             should_exist: false,
@@ -252,11 +312,11 @@ fn apply_delete_node_cases() {
         Case {
             name: "reject stale epoch",
             seed: Some(epoch2),
-            entry: DeleteNodeEntry {
+            entry: RemoveNodeEntry {
                 op_ms: 20_000,
                 node_id: 1,
                 expected_epoch: 1,
-                expected_state: Some(NodeState::Decommission),
+                expected_state: NodeState::Decommission,
             },
             expected_outcome: ExpectedOutcome::Stale,
             should_exist: true,
@@ -264,11 +324,11 @@ fn apply_delete_node_cases() {
         Case {
             name: "reject stale state",
             seed: Some(live),
-            entry: DeleteNodeEntry {
+            entry: RemoveNodeEntry {
                 op_ms: 20_000,
                 node_id: 1,
                 expected_epoch: 1,
-                expected_state: Some(NodeState::Decommission),
+                expected_state: NodeState::Decommission,
             },
             expected_outcome: ExpectedOutcome::Stale,
             should_exist: true,
@@ -276,11 +336,11 @@ fn apply_delete_node_cases() {
         Case {
             name: "missing node",
             seed: None,
-            entry: DeleteNodeEntry {
+            entry: RemoveNodeEntry {
                 op_ms: 20_000,
                 node_id: 1,
                 expected_epoch: 1,
-                expected_state: Some(NodeState::Decommission),
+                expected_state: NodeState::Decommission,
             },
             expected_outcome: ExpectedOutcome::NotFound,
             should_exist: false,
@@ -292,7 +352,7 @@ fn apply_delete_node_cases() {
         if let Some(seed) = &case.seed {
             insert_node(&mgr, seed);
         }
-        let outcome = mgr.apply_delete_node(&case.entry).unwrap();
+        let outcome = mgr.apply_remove_node(&case.entry).unwrap();
         assert_outcome(outcome, case.expected_outcome);
         assert_eq!(
             mgr.get_node(1).is_some(),
@@ -300,51 +360,5 @@ fn apply_delete_node_cases() {
             "{}",
             case.name
         );
-    }
-}
-
-#[test]
-fn apply_update_node_state_payload_update_preserves_meta_runtime_stats() {
-    let mgr = test_manager();
-    let mut node = make_node(1, NodeType::Meta, NodeState::Live);
-    node.last_heartbeat_ms = 10;
-    if let NodePayload::Meta(ref mut payload) = node.payload {
-        payload.group_id = 10;
-        payload.group_epoch = 1;
-        payload.stats.inode_count = 42;
-    }
-    insert_node(&mgr, &node);
-
-    let mut new_payload = match node.payload.clone() {
-        NodePayload::Meta(payload) => payload,
-        _ => unreachable!(),
-    };
-    new_payload.group_epoch = 2;
-    new_payload.stats.inode_count = 0;
-
-    let outcome = mgr
-        .apply_update_node_state(&UpdateNodeStateEntry {
-            op_ms: 20_000,
-            node_id: 1,
-            expected_epoch: 1,
-            expected_state: Some(NodeState::Live),
-            expected_last_heartbeat_ms: None,
-            new_state: NodeState::Live,
-            state_since_ms: node.state_since_ms,
-            last_heartbeat_ms: Some(20_000),
-            payload_update: Some(NodePayloadUpdate::Replace(NodePayload::Meta(new_payload))),
-        })
-        .unwrap();
-    assert_outcome(outcome, ExpectedOutcome::Applied);
-
-    let updated = mgr.get_node(1).unwrap();
-    assert_eq!(updated.state, NodeState::Live);
-    assert_eq!(updated.last_heartbeat_ms, 20_000);
-    match updated.payload {
-        NodePayload::Meta(payload) => {
-            assert_eq!(payload.group_epoch, 2);
-            assert_eq!(payload.stats.inode_count, 42);
-        }
-        _ => panic!("expected meta payload"),
     }
 }

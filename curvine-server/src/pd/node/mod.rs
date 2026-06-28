@@ -16,8 +16,6 @@ pub mod event;
 mod heartbeat;
 mod index;
 mod manager;
-#[cfg(test)]
-mod manager_tests;
 mod meta_node_handler;
 mod registry;
 mod store;

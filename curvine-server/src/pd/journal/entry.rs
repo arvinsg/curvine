@@ -14,7 +14,7 @@
 
 use curvine_common::state::{
     BGPrimary, BgId, BlockGroupInfo, ConfigInfo, MountInfo, NamespaceId, NamespaceInfo, NodeInfo,
-    NodePayload, NodeState, PathRouteEntry, TableId,
+    NodeState, PathRouteEntry, PeerInfo, RwPolicy, TableId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -55,58 +55,67 @@ pub struct ConfigEntry {
     pub(crate) info: ConfigInfo,
 }
 
-/// Node entry — used for both registration and periodic save
+/// Register or re-register a node.
 #[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct NodeEntry {
+pub struct RegisterNodeEntry {
     pub op_ms: u64,
-    pub info: NodeInfo,
+    pub node: NodeInfo,
 }
 
-/// Optional persistent node payload update.
+/// Remove a node after its lifecycle has completed.
 #[derive(Deserialize, Serialize, Debug, Clone)]
-pub enum NodePayloadUpdate {
-    Replace(NodePayload),
-}
-
-/// node state update with epoch/state CAS.
-#[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct UpdateNodeStateEntry {
+pub struct RemoveNodeEntry {
     pub op_ms: u64,
     pub node_id: u32,
     pub expected_epoch: u64,
-    pub expected_state: Option<NodeState>,
-    pub new_state: NodeState,
-    pub state_since_ms: u64,
-    #[serde(default)]
-    pub last_heartbeat_ms: Option<u64>,
-    #[serde(default)]
-    pub payload_update: Option<NodePayloadUpdate>,
+    pub expected_state: NodeState,
 }
 
-/// Periodic heartbeat checkpoint.
+/// Status-only node update. It can change the lifecycle state, advance the
+/// persisted heartbeat timestamp, or do both.
 #[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct HeartbeatCheckpointEntry {
+pub struct NodeStatusUpdate {
+    pub node_id: u32,
+    pub expected_epoch: u64,
+    pub expected_state: NodeState,
+    pub target_state: Option<NodeState>,
+    pub heartbeat_ms: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct UpdateNodeStatusEntry {
+    pub op_ms: u64,
+    pub update: NodeStatusUpdate,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct BatchUpdateNodeStatusEntry {
+    pub op_ms: u64,
+    pub updates: Vec<NodeStatusUpdate>,
+}
+
+/// Persistent node payload update. Runtime-only fields remain in memory and are
+/// not part of this entry.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct UpdateNodePayloadEntry {
     pub op_ms: u64,
     pub node_id: u32,
     pub expected_epoch: u64,
-    pub expected_state: Option<NodeState>,
-    pub last_heartbeat_ms: u64,
+    pub expected_state: NodeState,
+    pub patch: NodePayloadPatch,
 }
 
-/// Batch node state update with per-node epoch/state CAS.
 #[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct BatchUpdateNodeStateEntry {
-    pub op_ms: u64,
-    pub entries: Vec<UpdateNodeStateEntry>,
+pub enum NodePayloadPatch {
+    Meta(MetaNodePayloadPatch),
 }
 
-/// Node deletion with epoch/state CAS.
 #[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct DeleteNodeEntry {
-    pub op_ms: u64,
-    pub node_id: u32,
-    pub expected_epoch: u64,
-    pub expected_state: Option<NodeState>,
+pub struct MetaNodePayloadPatch {
+    pub group_id: u32,
+    pub group_epoch: u64,
+    pub peers: Vec<PeerInfo>,
+    pub rw_policy: RwPolicy,
 }
 
 /// BG create entry (Raft log)
@@ -234,12 +243,11 @@ pub enum PdEntry {
     Unmount(UnMountEntry),
 
     // Node management
-    RegisterNode(NodeEntry),
-    SaveNode(NodeEntry),
-    UpdateNodeState(UpdateNodeStateEntry),
-    BatchUpdateNodeState(BatchUpdateNodeStateEntry),
-    HeartbeatCheckpoint(HeartbeatCheckpointEntry),
-    DeleteNode(DeleteNodeEntry),
+    RegisterNode(RegisterNodeEntry),
+    UpdateNodeStatus(UpdateNodeStatusEntry),
+    BatchUpdateNodeStatus(BatchUpdateNodeStatusEntry),
+    UpdateNodePayload(UpdateNodePayloadEntry),
+    RemoveNode(RemoveNodeEntry),
 
     // Namespace management
     CreateNamespace(NamespaceCreateEntry),
@@ -264,11 +272,10 @@ impl PdEntry {
             PdEntry::Mount(_) => "mount",
             PdEntry::Unmount(_) => "unmount",
             PdEntry::RegisterNode(_) => "register_node",
-            PdEntry::SaveNode(_) => "save_node",
-            PdEntry::UpdateNodeState(_) => "update_node_state",
-            PdEntry::BatchUpdateNodeState(_) => "batch_update_node_state",
-            PdEntry::HeartbeatCheckpoint(_) => "heartbeat_checkpoint",
-            PdEntry::DeleteNode(_) => "delete_node",
+            PdEntry::UpdateNodeStatus(_) => "update_node_status",
+            PdEntry::BatchUpdateNodeStatus(_) => "batch_update_node_status",
+            PdEntry::UpdateNodePayload(_) => "update_node_payload",
+            PdEntry::RemoveNode(_) => "remove_node",
             PdEntry::CreateNamespace(_) => "create_namespace",
             PdEntry::CreateBG(_) => "create_bg",
             PdEntry::UpdateBG(_) => "update_bg",

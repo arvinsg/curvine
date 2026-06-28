@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::super::NodeManager;
-use crate::pd::journal::entry::UpdateNodeStateEntry;
+use crate::pd::journal::entry::{NodeStatusUpdate, UpdateNodeStatusEntry};
 use crate::pd::journal::ApplyOutcome;
 use curvine_common::state::{
     MetaNodePayload, NodeAddress, NodeBase, NodeInfo, NodePayload, NodeState, NodeType,
@@ -103,22 +103,22 @@ pub(super) fn assert_outcome(actual: ApplyOutcome, expected: ExpectedOutcome) {
     }
 }
 
-pub(super) fn update_entry(
+pub(super) fn status_entry(
+    op_ms: u64,
     node_id: u32,
     expected_epoch: u64,
-    expected_state: Option<NodeState>,
-    expected_last_heartbeat_ms: Option<u64>,
-    new_state: NodeState,
-) -> UpdateNodeStateEntry {
-    UpdateNodeStateEntry {
-        op_ms: 20_000,
-        node_id,
-        expected_epoch,
-        expected_state,
-        expected_last_heartbeat_ms,
-        new_state,
-        state_since_ms: 20_000,
-        last_heartbeat_ms: None,
-        payload_update: None,
+    expected_state: NodeState,
+    target_state: Option<NodeState>,
+    heartbeat_ms: Option<u64>,
+) -> UpdateNodeStatusEntry {
+    UpdateNodeStatusEntry {
+        op_ms,
+        update: NodeStatusUpdate {
+            node_id,
+            expected_epoch,
+            expected_state,
+            target_state,
+            heartbeat_ms,
+        },
     }
 }

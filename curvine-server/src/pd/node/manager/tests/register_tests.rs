@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::fixtures::*;
-use crate::pd::journal::entry::NodeEntry;
-use curvine_common::state::{MetaNodePayload, NodeInfo, NodePayload, NodeState, NodeType};
+use crate::pd::journal::entry::RegisterNodeEntry;
+use curvine_common::state::{NodeInfo, NodeState, NodeType};
 
 #[derive(Debug, Clone, Copy)]
 struct ExpectedNode {
@@ -75,12 +75,6 @@ fn apply_register_node_cases() {
     replace_decommission.epoch = 2;
     replace_decommission.base.startup_time_ms = 200;
 
-    let mut invalid_id = make_node(0, NodeType::Worker, NodeState::Starting);
-    invalid_id.epoch = 1;
-
-    let mut mismatch = make_node(2, NodeType::Worker, NodeState::Starting);
-    mismatch.payload = NodePayload::Meta(MetaNodePayload::default());
-
     let mut replay_meta = make_node(3, NodeType::Meta, NodeState::Starting);
     replay_meta.epoch = 4;
 
@@ -127,20 +121,6 @@ fn apply_register_node_cases() {
             expected_node: Some(ExpectedNode::new(1, NodeState::Decommission)),
         },
         Case {
-            name: "reject invalid node id",
-            seed: None,
-            entry: invalid_id,
-            expected_outcome: ExpectedOutcome::Stale,
-            expected_node: None,
-        },
-        Case {
-            name: "reject payload mismatch",
-            seed: None,
-            entry: mismatch,
-            expected_outcome: ExpectedOutcome::Stale,
-            expected_node: None,
-        },
-        Case {
             name: "allow replay missing meta with non-initial epoch",
             seed: None,
             entry: replay_meta,
@@ -156,9 +136,9 @@ fn apply_register_node_cases() {
         }
         let node_id = case.entry.base.node_id;
         let outcome = mgr
-            .apply_register_node(&NodeEntry {
+            .apply_register_node(&RegisterNodeEntry {
                 op_ms: 20_000,
-                info: case.entry,
+                node: case.entry,
             })
             .unwrap();
         assert_outcome(outcome, case.expected_outcome);

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::NodeManager;
-use crate::pd::journal::entry::{DeleteNodeEntry, UpdateNodeStateEntry};
+use crate::pd::journal::entry::{NodeStatusUpdate, RemoveNodeEntry, UpdateNodeStatusEntry};
 use crate::pd::journal::{ApplyOutcome, PdEntry};
 use crate::pd::node::event::{NodeEvent, NodeEventType};
 use curvine_common::state::{NodeInfo, NodeState};
@@ -53,16 +53,15 @@ impl NodeManager {
 
     fn propose_decommission_start(&self, node: &NodeInfo, now_ms: u64) -> FsResult<ApplyOutcome> {
         self.journal_client
-            .propose(PdEntry::UpdateNodeState(UpdateNodeStateEntry {
+            .propose(PdEntry::UpdateNodeStatus(UpdateNodeStatusEntry {
                 op_ms: now_ms,
-                node_id: node.base.node_id,
-                expected_epoch: node.epoch,
-                expected_state: Some(node.state),
-                expected_last_heartbeat_ms: None,
-                new_state: NodeState::Decommission,
-                state_since_ms: now_ms,
-                last_heartbeat_ms: None,
-                payload_update: None,
+                update: NodeStatusUpdate {
+                    node_id: node.base.node_id,
+                    expected_epoch: node.epoch,
+                    expected_state: node.state,
+                    target_state: Some(NodeState::Decommission),
+                    heartbeat_ms: None,
+                },
             }))
     }
 
@@ -76,7 +75,7 @@ impl NodeManager {
 
         let outcome = self.propose_delete_node(&node, now)?;
         let applied = matches!(&outcome, ApplyOutcome::Applied);
-        Self::apply_outcome_to_result(outcome, "delete_node", node_id)?;
+        Self::apply_outcome_to_result(outcome, "remove_node", node_id)?;
         if applied {
             self.emit_decommission_node_event(&node, NodeEventType::DecommissionFinished, now);
         }
@@ -99,11 +98,11 @@ impl NodeManager {
 
     fn propose_delete_node(&self, node: &NodeInfo, now_ms: u64) -> FsResult<ApplyOutcome> {
         self.journal_client
-            .propose(PdEntry::DeleteNode(DeleteNodeEntry {
+            .propose(PdEntry::RemoveNode(RemoveNodeEntry {
                 op_ms: now_ms,
                 node_id: node.base.node_id,
                 expected_epoch: node.epoch,
-                expected_state: Some(NodeState::Decommission),
+                expected_state: NodeState::Decommission,
             }))
     }
 
@@ -132,7 +131,7 @@ impl NodeManager {
             NodeEventType::DecommissionFinished => {
                 if self.get_node(node.base.node_id).is_some() {
                     warn!(
-                        "DeleteNode propose returned but node still exists node_id={}, epoch={}; skip DecommissionFinished event",
+                        "RemoveNode propose returned but node still exists node_id={}, epoch={}; skip DecommissionFinished event",
                         node.base.node_id, node.epoch
                     );
                     return;

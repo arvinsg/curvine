@@ -95,37 +95,41 @@ impl PdAppStorage {
             PdEntry::RegisterNode(entry) => {
                 info!(
                     "Apply RegisterNode node_id:{}, address:{:?}",
-                    entry.info.base.node_id, entry.info.base.address
+                    entry.node.base.node_id, entry.node.base.address
                 );
-                self.node_manager.apply_register_node(&entry)?;
+                let _ = self.node_manager.apply_register_node(&entry)?;
             }
-            PdEntry::SaveNode(entry) => {
+            PdEntry::UpdateNodeStatus(entry) => {
                 info!(
-                    "Apply SaveNode node_id:{}, state:{:?}",
-                    entry.info.base.node_id, entry.info.state
+                    "Apply UpdateNodeStatus node_id:{}, expected_epoch:{}, expected_state:{:?}, target_state:{:?}, heartbeat_ms:{:?}",
+                    entry.update.node_id,
+                    entry.update.expected_epoch,
+                    entry.update.expected_state,
+                    entry.update.target_state,
+                    entry.update.heartbeat_ms
                 );
-                self.node_manager.apply_save_node(&entry)?;
+                let _ = self.node_manager.apply_update_node_status(&entry)?;
             }
-            PdEntry::UpdateNodeState(entry) => {
+            PdEntry::BatchUpdateNodeStatus(entry) => {
                 info!(
-                    "Apply UpdateNodeState node_id:{}, expected_epoch:{}, expected_state:{:?}, new_state:{:?}",
-                    entry.node_id, entry.expected_epoch, entry.expected_state, entry.new_state
+                    "Apply BatchUpdateNodeStatus updates={}",
+                    entry.updates.len()
                 );
-                self.node_manager.apply_update_node_state(&entry)?;
+                let _ = self.node_manager.apply_batch_update_node_status(&entry)?;
             }
-            PdEntry::BatchUpdateNodeState(entry) => {
-                info!("Apply BatchUpdateNodeState entries={}", entry.entries.len());
-                self.node_manager.apply_batch_update_node_state(&entry)?;
-            }
-            PdEntry::HeartbeatCheckpoint(entry) => {
-                self.node_manager.apply_heartbeat_checkpoint(&entry)?;
-            }
-            PdEntry::DeleteNode(entry) => {
+            PdEntry::UpdateNodePayload(entry) => {
                 info!(
-                    "Apply DeleteNode node_id:{}, expected_epoch:{}, expected_state:{:?}",
+                    "Apply UpdateNodePayload node_id:{}, expected_epoch:{}, expected_state:{:?}",
                     entry.node_id, entry.expected_epoch, entry.expected_state
                 );
-                self.node_manager.apply_delete_node(&entry)?;
+                let _ = self.node_manager.apply_update_node_payload(&entry)?;
+            }
+            PdEntry::RemoveNode(entry) => {
+                info!(
+                    "Apply RemoveNode node_id:{}, expected_epoch:{}, expected_state:{:?}",
+                    entry.node_id, entry.expected_epoch, entry.expected_state
+                );
+                let _ = self.node_manager.apply_remove_node(&entry)?;
             }
             PdEntry::CreateNamespace(entry) => {
                 info!(
