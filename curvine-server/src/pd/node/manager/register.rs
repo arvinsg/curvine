@@ -23,7 +23,6 @@ use orpc::common::LocalTime;
 
 impl NodeManager {
     pub fn register(&self, req: RegisterRequest) -> FsResult<(NodeInfo, u64)> {
-        self.ensure_leader("register rejected: this PD node is not the raft leader")?;
         Self::validate_register_request(&req)?;
 
         let now = LocalTime::mills();

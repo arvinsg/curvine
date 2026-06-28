@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{HeartbeatPlan, NodeManager};
+use super::NodeManager;
 use crate::pd::journal::entry::{
     MetaNodePayloadPatch, NodePayloadPatch, NodeStatusUpdate, UpdateNodePayloadEntry,
     UpdateNodeStatusEntry,
@@ -28,105 +28,116 @@ use curvine_common::{FsError, FsResult};
 use log::{info, warn};
 use orpc::common::LocalTime;
 
+struct HeartbeatUpdate {
+    now_ms: u64,
+    old: NodeInfo,
+    updated: NodeInfo,
+    state_changed: bool,
+    need_checkpoint: bool,
+    payload_patch: Option<NodePayloadPatch>,
+}
+
 impl NodeManager {
     pub fn handle_heartbeat(&self, req: HeartbeatRequest) -> FsResult<HeartbeatResponse> {
-        self.ensure_leader("heartbeat rejected: this PD node is not the raft leader")?;
+        Self::record_heartbeat_metric(&req);
+
+        let update = self.build_heartbeat_update(&req)?;
+        self.persist_heartbeat_update(&update)?;
+        self.apply_runtime_heartbeat(&update.updated)?;
+        self.build_heartbeat_response(req.node_id, update.updated)
+    }
+
+    fn record_heartbeat_metric(req: &HeartbeatRequest) {
         Pd::get_metrics()
             .heartbeat_total
             .with_label_values(&[req.node_type.as_str()])
             .inc();
-
-        let plan = self.plan_heartbeat(&req)?;
-        self.commit_heartbeat_plan(&plan)?;
-        self.apply_runtime_heartbeat(&plan.planned)?;
-        self.build_heartbeat_response(req.node_id, plan.planned)
     }
 
-    fn plan_heartbeat(&self, req: &HeartbeatRequest) -> FsResult<HeartbeatPlan> {
+    fn build_heartbeat_update(&self, req: &HeartbeatRequest) -> FsResult<HeartbeatUpdate> {
         let now = LocalTime::mills();
-        let snapshot = self.get_heartbeat_snapshot(req)?;
-        let mut planned = snapshot.clone();
+        let old = self.get_heartbeat_snapshot(req)?;
+        let mut updated = old.clone();
         let critical_changed = self
             .get_handler(req.node_type)?
-            .process_heartbeat(&mut planned, req)?;
-        planned.last_heartbeat_ms = now;
+            .process_heartbeat(&mut updated, req)?;
+        updated.last_heartbeat_ms = now;
 
-        let old_state = snapshot.state;
+        let old_state = old.state;
         let state_changed = matches!(old_state, NodeState::Starting | NodeState::Lost);
         let payload_patch = critical_changed
-            .then(|| Self::node_payload_patch(&planned))
+            .then(|| Self::build_payload_patch(&updated))
             .flatten();
         let need_checkpoint = !state_changed
             && !critical_changed
-            && snapshot.need_persist(now, self.persist_interval_ms());
+            && old.need_persist(now, self.persist_interval_ms());
 
-        Ok(HeartbeatPlan {
+        Ok(HeartbeatUpdate {
             now_ms: now,
-            snapshot,
-            planned,
-            old_state,
+            old,
+            updated,
             state_changed,
             need_checkpoint,
             payload_patch,
         })
     }
 
-    fn commit_heartbeat_plan(&self, plan: &HeartbeatPlan) -> FsResult<()> {
-        if plan.state_changed || plan.need_checkpoint {
-            let applied = self.commit_heartbeat_status(plan)?;
-            self.emit_heartbeat_resume_event_if_needed(plan, applied);
+    fn persist_heartbeat_update(&self, update: &HeartbeatUpdate) -> FsResult<()> {
+        if update.state_changed || update.need_checkpoint {
+            let applied = self.persist_heartbeat_status(update)?;
+            self.emit_resume_event(update, applied);
         }
-        if let Some(patch) = &plan.payload_patch {
-            self.commit_heartbeat_payload(plan, patch.clone())?;
+        if let Some(patch) = &update.payload_patch {
+            self.persist_heartbeat_payload(update, patch.clone())?;
         }
         Ok(())
     }
 
-    fn commit_heartbeat_status(&self, plan: &HeartbeatPlan) -> FsResult<bool> {
+    fn persist_heartbeat_status(&self, update: &HeartbeatUpdate) -> FsResult<bool> {
         let outcome = self
             .journal_client
-            .propose(PdEntry::UpdateNodeStatus(self.heartbeat_status_entry(plan)))?;
+            .propose(PdEntry::UpdateNodeStatus(Self::build_status_entry(update)))?;
         let applied = matches!(outcome, ApplyOutcome::Applied);
-        if plan.state_changed {
-            Self::apply_outcome_to_result(outcome, "heartbeat_status", plan.snapshot.base.node_id)?;
+        if update.state_changed {
+            Self::apply_outcome_to_result(outcome, "heartbeat_status", update.old.base.node_id)?;
         } else if !outcome.is_success() {
             warn!(
                 "heartbeat status checkpoint skipped node_id={}, epoch={}, outcome={:?}",
-                plan.snapshot.base.node_id, plan.snapshot.epoch, outcome
+                update.old.base.node_id, update.old.epoch, outcome
             );
         }
         Ok(applied)
     }
 
-    fn heartbeat_status_entry(&self, plan: &HeartbeatPlan) -> UpdateNodeStatusEntry {
+    fn build_status_entry(update: &HeartbeatUpdate) -> UpdateNodeStatusEntry {
         UpdateNodeStatusEntry {
-            op_ms: plan.now_ms,
+            op_ms: update.now_ms,
             update: NodeStatusUpdate {
-                node_id: plan.snapshot.base.node_id,
-                expected_epoch: plan.snapshot.epoch,
-                expected_state: plan.old_state,
-                target_state: plan.state_changed.then_some(NodeState::Live),
-                heartbeat_ms: Some(plan.now_ms),
+                node_id: update.old.base.node_id,
+                expected_epoch: update.old.epoch,
+                expected_state: update.old.state,
+                target_state: update.state_changed.then_some(NodeState::Live),
+                heartbeat_ms: Some(update.now_ms),
             },
         }
     }
 
-    fn commit_heartbeat_payload(
+    fn persist_heartbeat_payload(
         &self,
-        plan: &HeartbeatPlan,
+        update: &HeartbeatUpdate,
         patch: NodePayloadPatch,
     ) -> FsResult<()> {
-        let expected_state = if plan.state_changed {
+        let expected_state = if update.state_changed {
             NodeState::Live
         } else {
-            plan.old_state
+            update.old.state
         };
         match self
             .journal_client
             .propose(PdEntry::UpdateNodePayload(UpdateNodePayloadEntry {
-                op_ms: plan.now_ms,
-                node_id: plan.snapshot.base.node_id,
-                expected_epoch: plan.snapshot.epoch,
+                op_ms: update.now_ms,
+                node_id: update.old.base.node_id,
+                expected_epoch: update.old.epoch,
                 expected_state,
                 patch,
             })) {
@@ -134,7 +145,7 @@ impl NodeManager {
                 if matches!(outcome, ApplyOutcome::Applied) {
                     info!(
                         "Node {} heartbeat committed persistent payload update epoch {} state {:?}",
-                        plan.snapshot.base.node_id, plan.snapshot.epoch, expected_state
+                        update.old.base.node_id, update.old.epoch, expected_state
                     );
                 }
                 Ok(())
@@ -142,7 +153,7 @@ impl NodeManager {
             Ok(outcome) => {
                 warn!(
                     "heartbeat payload update skipped node_id={}, epoch={}, outcome={:?}",
-                    plan.snapshot.base.node_id, plan.snapshot.epoch, outcome
+                    update.old.base.node_id, update.old.epoch, outcome
                 );
                 Ok(())
             }
@@ -150,21 +161,21 @@ impl NodeManager {
         }
     }
 
-    fn emit_heartbeat_resume_event_if_needed(&self, plan: &HeartbeatPlan, applied: bool) {
-        if !applied || !plan.state_changed {
+    fn emit_resume_event(&self, update: &HeartbeatUpdate, applied: bool) {
+        if !applied || !update.state_changed {
             return;
         }
         if self.emit_fenced_state_event(
-            plan.snapshot.base.node_id,
-            plan.snapshot.epoch,
-            Some(plan.old_state),
+            update.old.base.node_id,
+            update.old.epoch,
+            Some(update.old.state),
             NodeState::Live,
             NodeEventType::HeartbeatResumed,
-            plan.now_ms,
+            update.now_ms,
         ) {
             info!(
                 "Node {} heartbeat resumed {:?} -> Live epoch {}",
-                plan.snapshot.base.node_id, plan.old_state, plan.snapshot.epoch
+                update.old.base.node_id, update.old.state, update.old.epoch
             );
         }
     }
@@ -221,22 +232,22 @@ impl NodeManager {
         Ok(node.clone())
     }
 
-    fn apply_runtime_heartbeat(&self, planned: &NodeInfo) -> FsResult<()> {
+    fn apply_runtime_heartbeat(&self, updated: &NodeInfo) -> FsResult<()> {
         let mut index = self.index.write().unwrap();
-        let Some(node) = index.get_by_id_mut(planned.base.node_id) else {
+        let Some(node) = index.get_by_id_mut(updated.base.node_id) else {
             return Err(FsError::common(format!(
                 "node {} not found while applying runtime heartbeat",
-                planned.base.node_id
+                updated.base.node_id
             )));
         };
-        if node.epoch != planned.epoch {
+        if node.epoch != updated.epoch {
             return Err(FsError::common(format!(
                 "epoch mismatch while applying runtime heartbeat for node {}: expected {} got {}",
-                planned.base.node_id, node.epoch, planned.epoch
+                updated.base.node_id, node.epoch, updated.epoch
             )));
         }
-        node.last_heartbeat_ms = node.last_heartbeat_ms.max(planned.last_heartbeat_ms);
-        Self::preserve_runtime_fields(node, planned);
+        node.last_heartbeat_ms = node.last_heartbeat_ms.max(updated.last_heartbeat_ms);
+        Self::preserve_runtime_fields(node, updated);
         Ok(())
     }
 
@@ -270,7 +281,7 @@ impl NodeManager {
         Self::apply_outcome_to_result(outcome, "heartbeat_status", node_id)
     }
 
-    fn node_payload_patch(node: &NodeInfo) -> Option<NodePayloadPatch> {
+    fn build_payload_patch(node: &NodeInfo) -> Option<NodePayloadPatch> {
         match &node.payload {
             NodePayload::Meta(payload) => Some(NodePayloadPatch::Meta(MetaNodePayloadPatch {
                 group_id: payload.group_id,

@@ -28,23 +28,12 @@ use super::store::NodeStore;
 use super::{HandlerRegistry, MetaNodeHandler, NodeHandler, TaskNodeHandler, WorkerNodeHandler};
 use crate::pd::config::ConfigManager;
 use crate::pd::journal;
-use crate::pd::journal::entry::NodePayloadPatch;
 use curvine_common::state::{NodeInfo, NodeState, NodeType};
 use curvine_common::{FsError, FsResult};
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 2048;
-
-pub(super) struct HeartbeatPlan {
-    pub(super) now_ms: u64,
-    pub(super) snapshot: NodeInfo,
-    pub(super) planned: NodeInfo,
-    pub(super) old_state: NodeState,
-    pub(super) state_changed: bool,
-    pub(super) need_checkpoint: bool,
-    pub(super) payload_patch: Option<NodePayloadPatch>,
-}
 
 pub struct NodeManager {
     index: Arc<RwLock<NodeIndex>>,

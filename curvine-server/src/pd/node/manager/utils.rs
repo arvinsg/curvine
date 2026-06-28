@@ -23,14 +23,6 @@ use curvine_common::state::{NodeInfo, NodePayload, NodeState, NodeType};
 use curvine_common::{FsError, FsResult};
 
 impl NodeManager {
-    pub(super) fn ensure_leader(&self, message: &'static str) -> FsResult<()> {
-        if self.journal_client.is_leader() {
-            Ok(())
-        } else {
-            Err(FsError::not_leader(message))
-        }
-    }
-
     pub(super) fn heartbeat_timeout_ms(&self) -> u64 {
         self.config_manager.get_u64(PD_NODE_HEARTBEAT_TIMEOUT_MS)
     }
