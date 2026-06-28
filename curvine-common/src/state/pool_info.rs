@@ -13,92 +13,48 @@
 // limitations under the License.
 
 use crate::state::StorageType;
-use orpc::{err_box, CommonError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fmt;
 
-/// Fixed resource domains used by PD placement.
-#[derive(
-    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash, Ord, PartialOrd,
-)]
-pub enum PoolType {
-    Mem,
-    #[default]
-    Ssd,
-    Hdd,
+/// Fixed pool media used by PD placement.
+pub const POOL_STORAGE_TYPES: [StorageType; 3] =
+    [StorageType::Mem, StorageType::Ssd, StorageType::Hdd];
+
+#[inline]
+pub fn is_pool_storage_type(media: StorageType) -> bool {
+    matches!(
+        media,
+        StorageType::Mem | StorageType::Ssd | StorageType::Hdd
+    )
 }
 
-impl PoolType {
-    pub const ALL: [PoolType; 3] = [PoolType::Mem, PoolType::Ssd, PoolType::Hdd];
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            PoolType::Mem => "MEM",
-            PoolType::Ssd => "SSD",
-            PoolType::Hdd => "HDD",
-        }
-    }
-
-    pub fn name(&self) -> &'static str {
-        match self {
-            PoolType::Mem => "mem_pool",
-            PoolType::Ssd => "ssd_pool",
-            PoolType::Hdd => "hdd_pool",
-        }
-    }
-
-    pub fn media(&self) -> StorageType {
-        match self {
-            PoolType::Mem => StorageType::Mem,
-            PoolType::Ssd => StorageType::Ssd,
-            PoolType::Hdd => StorageType::Hdd,
-        }
-    }
-
-    pub fn code(&self) -> u16 {
-        match self {
-            PoolType::Mem => 1,
-            PoolType::Ssd => 2,
-            PoolType::Hdd => 3,
-        }
-    }
-
-    pub fn from_code(code: u16) -> Option<Self> {
-        match code {
-            1 => Some(PoolType::Mem),
-            2 => Some(PoolType::Ssd),
-            3 => Some(PoolType::Hdd),
-            _ => None,
-        }
-    }
-
-    pub fn from_media(media: StorageType) -> Option<Self> {
-        match media {
-            StorageType::Mem => Some(PoolType::Mem),
-            StorageType::Ssd => Some(PoolType::Ssd),
-            StorageType::Hdd => Some(PoolType::Hdd),
-            _ => None,
-        }
+#[inline]
+pub fn pool_name(media: StorageType) -> &'static str {
+    match media {
+        StorageType::Mem => "mem_pool",
+        StorageType::Ssd => "ssd_pool",
+        StorageType::Hdd => "hdd_pool",
+        _ => "invalid_pool",
     }
 }
 
-impl fmt::Display for PoolType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+#[inline]
+pub fn pool_storage_code(media: StorageType) -> Option<u16> {
+    match media {
+        StorageType::Mem => Some(1),
+        StorageType::Ssd => Some(2),
+        StorageType::Hdd => Some(3),
+        _ => None,
     }
 }
 
-impl TryFrom<&str> for PoolType {
-    type Error = CommonError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value.to_uppercase().as_str() {
-            "MEM" | "MEM_POOL" => Ok(PoolType::Mem),
-            "SSD" | "SSD_POOL" => Ok(PoolType::Ssd),
-            "HDD" | "HDD_POOL" => Ok(PoolType::Hdd),
-            _ => err_box!("invalid pool type: {}", value),
-        }
+#[inline]
+pub fn pool_storage_from_code(code: u16) -> Option<StorageType> {
+    match code {
+        1 => Some(StorageType::Mem),
+        2 => Some(StorageType::Ssd),
+        3 => Some(StorageType::Hdd),
+        _ => None,
     }
 }
 
@@ -114,9 +70,8 @@ pub struct PoolStats {
 /// Runtime pool view.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PoolInfo {
-    pub pool_type: PoolType,
-    pub name: String,
     pub media: StorageType,
+    pub name: String,
 
     // ========== Non-persisted ==========
     #[serde(skip)]
@@ -126,11 +81,10 @@ pub struct PoolInfo {
 }
 
 impl PoolInfo {
-    pub fn new(pool_type: PoolType) -> Self {
+    pub fn new(media: StorageType) -> Self {
         Self {
-            pool_type,
-            name: pool_type.name().to_string(),
-            media: pool_type.media(),
+            media,
+            name: pool_name(media).to_string(),
             workers: HashSet::new(),
             stats: PoolStats::default(),
         }

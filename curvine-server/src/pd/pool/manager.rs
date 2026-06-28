@@ -14,33 +14,17 @@
 
 use super::PoolIndex;
 use crate::pd::node::NodeManager;
-use curvine_common::state::{NodeAddress, NodeInfo, NodePayload, NodeState, NodeType, StorageSpec};
-use curvine_common::state::{PoolInfo, PoolStats, PoolType, StorageType};
+use curvine_common::state::{
+    is_pool_storage_type, NodeAddress, NodeInfo, NodePayload, NodeState, NodeType, PoolInfo,
+    PoolStats, StorageSpec, StorageType, POOL_STORAGE_TYPES,
+};
 use curvine_common::{FsError, FsResult};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 pub struct PoolManager {
     index: Arc<RwLock<PoolIndex>>,
     node_manager: Arc<NodeManager>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PoolAssignmentResult {
-    pub target_pool_types: Vec<PoolType>,
-    pub changed_pool_types: Vec<PoolType>,
-}
-
-impl PoolAssignmentResult {
-    pub fn is_empty(&self) -> bool {
-        self.target_pool_types.is_empty()
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PoolReconcileResult {
-    pub changed_pool_types: Vec<PoolType>,
 }
 
 impl PoolManager {
@@ -51,27 +35,19 @@ impl PoolManager {
         }
     }
 
-    /// Restore fixed pools and rebuild runtime membership from NodeManager.
+    /// Restore pools and rebuild runtime membership from NodeManager.
     pub fn restore(&self) -> FsResult<()> {
         self.reconcile_worker_pool_membership()?;
         self.refresh_pool_stats();
         Ok(())
     }
 
-    pub fn get_pool_by_media(&self, media: StorageType) -> FsResult<PoolInfo> {
+    pub fn get_pool(&self, media: StorageType) -> FsResult<PoolInfo> {
         let index = self.index.read().unwrap();
         index
-            .get_pool_by_media(media)
+            .get_pool(media)
             .cloned()
-            .ok_or_else(|| FsError::common(format!("no pool for media {:?}", media)))
-    }
-
-    pub fn get_pool(&self, pool_type: PoolType) -> FsResult<PoolInfo> {
-        let index = self.index.read().unwrap();
-        index
-            .get_pool(pool_type)
-            .cloned()
-            .ok_or_else(|| FsError::common(format!("pool {} not found", pool_type)))
+            .ok_or_else(|| FsError::common(format!("pool {} not found", media)))
     }
 
     pub fn list_pools(&self) -> Vec<PoolInfo> {
@@ -92,21 +68,21 @@ impl PoolManager {
             .collect()
     }
 
-    pub fn get_workers_in_pool(&self, pool_type: PoolType) -> Vec<u32> {
+    pub fn get_workers_in_pool(&self, media: StorageType) -> Vec<u32> {
         let mut workers: Vec<u32> = self
             .index
             .read()
             .unwrap()
-            .get_pool(pool_type)
+            .get_pool(media)
             .map(|p| p.workers.iter().copied().collect())
             .unwrap_or_default();
         workers.sort_unstable();
         workers
     }
 
-    pub fn get_live_workers(&self, pool_type: PoolType) -> Vec<u32> {
+    pub fn get_live_workers(&self, media: StorageType) -> Vec<u32> {
         let mut workers: Vec<u32> = self
-            .get_workers_in_pool(pool_type)
+            .get_workers_in_pool(media)
             .into_iter()
             .filter(|&wid| {
                 self.node_manager
@@ -119,9 +95,9 @@ impl PoolManager {
         workers
     }
 
-    /// Get runtime pool types this worker currently belongs to.
-    pub fn get_pools_by_worker(&self, worker_id: u32) -> Vec<PoolType> {
-        let mut pools: Vec<PoolType> = self
+    /// Get runtime pools this worker currently belongs to.
+    pub fn get_pools_by_worker(&self, worker_id: u32) -> Vec<StorageType> {
+        let mut pools: Vec<StorageType> = self
             .index
             .read()
             .unwrap()
@@ -132,49 +108,48 @@ impl PoolManager {
         pools
     }
 
-    /// Assign worker to runtime pools based on storage specs. This is in-memory only.
+    /// Assign worker to runtime pools based on storage specs.
+    /// Returns the pools whose membership changed.
     pub fn assign_worker_to_pools(
         &self,
         worker_id: u32,
         storage_specs: &HashMap<String, StorageSpec>,
-    ) -> FsResult<PoolAssignmentResult> {
-        let target = Self::pool_types_from_storage_specs(storage_specs);
-        let changed = self
+    ) -> FsResult<Vec<StorageType>> {
+        let target = Self::pools_from_storage_specs(storage_specs);
+        if target.is_empty() {
+            log::info!(
+                "worker {} has no storage specs that map to a runtime pool",
+                worker_id
+            );
+        }
+
+        let mut changed: Vec<StorageType> = self
             .index
             .write()
             .unwrap()
-            .set_worker_pools(worker_id, &target);
-        let mut target_pool_types: Vec<PoolType> = target.into_iter().collect();
-        let mut changed_pool_types: Vec<PoolType> = changed.into_iter().collect();
-        target_pool_types.sort_unstable();
-        changed_pool_types.sort_unstable();
-        if !changed_pool_types.is_empty() {
+            .set_worker_pools(worker_id, &target)
+            .into_iter()
+            .collect();
+        changed.sort_unstable();
+        if !changed.is_empty() {
+            let mut target_pools: Vec<StorageType> = target.into_iter().collect();
+            target_pools.sort_unstable();
             log::info!(
                 "assigned worker {} to runtime pools {:?} (changed {:?})",
                 worker_id,
-                target_pool_types,
-                changed_pool_types
+                target_pools,
+                changed
             );
         }
-        Ok(PoolAssignmentResult {
-            target_pool_types,
-            changed_pool_types,
-        })
+        Ok(changed)
     }
 
     /// Rebuild runtime pool membership from the current NodeManager state.
-    ///
-    /// This method deliberately reads NodeManager while holding the PoolIndex
-    /// write lock, so incremental event updates (assign/remove) cannot be
-    /// interleaved between taking a worker snapshot and rebuilding pool
-    /// membership. If an offline/decommission event has already updated
-    /// NodeManager, reconcile will observe the new state; if the event happens
-    /// after reconcile, the event path will apply the remove afterwards.
-    pub fn reconcile_worker_pool_membership(&self) -> FsResult<PoolReconcileResult> {
+    pub fn reconcile_worker_pool_membership(&self) -> FsResult<Vec<StorageType>> {
         let mut index = self.index.write().unwrap();
         let workers = self.node_manager.get_nodes_by_type(NodeType::Worker);
 
-        let mut desired_by_worker: HashMap<u32, HashSet<PoolType>> = HashMap::new();
+        let mut desired_by_worker: HashMap<u32, HashSet<StorageType>> = HashMap::new();
         for node in &workers {
             let NodePayload::Worker(payload) = &node.payload else {
                 continue;
@@ -187,26 +162,26 @@ impl PoolManager {
             }
             desired_by_worker.insert(
                 node.base.node_id,
-                Self::pool_types_from_storage_specs(&payload.storage_specs),
+                Self::pools_from_storage_specs(&payload.storage_specs),
             );
         }
 
-        index.reset_fixed_pools();
+        index.reset_pools();
         let mut changed = HashSet::new();
         for (worker_id, pools) in desired_by_worker {
-            for pool_type in &pools {
-                index.add_worker_to_pool(*pool_type, worker_id);
-                changed.insert(*pool_type);
+            for media in &pools {
+                index.add_worker_to_pool(*media, worker_id);
+                changed.insert(*media);
             }
         }
-        let mut changed_pool_types: Vec<PoolType> = changed.into_iter().collect();
-        changed_pool_types.sort_unstable();
-        Ok(PoolReconcileResult { changed_pool_types })
+        let mut changed_pools: Vec<StorageType> = changed.into_iter().collect();
+        changed_pools.sort_unstable();
+        Ok(changed_pools)
     }
 
     /// Remove worker from all runtime pools. This is in-memory only.
-    pub fn remove_worker_from_pools(&self, worker_id: u32) -> FsResult<Vec<PoolType>> {
-        let mut removed: Vec<PoolType> = self
+    pub fn remove_worker_from_pools(&self, worker_id: u32) -> FsResult<Vec<StorageType>> {
+        let mut removed: Vec<StorageType> = self
             .index
             .write()
             .unwrap()
@@ -225,20 +200,16 @@ impl PoolManager {
     }
 
     /// Update pool stats (in-memory only). For use by Scheduler to periodically refresh.
-    pub fn update_pool_stats(&self, pool_type: PoolType, stats: PoolStats) -> FsResult<()> {
-        self.index
-            .write()
-            .unwrap()
-            .update_pool_stats(pool_type, stats);
+    pub fn update_pool_stats(&self, media: StorageType, stats: PoolStats) -> FsResult<()> {
+        self.index.write().unwrap().update_pool_stats(media, stats);
         Ok(())
     }
 
     /// Refresh stats for all pools by aggregating worker storage_stats.
     pub fn refresh_pool_stats(&self) {
-        for pool_type in PoolType::ALL {
+        for media in POOL_STORAGE_TYPES {
             let mut stats = PoolStats::default();
-            let media = pool_type.media();
-            for worker_id in self.get_workers_in_pool(pool_type) {
+            for worker_id in self.get_workers_in_pool(media) {
                 let Some(node) = self.node_manager.get_node(worker_id) else {
                     continue;
                 };
@@ -257,7 +228,7 @@ impl PoolManager {
                     }
                 }
             }
-            let _ = self.update_pool_stats(pool_type, stats);
+            let _ = self.update_pool_stats(media, stats);
         }
     }
 
@@ -338,12 +309,12 @@ impl PoolManager {
             .map(|n| (n.base.address.clone(), n.state))
     }
 
-    fn pool_types_from_storage_specs(
+    fn pools_from_storage_specs(
         storage_specs: &HashMap<String, StorageSpec>,
-    ) -> HashSet<PoolType> {
+    ) -> HashSet<StorageType> {
         storage_specs
             .values()
-            .filter_map(|spec| PoolType::from_media(spec.storage_type))
+            .filter_map(|spec| is_pool_storage_type(spec.storage_type).then_some(spec.storage_type))
             .collect()
     }
 }
