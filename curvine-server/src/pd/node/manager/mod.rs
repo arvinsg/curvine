@@ -35,7 +35,6 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 2048;
-const MAX_BATCH_UPDATE_NODE_STATE: usize = 256;
 
 pub(super) struct HeartbeatPlan {
     pub(super) now_ms: u64,

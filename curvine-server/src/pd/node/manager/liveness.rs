@@ -12,46 +12,38 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{NodeManager, MAX_BATCH_UPDATE_NODE_STATE};
+use super::NodeManager;
 use crate::pd::journal::entry::{BatchUpdateNodeStatusEntry, NodeStatusUpdate};
 use crate::pd::journal::PdEntry;
 use crate::pd::node::event::NodeEventType;
 use curvine_common::state::{NodeInfo, NodeState};
-use log::warn;
+use log::{error, info, warn};
 use orpc::common::LocalTime;
-use orpc::runtime::RpcRuntime;
+use orpc::runtime::{RpcRuntime, Runtime};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 impl NodeManager {
     /// Start the internal liveness detection loop.
-    pub fn start_liveness_loop(
-        self: Arc<Self>,
-        runtime: Arc<orpc::runtime::Runtime>,
-        token: tokio_util::sync::CancellationToken,
-    ) {
+    pub fn start_liveness_loop(self: Arc<Self>, runtime: Arc<Runtime>, token: CancellationToken) {
         let mgr = self.clone();
         runtime.spawn(async move {
             mgr.liveness_loop(token).await;
         });
     }
 
-    async fn liveness_loop(&self, token: tokio_util::sync::CancellationToken) {
+    async fn liveness_loop(&self, token: CancellationToken) {
         let start_ms = LocalTime::mills();
         loop {
-            if self.wait_next_liveness_tick(&token).await {
-                break;
+            let check_interval = self.liveness_check_interval_ms();
+            tokio::select! {
+                _ = token.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_millis(check_interval)) => {}
             }
             self.run_liveness_tick(LocalTime::mills(), start_ms);
         }
-        log::info!("Liveness loop stopped");
-    }
-
-    async fn wait_next_liveness_tick(&self, token: &tokio_util::sync::CancellationToken) -> bool {
-        let check_interval = self.liveness_check_interval_ms();
-        tokio::select! {
-            _ = token.cancelled() => true,
-            _ = tokio::time::sleep(std::time::Duration::from_millis(check_interval)) => false,
-        }
+        info!("Liveness loop stopped");
     }
 
     fn run_liveness_tick(&self, now_ms: u64, start_ms: u64) {
@@ -65,7 +57,7 @@ impl NodeManager {
             return;
         }
         for node_id in self.detect_heartbeat_timeout(now_ms, timeout) {
-            log::warn!("Node {} marked Lost (heartbeat timeout)", node_id);
+            warn!("Node {} marked Lost (heartbeat timeout)", node_id);
         }
     }
 
@@ -73,21 +65,15 @@ impl NodeManager {
     /// Proposes Starting/Live → Lost through Raft and returns successfully IDs.
     pub fn detect_heartbeat_timeout(&self, now_ms: u64, timeout_ms: u64) -> Vec<u32> {
         let timed_out = self.collect_timed_out_nodes(now_ms, timeout_ms);
-        let mut changed = Vec::new();
-
-        for chunk in timed_out.chunks(MAX_BATCH_UPDATE_NODE_STATE) {
-            let updates = Self::lost_node_updates(chunk);
-            if !self.propose_node_state_batch(now_ms, updates, "timeout BatchUpdateNodeStatus") {
-                continue;
-            }
-            changed.extend(self.emit_transition_events(
-                chunk,
-                NodeState::Lost,
-                NodeEventType::Lost,
-                now_ms,
-            ));
+        if timed_out.is_empty() {
+            return Vec::new();
         }
-        changed
+
+        let updates = Self::lost_node_updates(&timed_out);
+        if !self.propose_node_status_updates(now_ms, updates, "timeout BatchUpdateNodeStatus") {
+            return Vec::new();
+        }
+        self.emit_transition_events(&timed_out, NodeState::Lost, NodeEventType::Lost, now_ms)
     }
 
     fn collect_timed_out_nodes(&self, now_ms: u64, timeout_ms: u64) -> Vec<NodeInfo> {
@@ -132,7 +118,7 @@ impl NodeManager {
             .collect()
     }
 
-    fn propose_node_state_batch(
+    fn propose_node_status_updates(
         &self,
         op_ms: u64,
         updates: Vec<NodeStatusUpdate>,
@@ -186,23 +172,59 @@ impl NodeManager {
     fn promote_expired_lost_nodes_to_offline(&self, now_ms: u64) {
         let recovery_window = self.recovery_window_ms();
         let expired = self.expired_lost_nodes(now_ms, recovery_window);
-        for chunk in expired.chunks(MAX_BATCH_UPDATE_NODE_STATE) {
-            let updates = Self::offline_node_updates(chunk);
-            log::error!(
-                "{} Lost nodes exceeded recovery window ({}ms), promoting to Offline",
-                updates.len(),
-                recovery_window
-            );
-            if self.propose_node_state_batch(now_ms, updates, "Lost->Offline BatchUpdateNodeStatus")
-            {
-                self.emit_transition_events(
-                    chunk,
-                    NodeState::Offline,
-                    NodeEventType::Offline,
-                    now_ms,
-                );
-            }
+        if expired.is_empty() {
+            return;
         }
+
+        if self.should_skip_offline_promotion(expired.len()) {
+            warn!(
+                "skip Lost->Offline promotion for {} nodes: offline promotion guard triggered",
+                expired.len()
+            );
+            return;
+        }
+
+        let updates = Self::offline_node_updates(&expired);
+        error!(
+            "{} Lost nodes exceeded recovery window ({}ms), promoting to Offline",
+            updates.len(),
+            recovery_window
+        );
+        if self.propose_node_status_updates(now_ms, updates, "Lost->Offline BatchUpdateNodeStatus")
+        {
+            self.emit_transition_events(
+                &expired,
+                NodeState::Offline,
+                NodeEventType::Offline,
+                now_ms,
+            );
+        }
+    }
+
+    pub(super) fn should_skip_offline_promotion(&self, expired_count: usize) -> bool {
+        let recoverable_count = self.recoverable_node_count();
+        let min_nodes = self.offline_promotion_min_nodes();
+        if recoverable_count < min_nodes || recoverable_count == 0 {
+            return false;
+        }
+
+        let max_ratio_bps = self.offline_promotion_max_ratio_bps();
+        (expired_count as u128) * 10_000 > (recoverable_count as u128) * (max_ratio_bps as u128)
+    }
+
+    fn recoverable_node_count(&self) -> usize {
+        let index = self.index.read().unwrap();
+        index
+            .all_node_ids()
+            .into_iter()
+            .filter_map(|node_id| index.get_by_id(node_id))
+            .filter(|node| {
+                matches!(
+                    node.state,
+                    NodeState::Starting | NodeState::Live | NodeState::Lost
+                )
+            })
+            .count()
     }
 
     fn expired_lost_nodes(&self, now_ms: u64, recovery_window_ms: u64) -> Vec<NodeInfo> {

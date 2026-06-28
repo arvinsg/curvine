@@ -26,6 +26,12 @@ pub const PD_NODE_HEARTBEAT_TIMEOUT_MS: &str = "pd.node.heartbeat_timeout_ms";
 /// Lost recovery window for node health checker, in milliseconds.
 pub const PD_NODE_LOST_RECOVERY_WINDOW_MS: &str = "pd.node.lost_recovery_window_ms";
 
+/// Minimum recoverable node count before guarding Lost -> Offline promotion.
+pub const PD_NODE_OFFLINE_PROMOTION_MIN_NODES: &str = "pd.node.offline_promotion_min_nodes";
+
+/// Maximum Lost -> Offline promotion ratio in basis points before the guard trips.
+pub const PD_NODE_OFFLINE_PROMOTION_MAX_RATIO_BPS: &str = "pd.node.offline_promotion_max_ratio_bps";
+
 /// Interval between periodic persists of node info via Raft, in milliseconds.
 pub const PD_NODE_PERSIST_INTERVAL_MS: &str = "pd.node.persist_interval_ms";
 
@@ -159,6 +165,16 @@ pub static DYNAMIC_CONFIG_ITEMS: &[DynamicConfigItem] = &[
         key: PD_NODE_LOST_RECOVERY_WINDOW_MS,
         default: "300000",
         desc: "Lost worker recovery window in milliseconds",
+    },
+    DynamicConfigItem {
+        key: PD_NODE_OFFLINE_PROMOTION_MIN_NODES,
+        default: "10",
+        desc: "Minimum recoverable node count before guarding Lost -> Offline promotion",
+    },
+    DynamicConfigItem {
+        key: PD_NODE_OFFLINE_PROMOTION_MAX_RATIO_BPS,
+        default: "3500",
+        desc: "Maximum Lost -> Offline promotion ratio in basis points before the guard trips",
     },
     DynamicConfigItem {
         key: PD_NODE_PERSIST_INTERVAL_MS,

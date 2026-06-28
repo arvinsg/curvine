@@ -13,6 +13,11 @@
 // limitations under the License.
 
 use super::NodeManager;
+use crate::pd::config::keys::{
+    PD_NODE_HEARTBEAT_TIMEOUT_MS, PD_NODE_LIVENESS_CHECK_INTERVAL_MS,
+    PD_NODE_LOST_RECOVERY_WINDOW_MS, PD_NODE_OFFLINE_PROMOTION_MAX_RATIO_BPS,
+    PD_NODE_OFFLINE_PROMOTION_MIN_NODES, PD_NODE_PERSIST_INTERVAL_MS,
+};
 use crate::pd::journal::ApplyOutcome;
 use curvine_common::state::{NodeInfo, NodePayload, NodeState, NodeType};
 use curvine_common::{FsError, FsResult};
@@ -27,23 +32,30 @@ impl NodeManager {
     }
 
     pub(super) fn heartbeat_timeout_ms(&self) -> u64 {
-        self.config_manager
-            .get_u64(crate::pd::config::keys::PD_NODE_HEARTBEAT_TIMEOUT_MS)
+        self.config_manager.get_u64(PD_NODE_HEARTBEAT_TIMEOUT_MS)
     }
 
     pub(super) fn persist_interval_ms(&self) -> u64 {
-        self.config_manager
-            .get_u64(crate::pd::config::keys::PD_NODE_PERSIST_INTERVAL_MS)
+        self.config_manager.get_u64(PD_NODE_PERSIST_INTERVAL_MS)
     }
 
     pub(super) fn liveness_check_interval_ms(&self) -> u64 {
         self.config_manager
-            .get_u64(crate::pd::config::keys::PD_NODE_LIVENESS_CHECK_INTERVAL_MS)
+            .get_u64(PD_NODE_LIVENESS_CHECK_INTERVAL_MS)
     }
 
     pub(super) fn recovery_window_ms(&self) -> u64 {
+        self.config_manager.get_u64(PD_NODE_LOST_RECOVERY_WINDOW_MS)
+    }
+
+    pub(super) fn offline_promotion_min_nodes(&self) -> usize {
         self.config_manager
-            .get_u64(crate::pd::config::keys::PD_NODE_LOST_RECOVERY_WINDOW_MS)
+            .get_u32(PD_NODE_OFFLINE_PROMOTION_MIN_NODES) as usize
+    }
+
+    pub(super) fn offline_promotion_max_ratio_bps(&self) -> u64 {
+        self.config_manager
+            .get_u64(PD_NODE_OFFLINE_PROMOTION_MAX_RATIO_BPS)
     }
 
     pub(super) fn payload_matches_node_type(payload: &NodePayload, node_type: NodeType) -> bool {
