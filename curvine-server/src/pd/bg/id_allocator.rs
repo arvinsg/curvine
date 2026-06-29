@@ -13,96 +13,150 @@
 // limitations under the License.
 
 use super::BGStore;
-use crate::pd::journal::{self, entry::BatchBGEntry, PdEntry};
-use curvine_common::FsResult;
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::pd::journal::entry::BatchBGEntry;
+use crate::pd::journal::{self, ApplyOutcome, PdEntry};
+use curvine_common::state::BgId;
+use curvine_common::{FsError, FsResult};
 use std::sync::{Arc, Mutex};
 
-fn pack(next: u32, end: u32) -> u64 {
-    ((next as u64) << 32) | (end as u64)
+#[derive(Debug, Clone, Copy, Default)]
+struct IdRange {
+    next: BgId,
+    end: BgId,
 }
 
-fn unpack(v: u64) -> (u32, u32) {
-    ((v >> 32) as u32, v as u32)
+impl IdRange {
+    fn has_capacity(&self, count: u64) -> bool {
+        self.next
+            .checked_add(count)
+            .map(|new_next| new_next <= self.end)
+            .unwrap_or(false)
+    }
+
+    fn alloc(&mut self, count: u64) -> FsResult<BgId> {
+        let base = self.next;
+        self.next = self.next.checked_add(count).ok_or_else(|| {
+            FsError::common(format!(
+                "BG id allocation overflow: base={base}, count={count}"
+            ))
+        })?;
+        Ok(base)
+    }
 }
 
-/// Pre-allocates BG ID ranges to reduce Raft proposal frequency.
+/// Leader-local BG id range allocator.
 ///
-/// `range` packs `(next, end)` into a single AtomicU64 so that alloc reads
-/// both values atomically.
-pub struct IdAllocator {
+/// The allocator reserves monotonically increasing id ranges through Raft and
+/// then serves ids from memory. Unused ids in a reserved range may be skipped
+/// after leader changes; ids are never reused.
+pub struct BgIdAllocator {
     store: Arc<BGStore>,
     journal_client: Arc<journal::Client>,
-    range: AtomicU64,
-    step: u32,
-    alloc_lock: Mutex<()>,
+    range: Mutex<IdRange>,
+    step: u64,
 }
 
-impl IdAllocator {
-    const DEFAULT_STEP: u32 = 4096;
+impl BgIdAllocator {
+    const DEFAULT_STEP: u64 = 4096;
 
     pub fn new(store: Arc<BGStore>, journal_client: Arc<journal::Client>) -> Self {
+        Self::with_step(store, journal_client, Self::DEFAULT_STEP)
+    }
+
+    pub fn with_step(store: Arc<BGStore>, journal_client: Arc<journal::Client>, step: u64) -> Self {
         Self {
             store,
             journal_client,
-            range: AtomicU64::new(pack(0, 0)),
-            step: Self::DEFAULT_STEP,
-            alloc_lock: Mutex::new(()),
+            range: Mutex::new(IdRange::default()),
+            step: step.max(1),
         }
     }
 
     pub fn restore(&self) -> FsResult<()> {
-        let base = self.store.get_next_bg_id()?;
-        self.range.store(pack(base, base), Ordering::SeqCst);
+        let next_id = self.store.get_next_bg_id()?;
+        *self.range.lock().unwrap() = IdRange {
+            next: next_id,
+            end: next_id,
+        };
         Ok(())
     }
 
-    pub fn alloc(&self, count: u32) -> FsResult<u32> {
-        loop {
-            let r = self.range.load(Ordering::SeqCst);
-            let (next, end) = unpack(r);
-            if next + count <= end {
-                let new_r = pack(next + count, end);
-                if self
-                    .range
-                    .compare_exchange(r, new_r, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    return Ok(next);
-                }
-                continue;
-            }
-            self.realloc(count)?;
+    pub fn alloc(&self, count: u64) -> FsResult<BgId> {
+        if count == 0 {
+            return Err(FsError::common("BG id allocation count must be positive"));
         }
+
+        let mut range = self.range.lock().unwrap();
+        if !range.has_capacity(count) {
+            self.reserve_locked(&mut range, count)?;
+        }
+        range.alloc(count)
     }
 
-    fn realloc(&self, min_count: u32) -> FsResult<()> {
-        let _lock = self.alloc_lock.lock().unwrap();
-        let (next, end) = unpack(self.range.load(Ordering::SeqCst));
-        if next + min_count <= end {
+    fn reserve_locked(&self, range: &mut IdRange, min_count: u64) -> FsResult<()> {
+        if range.has_capacity(min_count) {
             return Ok(());
         }
-        let alloc_size = self.step.max(min_count);
+
         let base = self.store.get_next_bg_id()?;
-        let new_end = base + alloc_size;
+        let reserve_count = self.step.max(min_count);
+        let end = base.checked_add(reserve_count).ok_or_else(|| {
+            FsError::common(format!(
+                "BG id range overflow: base={base}, reserve_count={reserve_count}"
+            ))
+        })?;
 
         let entry = BatchBGEntry {
             op_ms: orpc::common::LocalTime::mills(),
             table: None,
+            tables: vec![],
             creates: vec![],
             updates: vec![],
-            next_bg_id: Some(new_end),
-            bump_table_epoch: None,
+            expected_next_bg_id: Some(base),
+            next_bg_id: Some(end),
+            next_table_id: None,
             expected_table_absent: false,
         };
-        // Fence: only the current raft leader may extend the BG ID range.
-        // Without this guard, an old leader losing leadership could persist
-        // a new range in memory but fail to commit it via Raft, leaving the
-        // new leader with no record of the consumed IDs.
-        self.journal_client
-            .propose_as_leader(PdEntry::BatchBG(entry))?;
+        match self.journal_client.propose(PdEntry::BatchBG(entry))? {
+            ApplyOutcome::Applied | ApplyOutcome::SkippedNoop => {
+                *range = IdRange { next: base, end };
+                Ok(())
+            }
+            ApplyOutcome::SkippedStale { reason } => {
+                Err(FsError::stale_entry("reserve_bg_id_range", base, reason))
+            }
+            ApplyOutcome::NotFound { reason } => Err(FsError::not_found(reason)),
+        }
+    }
+}
 
-        self.range.store(pack(base, new_end), Ordering::SeqCst);
-        Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_capacity_cases() {
+        let cases = vec![
+            (IdRange { next: 1, end: 5 }, 4, true),
+            (IdRange { next: 1, end: 5 }, 5, false),
+            (
+                IdRange {
+                    next: u64::MAX,
+                    end: u64::MAX,
+                },
+                1,
+                false,
+            ),
+        ];
+        for (range, count, expected) in cases {
+            assert_eq!(range.has_capacity(count), expected);
+        }
+    }
+
+    #[test]
+    fn range_alloc_advances_next() {
+        let mut range = IdRange { next: 10, end: 20 };
+        assert_eq!(range.alloc(3).unwrap(), 10);
+        assert_eq!(range.next, 13);
     }
 }
