@@ -21,7 +21,7 @@ pub use app_storage::PdAppStorage;
 pub use apply_outcome::ApplyOutcome;
 pub use client::Client;
 pub use entry::{
-    BGDeleteEntry, BGEntry, BGUpdateEntry, BatchBGEntry, ConfigEntry, MountAddEntry, MountEntry,
-    MountUpdateEntry, NamespaceCreateEntry, PathRouteAddEntry, PathRouteRemoveEntry, PdEntry,
-    RegisterNodeEntry, UnMountEntry,
+    BGBatchUpdateEntry, BGDeleteEntry, BGEntry, BGIdAllocatorEntry, BGUpdateEntry, ConfigEntry,
+    MountAddEntry, MountEntry, MountUpdateEntry, NamespaceCreateEntry, PathRouteAddEntry,
+    PathRouteRemoveEntry, PdEntry, RegisterNodeEntry, UnMountEntry,
 };

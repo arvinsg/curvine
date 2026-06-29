@@ -14,15 +14,9 @@
 
 mod id_allocator;
 mod manager;
-pub mod placement;
 pub mod state_machine;
 mod store;
-mod table;
 
-pub use curvine_common::state::BGTableSummary;
 pub use id_allocator::BgIdAllocator;
 pub use manager::BGManager;
 pub use store::BGStore;
-pub use table::{
-    BGTable, BGTableController, BGTableStats, CapacityBGTableController, HashBGTableController,
-};

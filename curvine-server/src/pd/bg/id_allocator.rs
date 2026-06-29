@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::BGStore;
-use crate::pd::journal::entry::BatchBGEntry;
+use crate::pd::journal::entry::BGIdAllocatorEntry;
 use crate::pd::journal::{self, ApplyOutcome, PdEntry};
 use curvine_common::state::BgId;
 use curvine_common::{FsError, FsResult};
@@ -106,18 +106,12 @@ impl BgIdAllocator {
             ))
         })?;
 
-        let entry = BatchBGEntry {
+        let entry = BGIdAllocatorEntry {
             op_ms: orpc::common::LocalTime::mills(),
-            table: None,
-            tables: vec![],
-            creates: vec![],
-            updates: vec![],
-            expected_next_bg_id: Some(base),
-            next_bg_id: Some(end),
-            next_table_id: None,
-            expected_table_absent: false,
+            expected_next_bg_id: base,
+            next_bg_id: end,
         };
-        match self.journal_client.propose(PdEntry::BatchBG(entry))? {
+        match self.journal_client.propose(PdEntry::AllocateBGId(entry))? {
             ApplyOutcome::Applied | ApplyOutcome::SkippedNoop => {
                 *range = IdRange { next: base, end };
                 Ok(())

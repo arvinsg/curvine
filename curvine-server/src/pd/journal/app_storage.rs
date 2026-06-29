@@ -140,6 +140,13 @@ impl PdAppStorage {
                     .namespace_manager
                     .apply_create_namespace(&entry, is_leader)?;
             }
+            PdEntry::AllocateBGId(entry) => {
+                info!(
+                    "Apply AllocateBGId expected_next={}, next={}",
+                    entry.expected_next_bg_id, entry.next_bg_id
+                );
+                let _ = self.bg_manager.apply_allocate_bg_id(&entry)?;
+            }
             PdEntry::CreateBG(entry) => {
                 info!("Apply CreateBG bg_id={}", entry.info.bg_id);
                 self.bg_manager
@@ -147,8 +154,8 @@ impl PdAppStorage {
             }
             PdEntry::UpdateBG(entry) => {
                 info!(
-                    "Apply UpdateBG bg_id={}, expected_epoch={}, new_epoch={}",
-                    entry.bg_id, entry.expected_bg_epoch, entry.new_bg_epoch
+                    "Apply UpdateBG bg_id={}, expected_epoch={}",
+                    entry.bg_id, entry.expected_bg_epoch
                 );
                 let _ = self
                     .bg_manager
@@ -163,21 +170,11 @@ impl PdAppStorage {
                     .bg_manager
                     .apply_delete_bg_with_role(entry, is_leader)?;
             }
-            PdEntry::BatchBG(entry) => {
-                info!(
-                    "Apply BatchBG table={}, creates={}, updates={}",
-                    entry.table.is_some(),
-                    entry.creates.len(),
-                    entry.updates.len()
-                );
+            PdEntry::BatchUpdateBG(entry) => {
+                info!("Apply BatchUpdateBG updates={}", entry.updates.len());
                 let _ = self
                     .bg_manager
-                    .apply_batch_bg_with_role(&entry, is_leader)?;
-            }
-            PdEntry::BumpTableEpoch(entry) => {
-                info!("Apply BumpTableEpoch updates={}", entry.updates.len());
-                self.bg_manager
-                    .apply_bump_table_epoch_with_role(&entry, is_leader)?;
+                    .apply_batch_update_bg_with_role(&entry, is_leader)?;
             }
             PdEntry::AddPathRoute(ref entry) => {
                 info!(

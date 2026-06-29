@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::pd::bgtable::BGTable;
 use curvine_common::state::{
     BGPrimary, BgId, BlockGroupInfo, ConfigInfo, MountInfo, NamespaceId, NamespaceInfo, NodeInfo,
-    NodeState, PathRouteEntry, PeerInfo, RwPolicy, TableId,
+    NodeState, PathRouteEntry, PeerInfo, RwPolicy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -118,7 +119,15 @@ pub struct MetaNodePayloadPatch {
     pub rw_policy: RwPolicy,
 }
 
-/// BG create entry (Raft log)
+/// BG id allocator entry.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct BGIdAllocatorEntry {
+    pub op_ms: u64,
+    pub expected_next_bg_id: BgId,
+    pub next_bg_id: BgId,
+}
+
+/// BG create entry.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct BGEntry {
     pub op_ms: u64,
@@ -130,93 +139,37 @@ pub struct BGEntry {
 pub struct BGUpdateEntry {
     pub op_ms: u64,
     pub bg_id: BgId,
+    pub expected_bg_epoch: u64,
     pub state: Option<curvine_common::state::BGState>,
     pub replica_set: Option<Vec<u32>>,
     pub isr: Option<Vec<u32>>,
     pub primary: Option<BGPrimary>,
-    /// BG epoch the proposer based this entry on. `serde(default)` keeps
-    /// pre-P2.1 logs decodable: legacy entries decode with expected_bg_epoch=0
-    /// and rely on the `new_bg_epoch > info.bg_epoch` monotonicity check.
-    #[serde(default)]
-    pub expected_bg_epoch: u64,
-    pub new_bg_epoch: u64,
-    /// Table whose route epoch should be bumped at apply time if this BG mutation succeeds.
-    pub bump_table_epoch: Option<TableId>,
 }
 
-/// Batch BG entry (Raft log) — atomically applies table + multiple BG creates/updates.
+/// Atomically applies multiple BG updates.
 #[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct BatchBGEntry {
+pub struct BGBatchUpdateEntry {
     pub op_ms: u64,
-    /// Legacy single-table create field. New namespace creation uses `tables`.
-    pub table: Option<super::super::bg::BGTable>,
-    #[serde(default)]
-    pub tables: Vec<super::super::bg::BGTable>,
-    pub creates: Vec<BlockGroupInfo>,
     pub updates: Vec<BGUpdateEntry>,
-    /// If present, updates the next BG ID counter atomically with other changes.
-    #[serde(default)]
-    pub next_bg_id: Option<BgId>,
-    #[serde(default)]
-    pub next_table_id: Option<TableId>,
-    #[serde(default)]
-    /// Table whose route epoch should be bumped at apply time if this batch mutates route-visible state.
-    pub bump_table_epoch: Option<TableId>,
-    /// P2.3: when `table` is set and this is true, apply requires the table to
-    /// NOT already exist. Used by `create_table` to prevent two concurrent
-    /// creates with the same `(pool_type, replica_count)` from clobbering each
-    /// other's BGs (the second batch's CAS fails and orphan BGs are avoided).
-    /// Pre-P2.3 entries decode with `expected_table_absent = false` (no guard).
-    #[serde(default)]
-    pub expected_table_absent: bool,
 }
 
-/// BG delete entry (Raft log).
-///
-/// `expected_bg_epoch` (P2.2) protects against deleting a BG whose epoch has
-/// moved since the proposer's snapshot. `table_id` is kept for backward
-/// compatibility but apply now reads `info.table_id` from the BG itself
-/// instead of trusting this field, eliminating the "delete bumps wrong
-/// table_epoch" risk described in §4.6.
+/// BG delete entry.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct BGDeleteEntry {
     pub op_ms: u64,
     pub bg_id: BgId,
-    pub table_id: TableId,
-    /// BG epoch the proposer based the delete on. `serde(default)` keeps
-    /// pre-P2.2 logs decodable.
-    #[serde(default)]
     pub expected_bg_epoch: u64,
 }
 
-/// A single table epoch bump. Replica lifecycle state is leader-runtime only;
-/// this entry only publishes a monotonically increasing route epoch.
-#[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct TableEpochUpdate {
-    pub table_id: TableId,
-    pub expected_epoch: u64,
-    pub new_epoch: u64,
-}
-
-/// Namespace create entry (Raft log). This atomically materializes the
-/// NamespaceInfo and its initial Hash BGTable(s). Capacity BGTable creation is
-/// intentionally rejected in phase 1 and reserved for write acceleration.
+/// Namespace create entry
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct NamespaceCreateEntry {
     pub op_ms: u64,
     pub namespace: NamespaceInfo,
-    pub bg_batch: BatchBGEntry,
+    pub tables: Vec<BGTable>,
+    pub bgs: Vec<BlockGroupInfo>,
     pub expected_next_namespace_id: NamespaceId,
     pub next_namespace_id: NamespaceId,
-    pub expected_next_bg_id: BgId,
-    pub next_bg_id: BgId,
-}
-
-/// Batch table epoch bump entry (Raft log).
-#[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct BumpTableEpochEntry {
-    pub op_ms: u64,
-    pub updates: Vec<TableEpochUpdate>,
 }
 
 /// Add or update one static MetaRoute path rule with table-version CAS.
@@ -253,11 +206,11 @@ pub enum PdEntry {
     CreateNamespace(NamespaceCreateEntry),
 
     // BG management
+    AllocateBGId(BGIdAllocatorEntry),
     CreateBG(BGEntry),
     UpdateBG(BGUpdateEntry),
     DeleteBG(BGDeleteEntry),
-    BatchBG(BatchBGEntry),
-    BumpTableEpoch(BumpTableEpochEntry),
+    BatchUpdateBG(BGBatchUpdateEntry),
 
     // Path route (MetaNode Federation static mode)
     AddPathRoute(PathRouteAddEntry),
@@ -277,11 +230,11 @@ impl PdEntry {
             PdEntry::UpdateNodePayload(_) => "update_node_payload",
             PdEntry::RemoveNode(_) => "remove_node",
             PdEntry::CreateNamespace(_) => "create_namespace",
+            PdEntry::AllocateBGId(_) => "allocate_bg_id",
             PdEntry::CreateBG(_) => "create_bg",
             PdEntry::UpdateBG(_) => "update_bg",
             PdEntry::DeleteBG(_) => "delete_bg",
-            PdEntry::BatchBG(_) => "batch_bg",
-            PdEntry::BumpTableEpoch(_) => "bump_table_epoch",
+            PdEntry::BatchUpdateBG(_) => "batch_update_bg",
             PdEntry::AddPathRoute(_) => "add_path_route",
             PdEntry::RemovePathRoute(_) => "remove_path_route",
         }
