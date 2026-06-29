@@ -254,7 +254,7 @@ pub fn filter_min_isolation(
 }
 
 /// Per-worker violation score: constraint penalty (high) + isolation penalty (low).
-/// Higher = worse. Used by PlacementRuleChecker to find the worst replica.
+/// Higher = worse. Used by HashPlacementRuleChecker to find the worst replica.
 pub fn worst_replica(replicas: &[u32], rule: &PlacementRule, labels: &Labels) -> Option<u32> {
     if replicas.is_empty() {
         return None;

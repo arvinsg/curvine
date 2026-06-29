@@ -55,9 +55,9 @@ impl RebuildOptions {
 
 pub struct PolicyState {
     pub worker_bg_quota: HashMap<u32, u32>,
-    pub worker_lease_quota: HashMap<u32, u32>,
+    pub worker_primary_quota: HashMap<u32, u32>,
     pub worker_bg_effective: HashMap<u32, i64>,
-    pub worker_lease_effective: HashMap<u32, i64>,
+    pub worker_primary_effective: HashMap<u32, i64>,
 }
 
 impl PolicyState {
@@ -70,13 +70,13 @@ impl PolicyState {
         *self.worker_bg_effective.entry(new_worker).or_insert(0) += 1;
     }
 
-    pub fn record_lease_change(&mut self, old_owner: Option<u32>, new_owner: u32) {
+    pub fn record_primary_change(&mut self, old_owner: Option<u32>, new_owner: u32) {
         if let Some(old) = old_owner {
-            if let Some(v) = self.worker_lease_effective.get_mut(&old) {
+            if let Some(v) = self.worker_primary_effective.get_mut(&old) {
                 *v -= 1;
             }
         }
-        *self.worker_lease_effective.entry(new_owner).or_insert(0) += 1;
+        *self.worker_primary_effective.entry(new_owner).or_insert(0) += 1;
     }
 }
 
@@ -102,7 +102,7 @@ pub trait PlacementPolicy: Send + Sync {
         worker_id: u32,
     ) -> bool;
 
-    fn is_lease_overloaded(
+    fn is_primary_overloaded(
         &self,
         ctx: &PlacementContext<'_>,
         st: &PolicyState,
@@ -120,8 +120,8 @@ pub trait PlacementPolicy: Send + Sync {
         exclude: &HashSet<u32>,
     ) -> FsResult<Vec<u32>>;
 
-    /// Select a lease owner from candidates.
-    fn select_lease_owner(&self, st: &PolicyState, candidates: &[u32]) -> FsResult<u32>;
+    /// Select a primary from candidates.
+    fn select_primary(&self, st: &PolicyState, candidates: &[u32]) -> FsResult<u32>;
 }
 
 pub fn compute_equal_quota(worker_ids: &[u32], total: u32) -> HashMap<u32, u32> {
@@ -150,12 +150,12 @@ pub fn build_effective_counts(
         .iter()
         .map(|(&wid, snap)| (wid, snap.effective_bg()))
         .collect();
-    let lease: HashMap<u32, i64> = ctx
+    let primary: HashMap<u32, i64> = ctx
         .workers
         .iter()
-        .map(|(&wid, snap)| (wid, snap.effective_lease()))
+        .map(|(&wid, snap)| (wid, snap.effective_primary()))
         .collect();
-    (bg, lease)
+    (bg, primary)
 }
 
 pub fn classify_replica(
@@ -194,14 +194,18 @@ pub fn is_bg_overloaded(ctx: &PlacementContext<'_>, st: &PolicyState, worker_id:
     effective > threshold as i64
 }
 
-pub fn is_lease_overloaded(ctx: &PlacementContext<'_>, st: &PolicyState, worker_id: u32) -> bool {
+pub fn is_primary_overloaded(ctx: &PlacementContext<'_>, st: &PolicyState, worker_id: u32) -> bool {
     let effective = st
-        .worker_lease_effective
+        .worker_primary_effective
         .get(&worker_id)
         .copied()
         .unwrap_or(0);
-    let quota = st.worker_lease_quota.get(&worker_id).copied().unwrap_or(0);
-    let threshold = quota + tolerant(quota, ctx.lease_tolerant_ratio);
+    let quota = st
+        .worker_primary_quota
+        .get(&worker_id)
+        .copied()
+        .unwrap_or(0);
+    let threshold = quota + tolerant(quota, ctx.primary_tolerant_ratio);
     effective > threshold as i64
 }
 
@@ -230,11 +234,11 @@ pub fn select_by_hunger(
         .collect()
 }
 
-/// Hunger-based lease owner selection (lowest lease effective wins).
-pub fn select_lease_by_hunger(st: &PolicyState, candidates: &[u32]) -> Option<u32> {
+/// Hunger-based primary selection (lowest primary effective wins).
+pub fn select_primary_by_hunger(st: &PolicyState, candidates: &[u32]) -> Option<u32> {
     candidates.iter().copied().min_by_key(|&wid| {
-        let quota = st.worker_lease_quota.get(&wid).copied().unwrap_or(0) as i64;
-        let effective = st.worker_lease_effective.get(&wid).copied().unwrap_or(0);
+        let quota = st.worker_primary_quota.get(&wid).copied().unwrap_or(0) as i64;
+        let effective = st.worker_primary_effective.get(&wid).copied().unwrap_or(0);
         (-(quota - effective), wid)
     })
 }
@@ -254,24 +258,32 @@ pub fn is_bg_gap_sufficient(
     src - tgt > 2 * tol
 }
 
-pub fn is_lease_gap_sufficient(
+pub fn is_primary_gap_sufficient(
     st: &PolicyState,
     source_id: u32,
     target_id: u32,
     tolerant_ratio: f64,
 ) -> bool {
     let src = st
-        .worker_lease_effective
+        .worker_primary_effective
         .get(&source_id)
         .copied()
         .unwrap_or(0);
     let tgt = st
-        .worker_lease_effective
+        .worker_primary_effective
         .get(&target_id)
         .copied()
         .unwrap_or(0);
-    let src_quota = st.worker_lease_quota.get(&source_id).copied().unwrap_or(0);
-    let tgt_quota = st.worker_lease_quota.get(&target_id).copied().unwrap_or(0);
+    let src_quota = st
+        .worker_primary_quota
+        .get(&source_id)
+        .copied()
+        .unwrap_or(0);
+    let tgt_quota = st
+        .worker_primary_quota
+        .get(&target_id)
+        .copied()
+        .unwrap_or(0);
     let avg_quota = (src_quota + tgt_quota) / 2;
     let tol = tolerant(avg_quota, tolerant_ratio) as i64;
     src - tgt > 2 * tol

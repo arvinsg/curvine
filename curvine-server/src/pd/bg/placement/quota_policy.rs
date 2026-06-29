@@ -15,8 +15,8 @@
 use super::context::PlacementContext;
 use super::policy::{
     build_effective_counts, classify_replica, compute_equal_quota, is_bg_overloaded,
-    is_lease_overloaded, select_by_hunger, select_lease_by_hunger, PlacementPolicy, PolicyState,
-    ReplicaDecision,
+    is_primary_overloaded, select_by_hunger, select_primary_by_hunger, PlacementPolicy,
+    PolicyState, ReplicaDecision,
 };
 use curvine_common::state::BlockGroupInfo;
 use curvine_common::{FsError, FsResult};
@@ -25,7 +25,7 @@ use std::collections::HashSet;
 /// Default quota-based placement policy.
 ///
 /// BG quota: equal-weight (`total_slots / num_workers`).
-/// Lease quota: equal-weight (`bucket_count / num_workers`).
+/// Primary quota: equal-weight (`bucket_count / num_workers`).
 /// Selection: deterministic hunger-based (highest `quota - effective` wins).
 pub struct QuotaPolicy;
 
@@ -51,14 +51,14 @@ impl PlacementPolicy for QuotaPolicy {
         let total_slots = ctx.total_bg_slots();
 
         let worker_bg_quota = compute_equal_quota(&worker_ids, total_slots);
-        let worker_lease_quota = compute_equal_quota(&worker_ids, ctx.bucket_count);
-        let (worker_bg_effective, worker_lease_effective) = build_effective_counts(ctx);
+        let worker_primary_quota = compute_equal_quota(&worker_ids, ctx.bucket_count);
+        let (worker_bg_effective, worker_primary_effective) = build_effective_counts(ctx);
 
         Ok(PolicyState {
             worker_bg_quota,
-            worker_lease_quota,
+            worker_primary_quota,
             worker_bg_effective,
-            worker_lease_effective,
+            worker_primary_effective,
         })
     }
 
@@ -77,8 +77,13 @@ impl PlacementPolicy for QuotaPolicy {
         is_bg_overloaded(ctx, st, wid)
     }
 
-    fn is_lease_overloaded(&self, ctx: &PlacementContext<'_>, st: &PolicyState, wid: u32) -> bool {
-        is_lease_overloaded(ctx, st, wid)
+    fn is_primary_overloaded(
+        &self,
+        ctx: &PlacementContext<'_>,
+        st: &PolicyState,
+        wid: u32,
+    ) -> bool {
+        is_primary_overloaded(ctx, st, wid)
     }
 
     fn select_bg_targets(
@@ -96,9 +101,9 @@ impl PlacementPolicy for QuotaPolicy {
         Ok(result)
     }
 
-    fn select_lease_owner(&self, st: &PolicyState, candidates: &[u32]) -> FsResult<u32> {
-        select_lease_by_hunger(st, candidates)
-            .ok_or_else(|| FsError::common("no eligible lease owner".to_string()))
+    fn select_primary(&self, st: &PolicyState, candidates: &[u32]) -> FsResult<u32> {
+        select_primary_by_hunger(st, candidates)
+            .ok_or_else(|| FsError::common("no eligible primary".to_string()))
     }
 }
 
@@ -106,18 +111,18 @@ impl PlacementPolicy for QuotaPolicy {
 mod tests {
     use super::*;
     use crate::pd::bg::placement::{ReplicaReplaceReason, WorkerLoadSnapshot};
-    use curvine_common::state::{BGLease, BGOpState, BGState};
+    use curvine_common::state::{BGKind, BGOpState, BGPrimary, BGState};
     use std::collections::HashMap;
 
-    fn make_snapshot(worker_id: u32, actual_bg: u32, actual_lease: u32) -> WorkerLoadSnapshot {
+    fn make_snapshot(worker_id: u32, actual_bg: u32, actual_primary: u32) -> WorkerLoadSnapshot {
         WorkerLoadSnapshot {
             worker_id,
             actual_bg,
-            actual_lease,
+            actual_primary,
             pending_bg_add: 0,
             pending_bg_remove: 0,
-            pending_lease_in: 0,
-            pending_lease_out: 0,
+            pending_primary_in: 0,
+            pending_primary_out: 0,
             capacity_bytes: 1000,
             used_bytes: 100,
             labels: HashMap::new(),
@@ -130,20 +135,22 @@ mod tests {
             bucket_count: 8,
             replica_count: 2,
             tolerant_ratio: 0.1,
-            lease_tolerant_ratio: 0.1,
+            primary_tolerant_ratio: 0.1,
         }
     }
 
-    fn make_bg(bg_id: u32, replica_set: Vec<u32>, lease_owner_id: u32) -> BlockGroupInfo {
+    fn make_bg(bg_id: u32, replica_set: Vec<u32>, primary_id: u32) -> BlockGroupInfo {
         BlockGroupInfo {
-            bg_id,
+            bg_id: bg_id.into(),
             table_id: 1,
+            kind: BGKind::Hash,
             bg_epoch: 1,
-            replica_set,
+            replica_set: replica_set.clone(),
+            isr: replica_set,
             state: BGState::Active,
             op_state: BGOpState::Idle,
-            lease_owner: Some(BGLease {
-                node_id: lease_owner_id,
+            primary: Some(BGPrimary {
+                node_id: primary_id,
                 epoch: 1,
                 grant_time_ms: 0,
             }),
@@ -161,7 +168,7 @@ mod tests {
         let st = policy.prepare(&ctx).unwrap();
 
         assert_eq!(st.worker_bg_quota[&1] + st.worker_bg_quota[&2], 16);
-        assert_eq!(st.worker_lease_quota[&1], 4);
+        assert_eq!(st.worker_primary_quota[&1], 4);
     }
 
     #[test]
@@ -244,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_lease_owner() {
+    fn test_select_primary() {
         let mut workers = HashMap::new();
         workers.insert(1, make_snapshot(1, 4, 4));
         workers.insert(2, make_snapshot(2, 4, 0));
@@ -252,7 +259,7 @@ mod tests {
         let policy = QuotaPolicy::new();
         let st = policy.prepare(&ctx).unwrap();
 
-        let owner = policy.select_lease_owner(&st, &[1, 2]).unwrap();
+        let owner = policy.select_primary(&st, &[1, 2]).unwrap();
         assert_eq!(owner, 2);
     }
 

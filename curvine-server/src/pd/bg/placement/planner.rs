@@ -15,8 +15,11 @@
 use super::context::PlacementContext;
 use super::policy::{PlacementPolicy, PolicyState, RebuildOptions, ReplicaDecision};
 use super::rule::{best_isolation_candidates, filter_min_isolation, Labels, PlacementRule};
-use crate::pd::bg::{BGTable, BGTableStats};
-use curvine_common::state::{table_id_pool_type, BGLease, BGState, BlockGroupInfo};
+use crate::pd::bg::BGTable;
+use curvine_common::state::{
+    BGKind, BGPrimary, BGState, BgId, BlockGroupInfo, CacheReplicaPolicy, LabelMatch, StorageType,
+    TableId,
+};
 use curvine_common::FsError;
 use orpc::common::LocalTime;
 use std::collections::HashSet;
@@ -34,10 +37,14 @@ pub struct RebuildTableResult {
 
 /// Build a BGTable with all BGs allocated from scratch.
 pub fn build_table(
-    table_id: u32,
+    table_id: TableId,
+    namespace_id: u16,
+    pool_type: StorageType,
     bucket_count: u32,
     replica_count: u16,
-    next_bg_id: u32,
+    next_bg_id: BgId,
+    worker_labels: Vec<LabelMatch>,
+    cache_replica_policy: CacheReplicaPolicy,
     ctx: &PlacementContext<'_>,
     rule: &PlacementRule,
     policy: &dyn PlacementPolicy,
@@ -47,9 +54,9 @@ pub fn build_table(
         return Err(FsError::common("bucket_count must be > 0".to_string()));
     }
 
-    let worker_labels = ctx.worker_labels();
+    let all_worker_labels = ctx.worker_labels();
     let all_ids = ctx.worker_ids();
-    let constrained_workers = rule.filter(&all_ids, &worker_labels);
+    let constrained_workers = rule.filter(&all_ids, &all_worker_labels);
     if constrained_workers.len() < replica_count as usize {
         return Err(FsError::common(format!(
             "not enough workers satisfying constraints: need {}, have {}",
@@ -62,7 +69,7 @@ pub fn build_table(
     let mut bgs: Vec<BlockGroupInfo> = Vec::with_capacity(bucket_count as usize);
 
     for i in 0..bucket_count {
-        let bg_id = next_bg_id + i;
+        let bg_id = next_bg_id + i as BgId;
         let mut replica_set: Vec<u32> = Vec::with_capacity(replica_count as usize);
         let mut exclude = HashSet::new();
 
@@ -73,7 +80,7 @@ pub fn build_table(
                 rule,
                 policy,
                 &constrained_workers,
-                &worker_labels,
+                &all_worker_labels,
                 &replica_set,
                 &exclude,
             );
@@ -102,19 +109,21 @@ pub fn build_table(
             )));
         }
 
-        // Select lease owner from the replica set.
-        let lease_owner_id = policy.select_lease_owner(st, &replica_set)?;
-        st.record_lease_change(None, lease_owner_id);
+        // Select primary from the replica set.
+        let primary_id = policy.select_primary(st, &replica_set)?;
+        st.record_primary_change(None, primary_id);
 
         bgs.push(BlockGroupInfo {
             bg_id,
             table_id,
             bg_epoch: 1,
-            replica_set,
-            state: BGState::Assigned,
+            replica_set: replica_set.clone(),
+            isr: replica_set.clone(),
+            kind: BGKind::Hash,
+            state: BGState::Active,
             op_state: Default::default(),
-            lease_owner: Some(BGLease {
-                node_id: lease_owner_id,
+            primary: Some(BGPrimary {
+                node_id: primary_id,
                 epoch: 1,
                 grant_time_ms: now,
             }),
@@ -122,19 +131,18 @@ pub fn build_table(
         });
     }
 
-    let pool_type = table_id_pool_type(table_id)
-        .ok_or_else(|| FsError::common(format!("invalid table_id pool type: {}", table_id)))?;
-    let buckets: Vec<u32> = (next_bg_id..next_bg_id + bucket_count).collect();
-    let table = BGTable {
+    let buckets: Vec<BgId> = (0..bucket_count).map(|i| next_bg_id + i as BgId).collect();
+    let mut table = BGTable::new_hash_with_config(
         table_id,
+        namespace_id,
         pool_type,
+        replica_count,
         bucket_count,
         buckets,
-        epoch: 1,
-        create_time_ms: now,
-        last_rebuild_ms: now,
-        stats: BGTableStats::default(),
-    };
+        worker_labels,
+        cache_replica_policy,
+    );
+    table.set_epoch(1);
 
     Ok(BuildTableResult { table, bgs })
 }
@@ -210,21 +218,23 @@ pub fn rebuild_table(
             }
         }
 
-        // Check lease owner validity.
-        let mut new_lease = bg.lease_owner.clone();
-        if let Some(ref lease) = bg.lease_owner {
-            if !live_workers.contains(&lease.node_id) || !new_replica_set.contains(&lease.node_id) {
+        // Check primary validity.
+        let mut new_primary = bg.primary.clone();
+        if let Some(ref primary) = bg.primary {
+            if !live_workers.contains(&primary.node_id)
+                || !new_replica_set.contains(&primary.node_id)
+            {
                 let alive_replicas: Vec<u32> = new_replica_set
                     .iter()
                     .copied()
                     .filter(|wid| live_workers.contains(wid))
                     .collect();
                 if !alive_replicas.is_empty() {
-                    let new_owner = policy.select_lease_owner(st, &alive_replicas)?;
-                    st.record_lease_change(Some(lease.node_id), new_owner);
-                    new_lease = Some(BGLease {
+                    let new_owner = policy.select_primary(st, &alive_replicas)?;
+                    st.record_primary_change(Some(primary.node_id), new_owner);
+                    new_primary = Some(BGPrimary {
                         node_id: new_owner,
-                        epoch: lease.epoch + 1,
+                        epoch: primary.epoch + 1,
                         grant_time_ms: now,
                     });
                     changed = true;
@@ -235,7 +245,7 @@ pub fn rebuild_table(
         if changed {
             let mut updated = bg.clone();
             updated.replica_set = new_replica_set;
-            updated.lease_owner = new_lease;
+            updated.primary = new_primary;
             updated.bg_epoch += 1;
             updated_bgs.push(updated);
         }
@@ -351,7 +361,7 @@ fn try_pick(
 mod tests {
     use super::*;
     use crate::pd::bg::placement::{QuotaPolicy, WorkerLoadSnapshot};
-    use curvine_common::state::{gen_table_id, BGOpState, PoolType};
+    use curvine_common::state::{gen_table_id, BGKind, BGOpState, StorageType};
     use std::collections::HashMap;
 
     fn make_ctx<'a>(
@@ -364,7 +374,7 @@ mod tests {
             bucket_count,
             replica_count,
             tolerant_ratio: 0.1,
-            lease_tolerant_ratio: 0.1,
+            primary_tolerant_ratio: 0.1,
         }
     }
 
@@ -376,11 +386,11 @@ mod tests {
                     WorkerLoadSnapshot {
                         worker_id: wid,
                         actual_bg: 0,
-                        actual_lease: 0,
+                        actual_primary: 0,
                         pending_bg_add: 0,
                         pending_bg_remove: 0,
-                        pending_lease_in: 0,
-                        pending_lease_out: 0,
+                        pending_primary_in: 0,
+                        pending_primary_out: 0,
                         capacity_bytes: 1000,
                         used_bytes: 100,
                         labels: HashMap::new(),
@@ -398,11 +408,11 @@ mod tests {
                     WorkerLoadSnapshot {
                         worker_id: wid,
                         actual_bg: bg,
-                        actual_lease: 0,
+                        actual_primary: 0,
                         pending_bg_add: 0,
                         pending_bg_remove: 0,
-                        pending_lease_in: 0,
-                        pending_lease_out: 0,
+                        pending_primary_in: 0,
+                        pending_primary_out: 0,
                         capacity_bytes: 1000,
                         used_bytes: 100,
                         labels: HashMap::new(),
@@ -421,10 +431,14 @@ mod tests {
         let mut st = policy.prepare(&ctx).unwrap();
 
         let result = build_table(
-            gen_table_id(PoolType::Ssd, 2),
+            gen_table_id(StorageType::Ssd, 2),
+            0,
+            StorageType::Ssd,
             4,
             2,
             100,
+            vec![],
+            CacheReplicaPolicy::default(),
             &ctx,
             &rule,
             &policy,
@@ -432,13 +446,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.table.bucket_count, 4);
+        assert_eq!(result.table.bucket_count(), 4);
         assert_eq!(result.bgs.len(), 4);
         for bg in &result.bgs {
             assert_eq!(bg.replica_set.len(), 2);
             let set: HashSet<u32> = bg.replica_set.iter().copied().collect();
             assert_eq!(set.len(), 2);
-            assert!(bg.lease_owner.is_some());
+            assert!(bg.primary.is_some());
         }
     }
 
@@ -450,7 +464,20 @@ mod tests {
         let policy = QuotaPolicy::new();
         let mut st = policy.prepare(&ctx).unwrap();
 
-        let result = build_table(1, 4, 2, 100, &ctx, &rule, &policy, &mut st);
+        let result = build_table(
+            1,
+            0,
+            StorageType::Ssd,
+            4,
+            2,
+            100,
+            vec![],
+            CacheReplicaPolicy::default(),
+            &ctx,
+            &rule,
+            &policy,
+            &mut st,
+        );
         assert!(result.is_err());
     }
 
@@ -462,7 +489,20 @@ mod tests {
         let policy = QuotaPolicy::new();
         let mut st = policy.prepare(&ctx).unwrap();
 
-        let result = build_table(1, 0, 2, 100, &ctx, &rule, &policy, &mut st);
+        let result = build_table(
+            1,
+            0,
+            StorageType::Ssd,
+            0,
+            2,
+            100,
+            vec![],
+            CacheReplicaPolicy::default(),
+            &ctx,
+            &rule,
+            &policy,
+            &mut st,
+        );
         assert!(result.is_err());
     }
 
@@ -478,11 +518,13 @@ mod tests {
         let existing_bgs = vec![BlockGroupInfo {
             bg_id: 100,
             table_id: 1,
+            kind: BGKind::Hash,
             bg_epoch: 1,
             replica_set: vec![1, 2], // worker 1 is invalid
+            isr: vec![1, 2],
             state: BGState::Active,
             op_state: BGOpState::Idle,
-            lease_owner: Some(BGLease {
+            primary: Some(BGPrimary {
                 node_id: 2,
                 epoch: 1,
                 grant_time_ms: 0,
@@ -490,16 +532,15 @@ mod tests {
             stats: Default::default(),
         }];
 
-        let table = BGTable {
-            table_id: 1,
-            pool_type: PoolType::Ssd,
-            bucket_count: 1,
-            buckets: vec![100],
-            epoch: 1,
-            create_time_ms: 0,
-            last_rebuild_ms: 0,
-            stats: BGTableStats::default(),
-        };
+        let table = BGTable::new_hash_with_epoch(
+            1,
+            0,
+            StorageType::Ssd,
+            3,
+            vec![100].len() as u32,
+            vec![100],
+            1,
+        );
 
         let options = RebuildOptions::default();
         let result = rebuild_table(
@@ -529,11 +570,13 @@ mod tests {
         let existing_bgs = vec![BlockGroupInfo {
             bg_id: 100,
             table_id: 1,
+            kind: BGKind::Hash,
             bg_epoch: 1,
             replica_set: vec![1, 2],
+            isr: vec![1, 2],
             state: BGState::Active,
             op_state: BGOpState::Idle,
-            lease_owner: Some(BGLease {
+            primary: Some(BGPrimary {
                 node_id: 1,
                 epoch: 1,
                 grant_time_ms: 0,
@@ -541,16 +584,15 @@ mod tests {
             stats: Default::default(),
         }];
 
-        let table = BGTable {
-            table_id: 1,
-            pool_type: PoolType::Ssd,
-            bucket_count: 1,
-            buckets: vec![100],
-            epoch: 1,
-            create_time_ms: 0,
-            last_rebuild_ms: 0,
-            stats: BGTableStats::default(),
-        };
+        let table = BGTable::new_hash_with_epoch(
+            1,
+            0,
+            StorageType::Ssd,
+            3,
+            vec![100].len() as u32,
+            vec![100],
+            1,
+        );
 
         let options = RebuildOptions::default();
         let result = rebuild_table(
@@ -583,11 +625,13 @@ mod tests {
             .map(|i| BlockGroupInfo {
                 bg_id: 100 + i,
                 table_id: 1,
+                kind: BGKind::Hash,
                 bg_epoch: 1,
-                replica_set: vec![1, (i % 3 + 2)], // worker 1 always, worker 2/3/4 rotating
+                replica_set: vec![1, (i % 3 + 2) as u32], // worker 1 always, worker 2/3/4 rotating
+                isr: vec![1, (i % 3 + 2) as u32],
                 state: BGState::Active,
                 op_state: BGOpState::Idle,
-                lease_owner: Some(BGLease {
+                primary: Some(BGPrimary {
                     node_id: 1,
                     epoch: 1,
                     grant_time_ms: 0,
@@ -596,16 +640,15 @@ mod tests {
             })
             .collect();
 
-        let table = BGTable {
-            table_id: 1,
-            pool_type: PoolType::Ssd,
-            bucket_count: 4,
-            buckets: vec![100, 101, 102, 103],
-            epoch: 1,
-            create_time_ms: 0,
-            last_rebuild_ms: 0,
-            stats: BGTableStats::default(),
-        };
+        let table = BGTable::new_hash_with_epoch(
+            1,
+            0,
+            StorageType::Ssd,
+            3,
+            vec![100, 101, 102, 103].len() as u32,
+            vec![100, 101, 102, 103],
+            1,
+        );
 
         let options = RebuildOptions::default(); // max 50% = 1 per BG
         let result = rebuild_table(

@@ -15,7 +15,7 @@
 use super::context::PlacementContext;
 use super::policy::{
     build_effective_counts, classify_replica, compute_equal_quota, is_bg_overloaded,
-    is_lease_overloaded, select_lease_by_hunger, PlacementPolicy, PolicyState, ReplicaDecision,
+    is_primary_overloaded, select_primary_by_hunger, PlacementPolicy, PolicyState, ReplicaDecision,
 };
 use curvine_common::state::BlockGroupInfo;
 use curvine_common::{FsError, FsResult};
@@ -27,7 +27,7 @@ use std::sync::Mutex;
 /// Capacity-weighted placement policy.
 ///
 /// BG quota: proportional to worker disk capacity.
-/// Lease quota: equal-weight.
+/// Primary quota: equal-weight.
 /// Selection: weighted-random blending BG hunger + capacity proportion.
 pub struct CapacityPolicy {
     bg_weight: f64,
@@ -133,14 +133,14 @@ impl PlacementPolicy for CapacityPolicy {
         let total_slots = ctx.total_bg_slots();
         let worker_bg_quota = compute_capacity_weighted_quota(ctx, total_slots);
         let worker_ids: Vec<u32> = ctx.worker_ids();
-        let worker_lease_quota = compute_equal_quota(&worker_ids, ctx.bucket_count);
-        let (worker_bg_effective, worker_lease_effective) = build_effective_counts(ctx);
+        let worker_primary_quota = compute_equal_quota(&worker_ids, ctx.bucket_count);
+        let (worker_bg_effective, worker_primary_effective) = build_effective_counts(ctx);
 
         Ok(PolicyState {
             worker_bg_quota,
-            worker_lease_quota,
+            worker_primary_quota,
             worker_bg_effective,
-            worker_lease_effective,
+            worker_primary_effective,
         })
     }
 
@@ -159,8 +159,13 @@ impl PlacementPolicy for CapacityPolicy {
         is_bg_overloaded(ctx, st, wid)
     }
 
-    fn is_lease_overloaded(&self, ctx: &PlacementContext<'_>, st: &PolicyState, wid: u32) -> bool {
-        is_lease_overloaded(ctx, st, wid)
+    fn is_primary_overloaded(
+        &self,
+        ctx: &PlacementContext<'_>,
+        st: &PolicyState,
+        wid: u32,
+    ) -> bool {
+        is_primary_overloaded(ctx, st, wid)
     }
 
     fn select_bg_targets(
@@ -222,9 +227,9 @@ impl PlacementPolicy for CapacityPolicy {
         Ok(selected)
     }
 
-    fn select_lease_owner(&self, st: &PolicyState, candidates: &[u32]) -> FsResult<u32> {
-        select_lease_by_hunger(st, candidates)
-            .ok_or_else(|| FsError::common("no eligible lease owner".to_string()))
+    fn select_primary(&self, st: &PolicyState, candidates: &[u32]) -> FsResult<u32> {
+        select_primary_by_hunger(st, candidates)
+            .ok_or_else(|| FsError::common("no eligible primary".to_string()))
     }
 }
 
@@ -237,11 +242,11 @@ mod tests {
         WorkerLoadSnapshot {
             worker_id,
             actual_bg,
-            actual_lease: 0,
+            actual_primary: 0,
             pending_bg_add: 0,
             pending_bg_remove: 0,
-            pending_lease_in: 0,
-            pending_lease_out: 0,
+            pending_primary_in: 0,
+            pending_primary_out: 0,
             capacity_bytes,
             used_bytes: 0,
             labels: HashMap::new(),
@@ -260,7 +265,7 @@ mod tests {
             bucket_count: 8,
             replica_count: 3,
             tolerant_ratio: 0.1,
-            lease_tolerant_ratio: 0.1,
+            primary_tolerant_ratio: 0.1,
         };
 
         let policy = CapacityPolicy::new();
@@ -282,7 +287,7 @@ mod tests {
             bucket_count: 8,
             replica_count: 2,
             tolerant_ratio: 0.1,
-            lease_tolerant_ratio: 0.1,
+            primary_tolerant_ratio: 0.1,
         };
 
         let policy = CapacityPolicy::new();
@@ -304,7 +309,7 @@ mod tests {
             bucket_count: 4,
             replica_count: 2,
             tolerant_ratio: 0.1,
-            lease_tolerant_ratio: 0.1,
+            primary_tolerant_ratio: 0.1,
         };
 
         let policy = CapacityPolicy::new();
@@ -315,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lease_quota_still_equal() {
+    fn test_primary_quota_still_equal() {
         let mut workers = HashMap::new();
         workers.insert(1, make_snapshot(1, 0, 4000));
         workers.insert(2, make_snapshot(2, 0, 1000));
@@ -325,14 +330,14 @@ mod tests {
             bucket_count: 8,
             replica_count: 2,
             tolerant_ratio: 0.1,
-            lease_tolerant_ratio: 0.1,
+            primary_tolerant_ratio: 0.1,
         };
 
         let policy = CapacityPolicy::new();
         let st = policy.prepare(&ctx).unwrap();
 
-        assert_eq!(st.worker_lease_quota[&1], 4);
-        assert_eq!(st.worker_lease_quota[&2], 4);
+        assert_eq!(st.worker_primary_quota[&1], 4);
+        assert_eq!(st.worker_primary_quota[&2], 4);
     }
 
     #[test]
@@ -346,7 +351,7 @@ mod tests {
             bucket_count: 4,
             replica_count: 2,
             tolerant_ratio: 0.1,
-            lease_tolerant_ratio: 0.1,
+            primary_tolerant_ratio: 0.1,
         };
 
         let policy = CapacityPolicy::new();

@@ -26,7 +26,7 @@ pub use context::{PlacementContext, WorkerLoadSnapshot};
 pub(crate) use planner::select_with_fallback;
 pub use planner::{build_table, rebuild_table, BuildTableResult, RebuildTableResult};
 pub use policy::{
-    is_bg_gap_sufficient, is_lease_gap_sufficient, PlacementPolicy, PolicyState, RebuildOptions,
+    is_bg_gap_sufficient, is_primary_gap_sufficient, PlacementPolicy, PolicyState, RebuildOptions,
     ReplicaDecision, ReplicaReplaceReason,
 };
 pub use quota_policy::QuotaPolicy;
@@ -38,7 +38,7 @@ pub use rule::{
 /// Create a placement policy by strategy name.
 pub fn create_policy(strategy: &str) -> Box<dyn PlacementPolicy> {
     match strategy {
-        keys::PD_BG_BALANCE_POLICY_CAPACITY => Box::new(CapacityPolicy::new()),
+        keys::PD_COORDINATOR_BALANCE_POLICY_CAPACITY => Box::new(CapacityPolicy::new()),
         _ => Box::new(QuotaPolicy::new()),
     }
 }
