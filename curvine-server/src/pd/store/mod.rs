@@ -31,14 +31,12 @@ pub const PREFIX_MOUNT_NEXT_ID: u8 = 0x42;
 pub const PREFIX_ROUTE_VERSION: u8 = 0x50;
 pub const PREFIX_ROUTE: u8 = 0x51;
 pub const PREFIX_NAMESPACE: u8 = 0x60;
-pub const PREFIX_NAMESPACE_NAME: u8 = 0x61;
 pub const PREFIX_NAMESPACE_NEXT_ID: u8 = 0x62;
 
 // ---- Key Prefixes for CF_DATA ----
 pub const PREFIX_BG_INFO: u8 = 0x01;
 pub const PREFIX_BG_NEXT_ID: u8 = 0x02;
 pub const PREFIX_BG_TABLE: u8 = 0x03;
-pub const PREFIX_BG_TABLE_NEXT_ID: u8 = 0x04;
 
 pub type KvPair = (Vec<u8>, Vec<u8>);
 

@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::table::BGTable;
 use crate::pd::store::{self, KvStore, KvWrite};
-use curvine_common::state::{BgId, BlockGroupInfo, TableId};
+use curvine_common::state::{BgId, BlockGroupInfo};
 use curvine_common::utils::SerdeUtils as Serde;
 use orpc::{error::StringError, CommonResult};
 use std::sync::Arc;
@@ -22,8 +21,6 @@ use std::sync::Arc;
 const NS: &str = store::CF_DATA;
 const BG_INFO_PREFIX: u8 = store::PREFIX_BG_INFO;
 const BG_NEXT_ID_KEY: &[u8] = &[store::PREFIX_BG_NEXT_ID];
-const BG_NEXT_TABLE_ID_KEY: &[u8] = &[store::PREFIX_BG_TABLE_NEXT_ID];
-const BG_TABLE_PREFIX: u8 = store::PREFIX_BG_TABLE;
 
 pub struct BGStore {
     store: Arc<dyn KvStore>,
@@ -67,19 +64,8 @@ impl BGStore {
         self.delete_op(self.bg_info_key(bg_id).to_vec())
     }
 
-    pub fn table_put_op(&self, table: &BGTable) -> CommonResult<KvWrite> {
-        Ok(self.put_op(
-            self.table_key(table.table_id()).to_vec(),
-            Serde::serialize(table)?,
-        ))
-    }
-
     pub fn next_bg_id_op(&self, next_id: BgId) -> CommonResult<KvWrite> {
         Ok(self.put_op(BG_NEXT_ID_KEY.to_vec(), Serde::serialize(&next_id)?))
-    }
-
-    pub fn next_table_id_op(&self, next_id: TableId) -> CommonResult<KvWrite> {
-        Ok(self.put_op(BG_NEXT_TABLE_ID_KEY.to_vec(), Serde::serialize(&next_id)?))
     }
 
     pub fn write_batch(&self, ops: Vec<KvWrite>) -> CommonResult<()> {
@@ -145,67 +131,5 @@ impl BGStore {
         let value = Serde::serialize(&next_id)?;
         self.store.put(NS, BG_NEXT_ID_KEY, &value)?;
         Ok(())
-    }
-
-    pub fn get_next_table_id(&self) -> CommonResult<TableId> {
-        match self.store.get(NS, BG_NEXT_TABLE_ID_KEY)? {
-            Some(data) => {
-                let id: TableId = Serde::deserialize(&data)?;
-                Ok(id)
-            }
-            None => Ok(1),
-        }
-    }
-
-    pub fn set_next_table_id(&self, next_id: TableId) -> CommonResult<()> {
-        let current = self.get_next_table_id()?;
-        if next_id < current {
-            return Err(StringError::from(format!(
-                "next_table_id rollback rejected: current={}, next={}",
-                current, next_id
-            ))
-            .into());
-        }
-        if next_id == current {
-            return Ok(());
-        }
-        let value = Serde::serialize(&next_id)?;
-        self.store.put(NS, BG_NEXT_TABLE_ID_KEY, &value)?;
-        Ok(())
-    }
-
-    fn table_key(&self, table_id: TableId) -> [u8; 3] {
-        let mut k = [0u8; 3];
-        k[0] = BG_TABLE_PREFIX;
-        k[1..3].copy_from_slice(&table_id.to_be_bytes());
-        k
-    }
-
-    pub fn put_table(&self, table: &BGTable) -> CommonResult<()> {
-        let key = self.table_key(table.table_id());
-        let value = Serde::serialize(table)?;
-        self.store.put(NS, &key, &value)?;
-        Ok(())
-    }
-
-    pub fn get_table(&self, table_id: TableId) -> CommonResult<Option<BGTable>> {
-        let key = self.table_key(table_id);
-        match self.store.get(NS, &key)? {
-            Some(data) => {
-                let table: BGTable = Serde::deserialize(&data)?;
-                Ok(Some(table))
-            }
-            None => Ok(None),
-        }
-    }
-
-    pub fn list_tables(&self) -> CommonResult<Vec<BGTable>> {
-        let pairs = self.store.scan_prefix(NS, &[BG_TABLE_PREFIX])?;
-        let mut out = Vec::with_capacity(pairs.len());
-        for (_key, value) in pairs {
-            let table: BGTable = Serde::deserialize(&value)?;
-            out.push(table);
-        }
-        Ok(out)
     }
 }
