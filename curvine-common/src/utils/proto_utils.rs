@@ -755,24 +755,20 @@ impl ProtoUtils {
     pub fn bg_state_to_pb(s: BGState) -> i32 {
         match s {
             BGState::Init => 0,
-            BGState::Assigned => 1,
-            BGState::Active => 2,
-            BGState::Degraded => 3,
-            BGState::Recovering => 4,
-            BGState::Sealed => 5,
-            BGState::Deleting => 6,
+            BGState::Active => 1,
+            BGState::Degraded => 2,
+            BGState::Sealed => 3,
+            BGState::Deleting => 4,
         }
     }
 
     pub fn bg_state_from_pb(v: i32) -> FsResult<BGState> {
         match v {
             0 => Ok(BGState::Init),
-            1 => Ok(BGState::Assigned),
-            2 => Ok(BGState::Active),
-            3 => Ok(BGState::Degraded),
-            4 => Ok(BGState::Recovering),
-            5 => Ok(BGState::Sealed),
-            6 => Ok(BGState::Deleting),
+            1 => Ok(BGState::Active),
+            2 => Ok(BGState::Degraded),
+            3 => Ok(BGState::Sealed),
+            4 => Ok(BGState::Deleting),
             _ => Err(Self::invalid_proto(format!("unknown bg_state={}", v))),
         }
     }
@@ -847,21 +843,19 @@ impl ProtoUtils {
         }
     }
 
-    pub fn federation_route_mode_to_pb(m: FederationRouteMode) -> i32 {
-        match m {
-            FederationRouteMode::Static => 0,
-            FederationRouteMode::Hash => 1,
+    pub fn federation_route_config_to_pb(
+        config: &FederationRouteConfig,
+    ) -> FederationRouteConfigProto {
+        FederationRouteConfigProto {
+            hash_level: config.hash_level.map(|v| v as u32),
         }
     }
 
-    pub fn federation_route_mode_from_pb(v: i32) -> FsResult<FederationRouteMode> {
-        match v {
-            0 => Ok(FederationRouteMode::Static),
-            1 => Ok(FederationRouteMode::Hash),
-            _ => Err(Self::invalid_proto(format!(
-                "unknown federation_route_mode={}",
-                v
-            ))),
+    pub fn federation_route_config_from_pb(
+        config: FederationRouteConfigProto,
+    ) -> FederationRouteConfig {
+        FederationRouteConfig {
+            hash_level: config.hash_level.map(|v| v as u8),
         }
     }
 
@@ -1341,6 +1335,12 @@ impl ProtoUtils {
         }
     }
 
+    fn required_bg_primary(primary: Option<BgPrimaryProto>) -> FsResult<BGPrimary> {
+        primary
+            .map(Self::bg_primary_from_pb)
+            .ok_or_else(|| Self::invalid_proto("missing bg primary"))
+    }
+
     pub fn replica_info_to_pb(replica: &ReplicaInfo) -> ReplicaInfoProto {
         ReplicaInfoProto {
             node_id: replica.node_id,
@@ -1367,7 +1367,7 @@ impl ProtoUtils {
             replica_set: bg.replica_set.clone(),
             state: Self::bg_state_to_pb(bg.state),
             op_state: Self::bg_op_state_to_pb(bg.op_state),
-            primary: bg.primary.as_ref().map(Self::bg_primary_to_pb),
+            primary: Some(Self::bg_primary_to_pb(&bg.primary)),
             kind: Self::bg_kind_to_pb(bg.kind),
             isr: bg.isr.clone(),
         }
@@ -1385,7 +1385,8 @@ impl ProtoUtils {
             isr: bg.isr,
             state: Self::bg_state_from_pb(bg.state)?,
             op_state: Self::bg_op_state_from_pb(bg.op_state)?,
-            primary: bg.primary.map(Self::bg_primary_from_pb),
+            primary: Self::required_bg_primary(bg.primary)?,
+            replicas: Default::default(),
             stats: Default::default(),
         })
     }
@@ -1402,7 +1403,7 @@ impl ProtoUtils {
                 .collect(),
             state: Self::bg_state_to_pb(bg.state),
             op_state: Self::bg_op_state_to_pb(bg.op_state),
-            primary: bg.primary.as_ref().map(Self::bg_primary_to_pb),
+            primary: Some(Self::bg_primary_to_pb(&bg.primary)),
             kind: Self::bg_kind_to_pb(bg.kind),
             isr: bg.isr.clone(),
         }
@@ -1426,7 +1427,7 @@ impl ProtoUtils {
             isr: bg.isr,
             state: Self::bg_state_from_pb(bg.state)?,
             op_state: Self::bg_op_state_from_pb(bg.op_state)?,
-            primary: bg.primary.map(Self::bg_primary_from_pb),
+            primary: Self::required_bg_primary(bg.primary)?,
         })
     }
 
@@ -1441,7 +1442,7 @@ impl ProtoUtils {
                 .map(Self::replica_info_to_pb)
                 .collect(),
             state: Self::bg_state_to_pb(bg.state),
-            primary: bg.primary.as_ref().map(Self::bg_primary_to_pb),
+            primary: Some(Self::bg_primary_to_pb(&bg.primary)),
             kind: Self::bg_kind_to_pb(bg.kind),
         }
     }
@@ -1462,7 +1463,7 @@ impl ProtoUtils {
             bg_epoch: bg.bg_epoch,
             serving_replicas,
             state: Self::bg_state_from_pb(bg.state)?,
-            primary: bg.primary.map(Self::bg_primary_from_pb),
+            primary: Self::required_bg_primary(bg.primary)?,
         })
     }
 
@@ -1478,7 +1479,7 @@ impl ProtoUtils {
                     .iter()
                     .map(Self::block_group_route_view_to_pb)
                     .collect(),
-                pool_type: s.pool_type.code() as u32,
+                pool_type: pool_storage_code(s.pool_type).unwrap_or_default() as u32,
                 replica_count: s.replica_count as u32,
                 kind: Self::bg_kind_to_pb(BGKind::Hash),
                 active_bgs: vec![],
@@ -1492,7 +1493,7 @@ impl ProtoUtils {
                 epoch: s.epoch,
                 last_rebuild_ms: 0,
                 buckets: vec![],
-                pool_type: s.pool_type.code() as u32,
+                pool_type: pool_storage_code(s.pool_type).unwrap_or_default() as u32,
                 replica_count: s.replica_count as u32,
                 kind: Self::bg_kind_to_pb(BGKind::Capacity),
                 active_bgs: s
@@ -1506,7 +1507,7 @@ impl ProtoUtils {
     }
 
     pub fn bg_table_summary_from_pb(summary: BgTableSummaryProto) -> FsResult<BGTableSummary> {
-        let pool_type = PoolType::from_code(summary.pool_type as u16).ok_or_else(|| {
+        let pool_type = pool_storage_from_code(summary.pool_type as u16).ok_or_else(|| {
             Self::invalid_proto(format!("unknown pool_type={}", summary.pool_type))
         })?;
         let table_id = u16::try_from(summary.table_id).map_err(|_| {
@@ -1628,51 +1629,24 @@ impl ProtoUtils {
     }
 
     pub fn path_route_update_to_pb(update: &PathRouteUpdate) -> PathRouteUpdateProto {
-        match &update.action {
-            RouteUpdateAction::FullSync { routes } => PathRouteUpdateProto {
-                version: update.version,
-                action_type: 0,
-                routes: routes.iter().map(Self::path_route_entry_to_pb).collect(),
-                added: vec![],
-                removed: vec![],
-            },
-            RouteUpdateAction::Incremental { added, removed } => PathRouteUpdateProto {
-                version: update.version,
-                action_type: 1,
-                routes: vec![],
-                added: added.iter().map(Self::path_route_entry_to_pb).collect(),
-                removed: removed.clone(),
-            },
+        PathRouteUpdateProto {
+            version: update.version,
+            routes: update
+                .routes
+                .iter()
+                .map(Self::path_route_entry_to_pb)
+                .collect(),
         }
     }
 
     pub fn path_route_update_from_pb(update: PathRouteUpdateProto) -> FsResult<PathRouteUpdate> {
-        let action = match update.action_type {
-            0 => RouteUpdateAction::FullSync {
-                routes: update
-                    .routes
-                    .into_iter()
-                    .map(Self::path_route_entry_from_pb)
-                    .collect(),
-            },
-            1 => RouteUpdateAction::Incremental {
-                added: update
-                    .added
-                    .into_iter()
-                    .map(Self::path_route_entry_from_pb)
-                    .collect(),
-                removed: update.removed,
-            },
-            v => {
-                return Err(Self::invalid_proto(format!(
-                    "unknown route_update_action={}",
-                    v
-                )))
-            }
-        };
         Ok(PathRouteUpdate {
             version: update.version,
-            action,
+            routes: update
+                .routes
+                .into_iter()
+                .map(Self::path_route_entry_from_pb)
+                .collect(),
         })
     }
 
@@ -1851,12 +1825,19 @@ impl ProtoUtils {
         }
     }
 
-    pub fn pool_type_to_pb(pool: PoolType) -> String {
-        pool.as_str().to_string()
+    pub fn pool_type_to_pb(pool: StorageType) -> String {
+        pool.as_str_name().to_string()
     }
 
-    pub fn pool_type_from_pb(pool: &str) -> FsResult<PoolType> {
-        PoolType::try_from(pool).map_err(|e| FsError::common(e.to_string()))
+    pub fn pool_type_from_pb(pool: &str) -> FsResult<StorageType> {
+        let media = StorageType::try_from(pool).map_err(|e| FsError::common(e.to_string()))?;
+        if !is_pool_storage_type(media) {
+            return Err(FsError::common(format!(
+                "invalid pool storage type: {}",
+                pool
+            )));
+        }
+        Ok(media)
     }
 
     pub fn cache_ack_policy_to_pb(policy: &CacheAckPolicy) -> (i32, Option<u32>) {
@@ -2094,9 +2075,9 @@ impl ProtoUtils {
         MetaRouteSummaryProto {
             mode: Self::meta_node_mode_to_pb(summary.mode),
             version: summary.version,
-            federation_route_mode: summary
-                .federation_route_mode
-                .map(Self::federation_route_mode_to_pb),
+            federation_route_config: Some(Self::federation_route_config_to_pb(
+                &summary.federation_route_config,
+            )),
             path_table: summary
                 .path_table
                 .as_ref()
@@ -2107,7 +2088,6 @@ impl ProtoUtils {
                 .map(|(k, v)| (*k, Self::node_group_info_to_pb(v)))
                 .collect(),
             group_id_order: summary.group_id_order.clone(),
-            federation_hash_level: summary.federation_hash_level.map(|v| v as u32),
         }
     }
 
@@ -2121,14 +2101,13 @@ impl ProtoUtils {
         Ok(MetaRouteSummary {
             mode: Self::meta_node_mode_from_pb(summary.mode)?,
             version: summary.version,
-            federation_route_mode: summary
-                .federation_route_mode
-                .map(Self::federation_route_mode_from_pb)
-                .transpose()?,
+            federation_route_config: summary
+                .federation_route_config
+                .map(Self::federation_route_config_from_pb)
+                .unwrap_or_default(),
             path_table: summary.path_table.map(Self::path_route_table_from_pb),
             meta_groups,
             group_id_order: summary.group_id_order,
-            federation_hash_level: summary.federation_hash_level.map(|v| v as u8),
         })
     }
 }
@@ -2366,6 +2345,7 @@ mod pd_proto_utils_tests {
                     op_state: BGOpState::Idle,
                     primary: None,
                     stats: Default::default(),
+                    replicas: Default::default(),
                 }],
                 remove_bgs: vec![8],
                 update_bgs: vec![],
@@ -2393,7 +2373,7 @@ mod pd_proto_utils_tests {
             name: "ns1".to_string(),
             block_size: 4 * 1024 * 1024,
             cache_tier_config: CacheTierConfig {
-                pools: vec![PoolType::Ssd, PoolType::Hdd],
+                pools: vec![StorageType::Ssd, StorageType::Hdd],
                 replica_count: 2,
                 bucket_count: 64,
                 worker_labels: vec![LabelMatch {
@@ -2441,7 +2421,7 @@ mod pd_proto_utils_tests {
         let summary = MetaRouteSummary {
             mode: MetaNodeMode::Federation,
             version: 10,
-            federation_route_mode: Some(FederationRouteMode::Hash),
+            federation_route_config: FederationRouteConfig::new(Some(2)),
             path_table: None,
             meta_groups: HashMap::from([(
                 1,
@@ -2455,14 +2435,13 @@ mod pd_proto_utils_tests {
                 },
             )]),
             group_id_order: vec![1],
-            federation_hash_level: Some(2),
         };
         let decoded =
             ProtoUtils::meta_route_summary_from_pb(ProtoUtils::meta_route_summary_to_pb(&summary))
                 .expect("round trip meta route summary");
         assert_eq!(decoded.mode, MetaNodeMode::Federation);
         assert_eq!(decoded.version, 10);
-        assert_eq!(decoded.federation_hash_level, Some(2));
+        assert_eq!(decoded.federation_route_config.hash_level, Some(2));
         assert!(decoded.meta_groups.contains_key(&1));
     }
 

@@ -96,6 +96,9 @@ pub use self::blockgroup_info::*;
 mod bg_table;
 pub use self::bg_table::*;
 
+mod namespace;
+pub use self::namespace::*;
+
 mod worker_node_info;
 pub use self::worker_node_info::*;
 
@@ -108,8 +111,8 @@ pub use self::task_node_info::*;
 mod node_rpc;
 pub use self::node_rpc::*;
 
-mod meta_node_mode;
-pub use self::meta_node_mode::*;
+mod meta_route;
+pub use self::meta_route::*;
 
 mod node_info;
 pub use self::node_info::*;

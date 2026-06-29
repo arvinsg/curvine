@@ -81,13 +81,13 @@ pub struct PdConf {
     #[serde(default)]
     pub dynamic_config: HashMap<String, String>,
 
-    /// Scheduler runtime IO threads (default 1).
+    /// Coordinator runtime IO threads (default 1).
     #[serde(default)]
-    pub scheduler_io_threads: usize,
+    pub coordinator_io_threads: usize,
 
-    /// Scheduler runtime worker threads (default 4).
+    /// Coordinator runtime worker threads (default 4).
     #[serde(default)]
-    pub scheduler_worker_threads: usize,
+    pub coordinator_worker_threads: usize,
 }
 
 impl Default for PdConf {
@@ -110,8 +110,8 @@ impl Default for PdConf {
             location_labels: Vec::new(),
             // dynamic_config is populated from pd config file (if any).
             dynamic_config: HashMap::new(),
-            scheduler_io_threads: 2,
-            scheduler_worker_threads: 8,
+            coordinator_io_threads: 2,
+            coordinator_worker_threads: 8,
         }
     }
 }

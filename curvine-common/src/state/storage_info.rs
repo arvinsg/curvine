@@ -18,6 +18,7 @@ use clap::ValueEnum;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use orpc::{err_box, CommonError};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 #[repr(i32)]
 #[derive(
@@ -28,6 +29,8 @@ use serde::{Deserialize, Serialize};
     Deserialize,
     PartialEq,
     Eq,
+    PartialOrd,
+    Ord,
     Hash,
     IntoPrimitive,
     FromPrimitive,
@@ -99,4 +102,10 @@ pub struct StorageInfo {
     pub storage_type: StorageType,
     pub block_num: i64,
     pub dir_path: String,
+}
+
+impl fmt::Display for StorageType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str_name())
+    }
 }
