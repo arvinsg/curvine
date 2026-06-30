@@ -81,6 +81,20 @@ impl BgIdAllocator {
         Ok(())
     }
 
+    pub fn ensure_next_id_at_least(&self, floor: BgId) -> FsResult<Option<(BgId, BgId)>> {
+        let current = self.store.get_next_bg_id()?;
+        if current >= floor {
+            return Ok(None);
+        }
+
+        self.store.set_next_bg_id(floor)?;
+        *self.range.lock().unwrap() = IdRange {
+            next: floor,
+            end: floor,
+        };
+        Ok(Some((current, floor)))
+    }
+
     pub fn alloc(&self, count: u64) -> FsResult<BgId> {
         if count == 0 {
             return Err(FsError::common("BG id allocation count must be positive"));

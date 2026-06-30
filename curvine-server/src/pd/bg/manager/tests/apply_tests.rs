@@ -129,7 +129,7 @@ fn apply_update_bg_cases() {
 fn delete_bg_cleans_indexes_and_penalties() {
     let mgr = test_manager();
     create_bg(&mgr, make_bg(1, 10, vec![100, 101]));
-    mgr.record_isr_penalty(BGKind::Hash, 1, 101);
+    mgr.record_isr_failure(BGKind::Hash, 1, 101);
 
     let outcome = mgr
         .apply_delete_bg(&BGDeleteEntry {
@@ -145,7 +145,7 @@ fn delete_bg_cleans_indexes_and_penalties() {
     assert!(mgr
         .bgs_on_worker(BGKind::Hash, 100, BGListScope::All)
         .is_empty());
-    assert!(!mgr.isr_penalty_active(BGKind::Hash, 1, 101));
+    assert!(!mgr.is_isr_rejoin_blocked(BGKind::Hash, 1, 101));
 }
 
 struct HashStateCase {
@@ -168,12 +168,6 @@ fn apply_hash_state_transition_cases() {
             name: "degraded to active is allowed",
             initial_state: BGState::Degraded,
             target_state: BGState::Active,
-            expect_ok: true,
-        },
-        HashStateCase {
-            name: "degraded to deleting is allowed",
-            initial_state: BGState::Degraded,
-            target_state: BGState::Deleting,
             expect_ok: true,
         },
         HashStateCase {

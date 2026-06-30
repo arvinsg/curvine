@@ -64,7 +64,7 @@ pub(super) fn update_entry(bg_id: BgId, expected: u64) -> BGUpdateEntry {
 }
 
 pub(super) fn summarize_hash_bg_state(bg: &BlockGroupInfo) -> BGState {
-    if bg.kind != BGKind::Hash || matches!(bg.state, BGState::Deleting | BGState::Sealed) {
+    if bg.kind != BGKind::Hash || bg.state == BGState::Sealed {
         return bg.state;
     }
     let all_replicas_active = !bg.replica_set.is_empty()

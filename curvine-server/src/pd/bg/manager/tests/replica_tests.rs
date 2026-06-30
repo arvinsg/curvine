@@ -158,15 +158,14 @@ fn summarize_hash_bg_state_cases() {
 }
 
 #[test]
-fn summarize_non_hash_or_deleting_state_is_preserved() {
+fn summarize_non_hash_or_sealed_state_is_preserved() {
     let mut bg = make_bg(1, 10, vec![100]);
     bg.kind = BGKind::Capacity;
     bg.state = BGState::Sealed;
     assert_eq!(summarize_hash_bg_state(&bg), BGState::Sealed);
 
     bg.kind = BGKind::Hash;
-    bg.state = BGState::Deleting;
-    assert_eq!(summarize_hash_bg_state(&bg), BGState::Deleting);
+    assert_eq!(summarize_hash_bg_state(&bg), BGState::Sealed);
 }
 
 struct PenaltyCleanupCase {
@@ -220,11 +219,11 @@ fn isr_penalty_cleanup_cases() {
         new.isr = case.new_isr;
 
         create_bg(&mgr, old.clone());
-        mgr.record_isr_penalty(BGKind::Hash, old.bg_id, case.penalized_worker);
+        mgr.record_isr_failure(BGKind::Hash, old.bg_id, case.penalized_worker);
         mgr.cleanup_isr_penalties(&old, &new);
 
         assert_eq!(
-            mgr.isr_penalty_active(BGKind::Hash, old.bg_id, case.penalized_worker),
+            mgr.is_isr_rejoin_blocked(BGKind::Hash, old.bg_id, case.penalized_worker),
             !case.expect_cleared,
             "{}",
             case.name

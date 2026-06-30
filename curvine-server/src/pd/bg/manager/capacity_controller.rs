@@ -220,20 +220,6 @@ impl BGController for CapacityBGController {
         self.active.apply_replica_reports(worker_id, reports)
     }
 
-    fn record_isr_penalty(&self, bg_id: BgId, worker_id: u32) {
-        self.active.record_isr_penalty(bg_id, worker_id);
-    }
-
-    fn isr_penalty_active(&self, bg_id: BgId, worker_id: u32) -> bool {
-        self.active.isr_penalty_active(bg_id, worker_id)
-    }
-
-    fn cleanup_isr_penalties(&self, old: &BlockGroupInfo, new: &BlockGroupInfo) {
-        if Self::is_active_state(new.state) {
-            self.active.cleanup_isr_penalties(old, new);
-        }
-    }
-
     fn serving_replicas(&self, bg_id: BgId) -> Vec<u32> {
         self.active.serving_replicas(bg_id)
     }

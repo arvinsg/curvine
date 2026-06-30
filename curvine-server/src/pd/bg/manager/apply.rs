@@ -1,17 +1,17 @@
 use super::*;
 
-pub(crate) struct BGCreatePlan {
+pub(crate) struct PreparedBGCreate {
     pub info: BlockGroupInfo,
     pub op: KvWrite,
 }
 
-pub(crate) struct BGUpdatePlan {
+pub(crate) struct PreparedBGUpdate {
     pub old_info: BlockGroupInfo,
     pub new_info: BlockGroupInfo,
     pub op: KvWrite,
 }
 
-pub(crate) struct BGDeletePlan {
+pub(crate) struct PreparedBGDelete {
     pub old_info: BlockGroupInfo,
     pub op: KvWrite,
 }
@@ -22,17 +22,17 @@ pub(crate) enum UpdateBuildResult {
 }
 
 pub(crate) enum PrepareCreateResult {
-    Applied(BGCreatePlan),
+    Applied(PreparedBGCreate),
     Outcome(ApplyOutcome),
 }
 
 pub(crate) enum PrepareUpdateResult {
-    Applied(BGUpdatePlan),
+    Applied(PreparedBGUpdate),
     Outcome(ApplyOutcome),
 }
 
 pub(crate) enum PrepareDeleteResult {
-    Applied(BGDeletePlan),
+    Applied(PreparedBGDelete),
     Outcome(ApplyOutcome),
 }
 
@@ -122,10 +122,6 @@ impl BGManager {
 
     pub fn propose_seal_bg(&self, kind: BGKind, bg_id: BgId) -> FsResult<()> {
         self.propose_bg_state_transition(kind, bg_id, BGState::Sealed, "propose_seal_bg")
-    }
-
-    pub fn propose_mark_deleting_bg(&self, kind: BGKind, bg_id: BgId) -> FsResult<()> {
-        self.propose_bg_state_transition(kind, bg_id, BGState::Deleting, "propose_mark_deleting_bg")
     }
 
     fn propose_bg_state_transition(
@@ -290,7 +286,7 @@ impl BGManager {
             runtime_info.op_state = BGOpState::Idle;
         }
         let op = self.bg_put_op(&runtime_info)?;
-        Ok(PrepareCreateResult::Applied(BGCreatePlan {
+        Ok(PrepareCreateResult::Applied(PreparedBGCreate {
             info: runtime_info,
             op,
         }))
@@ -317,7 +313,7 @@ impl BGManager {
         };
         Self::validate_bg_info(&new_info)?;
         let op = self.bg_put_op(&new_info)?;
-        Ok(PrepareUpdateResult::Applied(BGUpdatePlan {
+        Ok(PrepareUpdateResult::Applied(PreparedBGUpdate {
             old_info,
             new_info,
             op,
@@ -336,7 +332,7 @@ impl BGManager {
                 existing.bg_epoch, entry.expected_bg_epoch
             ))));
         }
-        Ok(PrepareDeleteResult::Applied(BGDeletePlan {
+        Ok(PrepareDeleteResult::Applied(PreparedBGDelete {
             old_info: (*existing).clone(),
             op: self.bg_delete_op(entry.bg_id),
         }))

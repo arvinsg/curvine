@@ -132,14 +132,8 @@ impl BGManager {
         self.capacity.restore_bgs(capacity_bgs);
     }
 
-    pub(crate) fn repair_next_bg_id_floor(&self, floor: BgId) -> FsResult<Option<(BgId, BgId)>> {
-        let current = self.store.get_next_bg_id()?;
-        if current < floor {
-            self.store.set_next_bg_id(floor)?;
-            Ok(Some((current, floor)))
-        } else {
-            Ok(None)
-        }
+    pub(crate) fn ensure_next_id_at_least(&self, floor: BgId) -> FsResult<Option<(BgId, BgId)>> {
+        self.id_allocator.ensure_next_id_at_least(floor)
     }
 
     fn controller(&self, kind: BGKind) -> &dyn BGController {
@@ -214,6 +208,11 @@ impl BGManager {
         self.controller(kind).get_replica_state(bg_id, worker_id)
     }
 
+    /// Update the PD-observed replica state.
+    ///
+    /// Normal production flow should prefer `apply_replica_reports`, because
+    /// replica state is owned by worker reports. Keep this API for tests and
+    /// exceptional control-plane fencing paths.
     pub fn set_replica_state(
         &self,
         kind: BGKind,
@@ -255,16 +254,20 @@ impl BGManager {
         Ok(changed)
     }
 
-    pub(crate) fn record_isr_penalty(&self, kind: BGKind, bg_id: BgId, worker_id: u32) {
-        self.controller(kind).record_isr_penalty(bg_id, worker_id);
+    pub(crate) fn record_isr_failure(&self, kind: BGKind, bg_id: BgId, worker_id: u32) {
+        if kind == BGKind::Hash {
+            self.hash.record_isr_failure(bg_id, worker_id);
+        }
     }
 
-    pub(crate) fn isr_penalty_active(&self, kind: BGKind, bg_id: BgId, worker_id: u32) -> bool {
-        self.controller(kind).isr_penalty_active(bg_id, worker_id)
+    pub(crate) fn is_isr_rejoin_blocked(&self, kind: BGKind, bg_id: BgId, worker_id: u32) -> bool {
+        kind == BGKind::Hash && self.hash.is_isr_rejoin_blocked(bg_id, worker_id)
     }
 
     pub(crate) fn cleanup_isr_penalties(&self, old: &BlockGroupInfo, new: &BlockGroupInfo) {
-        self.controller(new.kind).cleanup_isr_penalties(old, new);
+        if new.kind == BGKind::Hash {
+            self.hash.cleanup_isr_penalties(old, new);
+        }
     }
 
     pub fn serving_replicas(&self, kind: BGKind, bg_id: BgId) -> Vec<u32> {

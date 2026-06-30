@@ -156,7 +156,7 @@ impl BGIndex {
         changed
     }
 
-    pub(crate) fn record_isr_penalty(&self, bg_id: BgId, worker_id: u32) {
+    pub(crate) fn record_isr_failure(&self, bg_id: BgId, worker_id: u32) {
         let now = orpc::common::LocalTime::mills();
         let mut bgs = self.bgs.write().unwrap();
         let Some(bg) = bgs.get_mut(&bg_id) else {
@@ -168,16 +168,16 @@ impl BGIndex {
         let delay = ISR_PENALTY_BASE_MS
             .saturating_mul(1u64 << shift)
             .min(ISR_PENALTY_MAX_MS);
-        bg.record_isr_penalty(worker_id, now, delay);
+        bg.record_isr_failure(worker_id, now, delay);
     }
 
-    pub(crate) fn isr_penalty_active(&self, bg_id: BgId, worker_id: u32) -> bool {
+    pub(crate) fn is_isr_rejoin_blocked(&self, bg_id: BgId, worker_id: u32) -> bool {
         let now = orpc::common::LocalTime::mills();
         self.bgs
             .read()
             .unwrap()
             .get(&bg_id)
-            .map(|bg| bg.is_isr_penalty_active(worker_id, now))
+            .map(|bg| bg.is_isr_rejoin_blocked(worker_id, now))
             .unwrap_or(false)
     }
 

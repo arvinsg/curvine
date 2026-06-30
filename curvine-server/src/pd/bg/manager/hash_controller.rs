@@ -9,6 +9,18 @@ impl HashBGController {
     fn active(&self, scope: BGListScope) -> bool {
         matches!(scope, BGListScope::Active | BGListScope::All)
     }
+
+    pub(crate) fn record_isr_failure(&self, bg_id: BgId, worker_id: u32) {
+        self.index.record_isr_failure(bg_id, worker_id);
+    }
+
+    pub(crate) fn is_isr_rejoin_blocked(&self, bg_id: BgId, worker_id: u32) -> bool {
+        self.index.is_isr_rejoin_blocked(bg_id, worker_id)
+    }
+
+    pub(crate) fn cleanup_isr_penalties(&self, old: &BlockGroupInfo, new: &BlockGroupInfo) {
+        self.index.cleanup_isr_penalties(old, new);
+    }
 }
 
 impl BGController for HashBGController {
@@ -92,18 +104,6 @@ impl BGController for HashBGController {
 
     fn apply_replica_reports(&self, worker_id: u32, reports: &[WorkerBGReport]) -> usize {
         self.index.apply_replica_reports(worker_id, reports)
-    }
-
-    fn record_isr_penalty(&self, bg_id: BgId, worker_id: u32) {
-        self.index.record_isr_penalty(bg_id, worker_id);
-    }
-
-    fn isr_penalty_active(&self, bg_id: BgId, worker_id: u32) -> bool {
-        self.index.isr_penalty_active(bg_id, worker_id)
-    }
-
-    fn cleanup_isr_penalties(&self, old: &BlockGroupInfo, new: &BlockGroupInfo) {
-        self.index.cleanup_isr_penalties(old, new);
     }
 
     fn serving_replicas(&self, bg_id: BgId) -> Vec<u32> {

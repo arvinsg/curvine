@@ -30,10 +30,7 @@ pub(crate) trait BGController: Send + Sync {
     fn set_replica_state(&self, bg_id: BgId, worker_id: u32, state: ReplicaState);
     fn apply_replica_reports(&self, worker_id: u32, reports: &[WorkerBGReport]) -> usize;
 
-    // ISR helpers.
-    fn record_isr_penalty(&self, bg_id: BgId, worker_id: u32);
-    fn isr_penalty_active(&self, bg_id: BgId, worker_id: u32) -> bool;
-    fn cleanup_isr_penalties(&self, old: &BlockGroupInfo, new: &BlockGroupInfo);
+    // Replica visibility helpers.
     fn serving_replicas(&self, bg_id: BgId) -> Vec<u32>;
     fn resident_replicas(&self, bg_id: BgId) -> Vec<u32>;
 }
