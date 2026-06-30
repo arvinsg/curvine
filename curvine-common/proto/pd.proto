@@ -163,15 +163,11 @@ message BlockGroupRouteViewProto {
 
 message BGTableSummaryProto {
     required uint32 table_id = 1;
-    required uint32 bucket_count = 2;
-    required uint64 epoch = 3;
-    required uint64 last_rebuild_ms = 4;
-    repeated BlockGroupRouteViewProto buckets = 5;
-    required uint32 pool_type = 6;
-    required uint32 replica_count = 7;
-    required uint32 kind = 8;
-    repeated BlockGroupRouteViewProto active_bgs = 9;
-    optional CacheReplicaPolicyProto cache_replica_policy = 10;
+    required uint64 epoch = 2;
+    required uint32 kind = 3;
+    repeated BlockGroupRouteViewProto buckets = 4;
+    repeated BlockGroupRouteViewProto active_bgs = 5;
+    optional CacheReplicaPolicyProto cache_replica_policy = 6;
 }
 
 message WorkerHeartbeatResponseProto {

@@ -1428,17 +1428,13 @@ impl ProtoUtils {
         match summary {
             BGTableSummary::Hash(s) => BgTableSummaryProto {
                 table_id: s.table_id as u32,
-                bucket_count: s.bucket_count,
                 epoch: s.epoch,
-                last_rebuild_ms: s.last_rebuild_ms,
+                kind: Self::bg_kind_to_pb(BGKind::Hash),
                 buckets: s
                     .buckets
                     .iter()
                     .map(Self::block_group_route_view_to_pb)
                     .collect(),
-                pool_type: pool_storage_code(s.pool_type).unwrap_or_default() as u32,
-                replica_count: s.replica_count as u32,
-                kind: Self::bg_kind_to_pb(BGKind::Hash),
                 active_bgs: vec![],
                 cache_replica_policy: Some(Self::cache_replica_policy_to_pb(
                     &s.cache_replica_policy,
@@ -1446,13 +1442,9 @@ impl ProtoUtils {
             },
             BGTableSummary::Capacity(s) => BgTableSummaryProto {
                 table_id: s.table_id as u32,
-                bucket_count: 0,
                 epoch: s.epoch,
-                last_rebuild_ms: 0,
-                buckets: vec![],
-                pool_type: pool_storage_code(s.pool_type).unwrap_or_default() as u32,
-                replica_count: s.replica_count as u32,
                 kind: Self::bg_kind_to_pb(BGKind::Capacity),
+                buckets: vec![],
                 active_bgs: s
                     .active_bgs
                     .iter()
@@ -1464,9 +1456,6 @@ impl ProtoUtils {
     }
 
     pub fn bg_table_summary_from_pb(summary: BgTableSummaryProto) -> FsResult<BGTableSummary> {
-        let pool_type = pool_storage_from_code(summary.pool_type as u16).ok_or_else(|| {
-            Self::invalid_proto(format!("unknown pool_type={}", summary.pool_type))
-        })?;
         let table_id = u16::try_from(summary.table_id).map_err(|_| {
             Self::invalid_proto(format!("table_id out of range: {}", summary.table_id))
         })?;
@@ -1478,11 +1467,7 @@ impl ProtoUtils {
                 }
                 Ok(BGTableSummary::Hash(HashBGTableSummary {
                     table_id,
-                    pool_type,
-                    replica_count: summary.replica_count as u16,
-                    bucket_count: summary.bucket_count,
                     epoch: summary.epoch,
-                    last_rebuild_ms: summary.last_rebuild_ms,
                     cache_replica_policy: summary
                         .cache_replica_policy
                         .map(Self::cache_replica_policy_from_pb)
@@ -1498,8 +1483,6 @@ impl ProtoUtils {
                 }
                 Ok(BGTableSummary::Capacity(CapacityBGTableSummary {
                     table_id,
-                    pool_type,
-                    replica_count: summary.replica_count as u16,
                     epoch: summary.epoch,
                     active_bgs,
                 }))

@@ -12,123 +12,116 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::PoolType;
+use super::{BGKind, BlockGroupRouteView, CacheReplicaPolicy, TableId};
 use orpc::common::Utils;
 use serde::{Deserialize, Serialize};
 
-/// Temporary deterministic table id encoding before namespace-scoped table id
-/// allocation lands: (pool_type_code << 16) | replicas.
-#[inline]
-pub fn table_id_replica_count(table_id: u32) -> u16 {
-    (table_id & 0xFFFF) as u16
-}
-
-#[inline]
-pub fn table_id_pool_type(table_id: u32) -> Option<PoolType> {
-    PoolType::from_code((table_id >> 16) as u16)
-}
-
-#[inline]
-pub fn gen_table_id(pool_type: PoolType, replica_count: u16) -> u32 {
-    ((pool_type.code() as u32) << 16) | (replica_count as u32)
-}
-
-/// Built by PD from BGTable.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BGTableSummary {
-    pub table_id: u32,
-    pub pool_type: PoolType,
-    pub replica_count: u16,
-    pub bucket_count: u32,
-    pub epoch: u64,
-    pub last_rebuild_ms: u64,
-    pub buckets: Vec<super::BlockGroupInfoView>,
+/// Client-facing BGTable route summary built by PD.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BGTableSummary {
+    Hash(HashBGTableSummary),
+    Capacity(CapacityBGTableSummary),
 }
 
 impl BGTableSummary {
-    pub fn replica_count(&self) -> u16 {
-        self.replica_count
+    pub fn table_id(&self) -> TableId {
+        match self {
+            BGTableSummary::Hash(s) => s.table_id,
+            BGTableSummary::Capacity(s) => s.table_id,
+        }
     }
 
-    pub fn pool_type(&self) -> PoolType {
-        self.pool_type
+    pub fn kind(&self) -> BGKind {
+        match self {
+            BGTableSummary::Hash(_) => BGKind::Hash,
+            BGTableSummary::Capacity(_) => BGKind::Capacity,
+        }
     }
 
+    pub fn epoch(&self) -> u64 {
+        match self {
+            BGTableSummary::Hash(s) => s.epoch,
+            BGTableSummary::Capacity(s) => s.epoch,
+        }
+    }
+
+    pub fn lookup(&self, key: &[u8]) -> Option<&BlockGroupRouteView> {
+        match self {
+            BGTableSummary::Hash(s) => s.lookup(key),
+            BGTableSummary::Capacity(_) => None,
+        }
+    }
+}
+
+impl Default for BGTableSummary {
+    fn default() -> Self {
+        BGTableSummary::Hash(HashBGTableSummary::default())
+    }
+}
+
+/// Hash BGTable route summary built by PD.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HashBGTableSummary {
+    pub table_id: TableId,
+    pub epoch: u64,
+    pub cache_replica_policy: CacheReplicaPolicy,
+    pub buckets: Vec<BlockGroupRouteView>,
+}
+
+impl HashBGTableSummary {
     /// Lookup which BlockGroup (with replicas) to use for the given key.
-    pub fn lookup(&self, key: &[u8]) -> Option<&super::BlockGroupInfoView> {
+    pub fn lookup(&self, key: &[u8]) -> Option<&BlockGroupRouteView> {
         if self.buckets.is_empty() {
             return None;
         }
         let hash = Utils::murmur3(key);
-        let idx = (hash % self.bucket_count) as usize;
+        let idx = hash as usize % self.buckets.len();
         self.buckets.get(idx)
     }
+}
+
+/// Capacity BGTable active-set summary. Data-plane write is reserved for later phases.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CapacityBGTableSummary {
+    pub table_id: TableId,
+    pub epoch: u64,
+    pub active_bgs: Vec<BlockGroupRouteView>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{BGLease, BGState, BlockGroupInfoView};
+    use crate::state::{BGPrimary, BGState, BgId};
 
-    fn sample_view(bg_id: u32, table_id: u32) -> BlockGroupInfoView {
-        BlockGroupInfoView {
+    fn sample_view(bg_id: BgId, table_id: TableId) -> BlockGroupRouteView {
+        BlockGroupRouteView {
             bg_id,
             table_id,
+            kind: BGKind::Hash,
             bg_epoch: 1,
-            replica_set: vec![],
-            state: BGState::Assigned,
-            op_state: Default::default(),
-            lease_owner: Some(BGLease {
+            serving_replicas: vec![],
+            state: BGState::Active,
+            primary: BGPrimary {
                 node_id: 0,
                 epoch: 1,
                 grant_time_ms: 0,
-            }),
+            },
         }
     }
 
     #[test]
-    fn table_id_helpers() {
-        let table_id = gen_table_id(PoolType::Ssd, 3);
-        assert_eq!(table_id_replica_count(table_id), 3);
-        assert_eq!(table_id_pool_type(table_id), Some(PoolType::Ssd));
-    }
-
-    #[test]
-    fn summary_replica_count_and_pool_type() {
-        let s = BGTableSummary {
-            table_id: gen_table_id(PoolType::Ssd, 3),
-            pool_type: PoolType::Ssd,
-            replica_count: 3,
-            bucket_count: 4,
-            epoch: 1,
-            last_rebuild_ms: 0,
-            buckets: vec![
-                sample_view(1, 0),
-                sample_view(2, 0),
-                sample_view(3, 0),
-                sample_view(4, 0),
-            ],
-        };
-        assert_eq!(s.replica_count(), 3);
-        assert_eq!(s.pool_type(), PoolType::Ssd);
-    }
-
-    #[test]
-    fn summary_lookup() {
-        let s = BGTableSummary {
+    fn hash_summary_lookup() {
+        let s = BGTableSummary::Hash(HashBGTableSummary {
             table_id: 1,
-            pool_type: PoolType::Ssd,
-            replica_count: 1,
-            bucket_count: 4,
             epoch: 0,
-            last_rebuild_ms: 0,
+            cache_replica_policy: CacheReplicaPolicy::default(),
             buckets: vec![
                 sample_view(10, 1),
                 sample_view(20, 1),
                 sample_view(30, 1),
                 sample_view(40, 1),
             ],
-        };
+        });
         let bg = s.lookup(b"key");
         assert!(bg.is_some());
         let id = bg.unwrap().bg_id;
@@ -136,16 +129,13 @@ mod tests {
     }
 
     #[test]
-    fn summary_lookup_empty_none() {
-        let s = BGTableSummary {
-            table_id: 1,
-            pool_type: PoolType::Ssd,
-            replica_count: 1,
-            bucket_count: 0,
-            epoch: 0,
-            last_rebuild_ms: 0,
-            buckets: vec![],
-        };
+    fn capacity_summary_has_no_hash_lookup() {
+        let s = BGTableSummary::Capacity(CapacityBGTableSummary {
+            table_id: 2,
+            epoch: 1,
+            active_bgs: vec![],
+        });
         assert!(s.lookup(b"x").is_none());
+        assert_eq!(s.kind(), BGKind::Capacity);
     }
 }
