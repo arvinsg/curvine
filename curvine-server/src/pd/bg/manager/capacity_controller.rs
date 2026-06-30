@@ -60,7 +60,7 @@ impl CapacityBGController {
     fn reset_sealed_replica_states(&self) {
         let mut sealed = self.sealed.write().unwrap();
         for bg in sealed.values_mut() {
-            Arc::make_mut(bg).reset_runtime_replicas();
+            Arc::make_mut(bg).reset_replicas();
         }
     }
 
@@ -140,7 +140,7 @@ impl BGController for CapacityBGController {
                 continue;
             }
             let mut sealed_bg = (*bg).clone();
-            sealed_bg.sync_runtime_replicas_with_set();
+            sealed_bg.sync_replicas_with_replica_set();
             for &worker_id in &sealed_bg.replica_set {
                 by_worker.entry(worker_id).or_default().insert(bg_id);
             }
@@ -153,7 +153,7 @@ impl BGController for CapacityBGController {
 
     fn insert_bg(&self, mut info: BlockGroupInfo) {
         if Self::is_active_state(info.state) {
-            info.reset_runtime_replicas();
+            info.reset_replicas();
             self.active.insert_bg(info);
         } else {
             self.insert_sealed(info);
@@ -165,7 +165,7 @@ impl BGController for CapacityBGController {
         let new_active = Self::is_active_state(new.state);
         match (old_active, new_active) {
             (true, true) => {
-                new.sync_runtime_replicas_with_set();
+                new.sync_replicas_with_replica_set();
                 self.active.update_bg(old, new);
             }
             (true, false) => {
@@ -174,7 +174,7 @@ impl BGController for CapacityBGController {
             }
             (false, true) => {
                 self.remove_sealed(old);
-                new.sync_runtime_replicas_with_set();
+                new.sync_replicas_with_replica_set();
                 self.active.insert_bg(new);
             }
             (false, false) => self.update_sealed(old, new),

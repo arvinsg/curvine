@@ -71,7 +71,7 @@ impl BGIndex {
     pub(crate) fn reset_replica_states(&self) {
         let mut bgs = self.bgs.write().unwrap();
         for bg in bgs.values_mut() {
-            Arc::make_mut(bg).reset_runtime_replicas();
+            Arc::make_mut(bg).reset_replicas();
         }
     }
 

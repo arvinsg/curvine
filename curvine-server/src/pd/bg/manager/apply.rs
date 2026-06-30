@@ -284,7 +284,7 @@ impl BGManager {
             return Ok(PrepareCreateResult::Outcome(ApplyOutcome::SkippedNoop));
         }
         let mut runtime_info = info.clone();
-        runtime_info.reset_runtime_replicas();
+        runtime_info.reset_replicas();
         let op = self.store.bg_put_op(&runtime_info).map_err(FsError::from)?;
         Ok(PrepareCreateResult::Applied(PreparedBGCreate {
             info: runtime_info,
@@ -304,7 +304,7 @@ impl BGManager {
         let old_info = (*existing).clone();
         let new_info = match Self::build_updated_bg(&old_info, entry)? {
             UpdateBuildResult::Applied(mut info) => {
-                info.sync_runtime_replicas_with_set();
+                info.sync_replicas_with_replica_set();
                 info
             }
             UpdateBuildResult::Outcome(outcome) => {

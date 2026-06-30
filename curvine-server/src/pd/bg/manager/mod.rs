@@ -86,11 +86,11 @@ impl BGManager {
         for mut bg in bgs {
             match bg.kind {
                 BGKind::Hash => {
-                    bg.reset_runtime_replicas();
+                    bg.reset_replicas();
                     hash_bgs.insert(bg.bg_id, Arc::new(bg));
                 }
                 BGKind::Capacity => {
-                    bg.reset_runtime_replicas();
+                    bg.reset_replicas();
                     capacity_bgs.insert(bg.bg_id, Arc::new(bg));
                 }
             }

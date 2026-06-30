@@ -71,16 +71,20 @@ message BGStatsProto {
 
 enum ReplicaStateProto {
     REPLICA_STATE_PROTO_PENDING = 0;
-    REPLICA_STATE_PROTO_SYNCING = 1;
-    REPLICA_STATE_PROTO_ACTIVE = 2;
-    REPLICA_STATE_PROTO_LOST = 3;
-    REPLICA_STATE_PROTO_OFFLINE = 4;
+    REPLICA_STATE_PROTO_RECOVERING = 1;
+    REPLICA_STATE_PROTO_SYNCING = 2;
+    REPLICA_STATE_PROTO_ACTIVE = 3;
+    REPLICA_STATE_PROTO_SEALED = 4;
+    REPLICA_STATE_PROTO_DRAINING = 5;
 }
 
 message WorkerBGReportProto {
-    required uint32 bg_id = 1;
-    required ReplicaStateProto state = 2;
-    optional BGStatsProto stats = 3;
+    required uint32 kind = 1;
+    required uint64 bg_id = 2;
+    required uint64 bg_epoch = 3;
+    required ReplicaStateProto state = 4;
+    optional BGStatsProto stats = 5;
+    repeated uint32 isr_remove_candidates = 6;
 }
 
 message WorkerRegisterPayloadProto {
@@ -90,8 +94,7 @@ message WorkerRegisterPayloadProto {
 message WorkerHeartbeatPayloadProto {
     map<string, StorageStatsProto> storage_stats = 1;
     required SystemStatsProto sys_stats = 2;
-    map<uint32, uint64> bg_epochs = 3;
-    repeated WorkerBGReportProto bg_reports = 4;
+    repeated WorkerBGReportProto bg_reports = 3;
 }
 
 message TaskNodeStatsProto {
@@ -109,23 +112,21 @@ message TaskHeartbeatPayloadProto {
 
 enum BGStateProto {
     BG_STATE_PROTO_INIT = 0;
-    BG_STATE_PROTO_ASSIGNED = 1;
-    BG_STATE_PROTO_ACTIVE = 2;
-    BG_STATE_PROTO_DEGRADED = 3;
-    BG_STATE_PROTO_RECOVERING = 4;
-    BG_STATE_PROTO_REBALANCING = 5;
-    BG_STATE_PROTO_DELETING = 6;
+    BG_STATE_PROTO_ACTIVE = 1;
+    BG_STATE_PROTO_DEGRADED = 2;
+    BG_STATE_PROTO_SEALED = 3;
 }
 
 enum BGOpStateProto {
     BG_OP_STATE_PROTO_IDLE = 0;
-    BG_OP_STATE_PROTO_RECOVERING = 1;
+    BG_OP_STATE_PROTO_REPAIRING = 1;
     BG_OP_STATE_PROTO_REBALANCING = 2;
-    BG_OP_STATE_PROTO_LEASE_BALANCING = 3;
-    BG_OP_STATE_PROTO_DELETING = 4;
+    BG_OP_STATE_PROTO_PRIMARY_TRANSFER = 3;
+    BG_OP_STATE_PROTO_SEALING = 4;
+    BG_OP_STATE_PROTO_DELETING = 5;
 }
 
-message BGLeaseProto {
+message BGPrimaryProto {
     required uint32 node_id = 1;
     required uint64 epoch = 2;
     required uint64 grant_time_ms = 3;
@@ -139,23 +140,25 @@ message ReplicaInfoProto {
 }
 
 message BlockGroupInfoProto {
-    required uint32 bg_id = 1;
+    required uint64 bg_id = 1;
     required uint32 table_id = 2;
     required uint64 bg_epoch = 3;
     repeated uint32 replica_set = 4;
     required BGStateProto state = 5;
     required BGOpStateProto op_state = 6;
-    optional BGLeaseProto lease_owner = 7;
+    optional BGPrimaryProto primary = 7;
+    required uint32 kind = 8;
+    repeated uint32 isr = 9;
 }
 
-message BlockGroupInfoViewProto {
-    required uint32 bg_id = 1;
+message BlockGroupRouteViewProto {
+    required uint64 bg_id = 1;
     required uint32 table_id = 2;
     required uint64 bg_epoch = 3;
-    repeated ReplicaInfoProto replica_set = 4;
+    repeated ReplicaInfoProto serving_replicas = 4;
     required BGStateProto state = 5;
-    required BGOpStateProto op_state = 6;
-    optional BGLeaseProto lease_owner = 7;
+    optional BGPrimaryProto primary = 6;
+    required uint32 kind = 7;
 }
 
 message BGTableSummaryProto {
@@ -163,14 +166,17 @@ message BGTableSummaryProto {
     required uint32 bucket_count = 2;
     required uint64 epoch = 3;
     required uint64 last_rebuild_ms = 4;
-    repeated BlockGroupInfoViewProto buckets = 5;
+    repeated BlockGroupRouteViewProto buckets = 5;
     required uint32 pool_type = 6;
     required uint32 replica_count = 7;
+    required uint32 kind = 8;
+    repeated BlockGroupRouteViewProto active_bgs = 9;
+    optional CacheReplicaPolicyProto cache_replica_policy = 10;
 }
 
 message WorkerHeartbeatResponseProto {
     repeated BlockGroupInfoProto add_bgs = 1;
-    repeated uint32 remove_bgs = 2;
+    repeated uint64 remove_bgs = 2;
     repeated BlockGroupInfoProto update_bgs = 3;
 }
 
@@ -216,17 +222,9 @@ message PathRouteEntryProto {
     required uint64 update_time_ms = 4;
 }
 
-enum RouteUpdateActionTypeProto {
-    ROUTE_UPDATE_ACTION_TYPE_PROTO_FULL_SYNC = 0;
-    ROUTE_UPDATE_ACTION_TYPE_PROTO_INCREMENTAL = 1;
-}
-
 message PathRouteUpdateProto {
     required uint64 version = 1;
-    required RouteUpdateActionTypeProto action_type = 2;
-    repeated PathRouteEntryProto routes = 3;
-    repeated PathRouteEntryProto added = 4;
-    repeated string removed = 5;
+    repeated PathRouteEntryProto routes = 2;
 }
 
 message NodeGroupInfoProto {
@@ -294,9 +292,8 @@ enum MetaNodeModeProto {
     META_NODE_MODE_PROTO_FEDERATION = 2;
 }
 
-enum FederationRouteModeProto {
-    FEDERATION_ROUTE_MODE_PROTO_STATIC = 0;
-    FEDERATION_ROUTE_MODE_PROTO_HASH = 1;
+message FederationRouteConfigProto {
+    optional uint32 hash_level = 1;
 }
 
 message PathRouteTableProto {
@@ -308,11 +305,99 @@ message PathRouteTableProto {
 message MetaRouteSummaryProto {
     required MetaNodeModeProto mode = 1;
     required uint64 version = 2;
-    optional FederationRouteModeProto federation_route_mode = 3;
+    optional FederationRouteConfigProto federation_route_config = 3;
     optional PathRouteTableProto path_table = 4;
     map<uint64, NodeGroupInfoProto> meta_groups = 5;
     repeated uint64 group_id_order = 6;
-    optional uint32 federation_hash_level = 7;
+}
+
+
+// Namespace / BGTable creation API. Phase 1 supports Hash cache-tier tables only.
+message LabelMatchProto {
+    required string key = 1;
+    required string value = 2;
+}
+
+message CacheTierConfigProto {
+    repeated string pools = 1;
+    required uint32 replica_count = 2;
+    required uint32 bucket_count = 3;
+    repeated LabelMatchProto worker_labels = 4;
+}
+
+message WriteBufferConfigProto {
+    required string pool = 1;
+    required uint32 replica_count = 2;
+    required uint64 capacity_bg_size = 3;
+    required uint32 min_active_bgs = 4;
+    repeated LabelMatchProto worker_labels = 5;
+}
+
+enum CacheAckPolicyProto {
+    CACHE_ACK_POLICY_PROTO_ONE = 0;
+    CACHE_ACK_POLICY_PROTO_MAJORITY = 1;
+    CACHE_ACK_POLICY_PROTO_AT_LEAST = 2;
+}
+
+enum CacheReadPolicyProto {
+    CACHE_READ_POLICY_PROTO_LOCAL_FIRST = 0;
+    CACHE_READ_POLICY_PROTO_PRIMARY_FIRST = 1;
+    CACHE_READ_POLICY_PROTO_RANDOM = 2;
+}
+
+message CacheReplicaPolicyProto {
+    required CacheAckPolicyProto ack_policy = 1;
+    required CacheReadPolicyProto read_policy = 2;
+    required uint32 min_isr = 3;
+    optional uint32 at_least = 4;
+}
+
+message NamespaceInfoProto {
+    required uint32 id = 1;
+    required string name = 2;
+    required uint32 block_size = 3;
+    repeated uint32 cache_tier_tables = 4;
+    optional uint32 write_buffer_table = 5;
+    required CacheTierConfigProto cache_tier_config = 6;
+    optional WriteBufferConfigProto write_buffer_config = 7;
+    required CacheReplicaPolicyProto cache_replica_policy = 8;
+    optional uint64 default_ttl_ms = 9;
+    required TtlActionProto ttl_action = 10;
+    required uint64 version = 11;
+    required uint64 create_time_ms = 12;
+    required uint64 update_time_ms = 13;
+    map<string, string> properties = 14;
+}
+
+message CreateNamespaceRequestProto {
+    required string name = 1;
+    required uint32 block_size = 2;
+    required CacheTierConfigProto cache_tier_config = 3;
+    optional WriteBufferConfigProto write_buffer_config = 4;
+    required CacheReplicaPolicyProto cache_replica_policy = 5;
+    optional uint64 default_ttl_ms = 6;
+    required TtlActionProto ttl_action = 7;
+    map<string, string> properties = 8;
+}
+
+message CreateNamespaceResponseProto {
+    required NamespaceInfoProto namespace = 1;
+}
+
+message GetNamespaceRequestProto {
+    optional uint32 id = 1;
+    optional string name = 2;
+}
+
+message GetNamespaceResponseProto {
+    optional NamespaceInfoProto namespace = 1;
+}
+
+message ListNamespacesRequestProto {
+}
+
+message ListNamespacesResponseProto {
+    repeated NamespaceInfoProto namespaces = 1;
 }
 
 // Get meta route summary (mode, version, path table, meta groups).

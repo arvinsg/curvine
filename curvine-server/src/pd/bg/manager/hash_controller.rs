@@ -53,12 +53,12 @@ impl BGController for HashBGController {
     }
 
     fn insert_bg(&self, mut info: BlockGroupInfo) {
-        info.reset_runtime_replicas();
+        info.reset_replicas();
         self.index.insert_bg(info);
     }
 
     fn update_bg(&self, old: &BlockGroupInfo, mut new: BlockGroupInfo) {
-        new.sync_runtime_replicas_with_set();
+        new.sync_replicas_with_replica_set();
         self.index.update_bg(old, new);
     }
 

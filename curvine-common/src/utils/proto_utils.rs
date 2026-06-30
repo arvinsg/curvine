@@ -758,7 +758,6 @@ impl ProtoUtils {
             BGState::Active => 1,
             BGState::Degraded => 2,
             BGState::Sealed => 3,
-            BGState::Deleting => 4,
         }
     }
 
@@ -768,7 +767,6 @@ impl ProtoUtils {
             1 => Ok(BGState::Active),
             2 => Ok(BGState::Degraded),
             3 => Ok(BGState::Sealed),
-            4 => Ok(BGState::Deleting),
             _ => Err(Self::invalid_proto(format!("unknown bg_state={}", v))),
         }
     }
@@ -986,21 +984,23 @@ impl ProtoUtils {
 
     pub fn worker_bg_report_to_pb(report: &WorkerBGReport) -> WorkerBgReportProto {
         WorkerBgReportProto {
+            kind: Self::bg_kind_to_pb(report.kind),
             bg_id: report.bg_id,
+            bg_epoch: report.bg_epoch,
             state: Self::replica_state_to_pb(report.state),
             stats: Some(Self::bg_stats_to_pb(&report.stats)),
             isr_remove_candidates: report.isr_remove_candidates.clone(),
-            primary_unhealthy: Some(report.primary_unhealthy),
         }
     }
 
     pub fn worker_bg_report_from_pb(report: WorkerBgReportProto) -> FsResult<WorkerBGReport> {
         Ok(WorkerBGReport {
+            kind: Self::bg_kind_from_pb(report.kind)?,
             bg_id: report.bg_id,
+            bg_epoch: report.bg_epoch,
             state: Self::replica_state_from_pb(report.state)?,
             stats: report.stats.map(Self::bg_stats_from_pb).unwrap_or_default(),
             isr_remove_candidates: report.isr_remove_candidates,
-            primary_unhealthy: report.primary_unhealthy.unwrap_or(false),
         })
     }
 
@@ -1025,7 +1025,6 @@ impl ProtoUtils {
                 .into_iter()
                 .map(|(k, v)| (k, Self::storage_spec_from_pb(v)))
                 .collect(),
-            bg_epochs: Default::default(),
             storage_stats: Default::default(),
             bg_reports: Default::default(),
         }
@@ -1041,7 +1040,6 @@ impl ProtoUtils {
                 .map(|(k, v)| (k.clone(), Self::storage_stats_to_pb(v)))
                 .collect(),
             sys_stats: Self::system_stats_to_pb(&payload.sys_stats),
-            bg_epochs: payload.bg_epochs.clone(),
             bg_reports: payload
                 .bg_reports
                 .iter()
@@ -1064,7 +1062,6 @@ impl ProtoUtils {
                 .map(|(k, v)| (k, Self::storage_stats_from_pb(v)))
                 .collect(),
             sys_stats: Self::system_stats_from_pb(payload.sys_stats),
-            bg_epochs: payload.bg_epochs,
             bg_reports,
         })
     }
@@ -1388,46 +1385,6 @@ impl ProtoUtils {
             primary: Self::required_bg_primary(bg.primary)?,
             replicas: Default::default(),
             stats: Default::default(),
-        })
-    }
-
-    pub fn block_group_info_view_to_pb(bg: &BlockGroupInfoView) -> BlockGroupInfoViewProto {
-        BlockGroupInfoViewProto {
-            bg_id: bg.bg_id,
-            table_id: bg.table_id as u32,
-            bg_epoch: bg.bg_epoch,
-            replica_set: bg
-                .replica_set
-                .iter()
-                .map(Self::replica_info_to_pb)
-                .collect(),
-            state: Self::bg_state_to_pb(bg.state),
-            op_state: Self::bg_op_state_to_pb(bg.op_state),
-            primary: Some(Self::bg_primary_to_pb(&bg.primary)),
-            kind: Self::bg_kind_to_pb(bg.kind),
-            isr: bg.isr.clone(),
-        }
-    }
-
-    pub fn block_group_info_view_from_pb(
-        bg: BlockGroupInfoViewProto,
-    ) -> FsResult<BlockGroupInfoView> {
-        let mut replicas = Vec::with_capacity(bg.replica_set.len());
-        for replica in bg.replica_set {
-            replicas.push(Self::replica_info_from_pb(replica)?);
-        }
-        Ok(BlockGroupInfoView {
-            bg_id: bg.bg_id,
-            table_id: u16::try_from(bg.table_id).map_err(|_| {
-                Self::invalid_proto(format!("table_id out of range: {}", bg.table_id))
-            })?,
-            kind: Self::bg_kind_from_pb(bg.kind)?,
-            bg_epoch: bg.bg_epoch,
-            replica_set: replicas,
-            isr: bg.isr,
-            state: Self::bg_state_from_pb(bg.state)?,
-            op_state: Self::bg_op_state_from_pb(bg.op_state)?,
-            primary: Self::required_bg_primary(bg.primary)?,
         })
     }
 
@@ -2184,9 +2141,10 @@ mod pd_proto_utils_tests {
                     cpu_usage: 0.5,
                     memory_usage: 0.6,
                 },
-                bg_epochs: HashMap::from([(7, 11)]),
                 bg_reports: vec![WorkerBGReport {
+                    kind: BGKind::Hash,
                     bg_id: 7,
+                    bg_epoch: 11,
                     state: ReplicaState::Active,
                     stats: BGStats {
                         used_bytes: 1,
@@ -2270,7 +2228,8 @@ mod pd_proto_utils_tests {
         assert_eq!(decoded.epoch, req.epoch);
         match decoded.payload {
             HeartbeatPayload::Worker(w) => {
-                assert_eq!(w.bg_epochs.get(&7), Some(&11));
+                assert_eq!(w.bg_reports[0].kind, BGKind::Hash);
+                assert_eq!(w.bg_reports[0].bg_epoch, 11);
                 assert_eq!(w.bg_reports[0].state, ReplicaState::Active);
             }
             _ => panic!("expected worker heartbeat payload"),
@@ -2343,7 +2302,11 @@ mod pd_proto_utils_tests {
                     isr: vec![10],
                     state: BGState::Active,
                     op_state: BGOpState::Idle,
-                    primary: None,
+                    primary: BGPrimary {
+                        node_id: 10,
+                        epoch: 1,
+                        grant_time_ms: 0,
+                    },
                     stats: Default::default(),
                     replicas: Default::default(),
                 }],
