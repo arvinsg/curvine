@@ -22,10 +22,6 @@ impl BGIndex {
         self.bgs.read().unwrap().values().cloned().collect()
     }
 
-    pub(crate) fn snapshot_bgs(&self) -> HashMap<BgId, Arc<BlockGroupInfo>> {
-        self.bgs.read().unwrap().clone()
-    }
-
     pub(crate) fn restore_bgs(&self, bgs: HashMap<BgId, Arc<BlockGroupInfo>>) {
         *self.bgs.write().unwrap() = bgs;
         self.rebuild_worker_to_bgs();
@@ -41,15 +37,6 @@ impl BGIndex {
             .iter()
             .filter_map(|bg_id| bgs.get(bg_id).cloned())
             .collect()
-    }
-
-    pub(crate) fn worker_primary_counts(&self) -> HashMap<u32, u32> {
-        let bgs = self.bgs.read().unwrap();
-        let mut counts = HashMap::new();
-        for bg in bgs.values() {
-            *counts.entry(bg.primary.node_id).or_default() += 1;
-        }
-        counts
     }
 
     pub(crate) fn insert_bg(&self, info: BlockGroupInfo) {
@@ -204,26 +191,6 @@ impl BGIndex {
         for worker_id in workers {
             bg.clear_isr_penalty(worker_id);
         }
-    }
-
-    pub(crate) fn serving_replicas(&self, bg_id: BgId) -> Vec<u32> {
-        let bgs = self.bgs.read().unwrap();
-        let Some(bg) = bgs.get(&bg_id) else {
-            return vec![];
-        };
-        bg.replica_set
-            .iter()
-            .filter(|&&wid| bg.replica_state(wid) == ReplicaState::Active)
-            .copied()
-            .collect()
-    }
-
-    pub(crate) fn resident_replicas(&self, bg_id: BgId) -> Vec<u32> {
-        let bgs = self.bgs.read().unwrap();
-        let Some(bg) = bgs.get(&bg_id) else {
-            return vec![];
-        };
-        bg.replica_set.clone()
     }
 
     fn rebuild_worker_to_bgs(&self) {

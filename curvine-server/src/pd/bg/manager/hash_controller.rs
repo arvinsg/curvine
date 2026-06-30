@@ -6,8 +6,13 @@ pub(crate) struct HashBGController {
 }
 
 impl HashBGController {
-    fn active(&self, scope: BGListScope) -> bool {
-        matches!(scope, BGListScope::Active | BGListScope::All)
+    fn filter_state(
+        bgs: impl IntoIterator<Item = Arc<BlockGroupInfo>>,
+        state: Option<BGState>,
+    ) -> Vec<Arc<BlockGroupInfo>> {
+        bgs.into_iter()
+            .filter(|bg| state.is_none_or(|state| bg.state == state))
+            .collect()
     }
 
     pub(crate) fn record_isr_failure(&self, bg_id: BgId, worker_id: u32) {
@@ -32,20 +37,15 @@ impl BGController for HashBGController {
         self.index.get_bg(bg_id)
     }
 
-    fn list_bgs(&self, scope: BGListScope) -> Vec<Arc<BlockGroupInfo>> {
-        if self.active(scope) {
-            self.index.list_bgs()
-        } else {
-            Vec::new()
-        }
+    fn list_bgs(&self, state: Option<BGState>) -> Vec<Arc<BlockGroupInfo>> {
+        Self::filter_state(self.index.list_bgs(), state)
     }
 
-    fn snapshot_bgs(&self, scope: BGListScope) -> HashMap<BgId, Arc<BlockGroupInfo>> {
-        if self.active(scope) {
-            self.index.snapshot_bgs()
-        } else {
-            HashMap::new()
-        }
+    fn snapshot_bgs(&self, state: Option<BGState>) -> HashMap<BgId, Arc<BlockGroupInfo>> {
+        self.list_bgs(state)
+            .into_iter()
+            .map(|bg| (bg.bg_id, bg))
+            .collect()
     }
 
     fn restore_bgs(&self, bgs: HashMap<BgId, Arc<BlockGroupInfo>>) {
@@ -66,20 +66,16 @@ impl BGController for HashBGController {
         self.index.remove_bg(old);
     }
 
-    fn bgs_on_worker(&self, worker_id: u32, scope: BGListScope) -> Vec<Arc<BlockGroupInfo>> {
-        if self.active(scope) {
-            self.index.bgs_on_worker(worker_id)
-        } else {
-            Vec::new()
-        }
+    fn bgs_on_worker(&self, worker_id: u32, state: Option<BGState>) -> Vec<Arc<BlockGroupInfo>> {
+        Self::filter_state(self.index.bgs_on_worker(worker_id), state)
     }
 
-    fn worker_primary_counts(&self, scope: BGListScope) -> HashMap<u32, u32> {
-        if self.active(scope) {
-            self.index.worker_primary_counts()
-        } else {
-            HashMap::new()
+    fn worker_primary_counts(&self, state: Option<BGState>) -> HashMap<u32, u32> {
+        let mut counts = HashMap::new();
+        for bg in self.list_bgs(state) {
+            *counts.entry(bg.primary.node_id).or_default() += 1;
         }
+        counts
     }
 
     fn reset_replica_states(&self) {
@@ -104,13 +100,5 @@ impl BGController for HashBGController {
 
     fn apply_replica_reports(&self, worker_id: u32, reports: &[WorkerBGReport]) -> usize {
         self.index.apply_replica_reports(worker_id, reports)
-    }
-
-    fn serving_replicas(&self, bg_id: BgId) -> Vec<u32> {
-        self.index.serving_replicas(bg_id)
-    }
-
-    fn resident_replicas(&self, bg_id: BgId) -> Vec<u32> {
-        self.index.resident_replicas(bg_id)
     }
 }

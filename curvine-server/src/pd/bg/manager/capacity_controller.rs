@@ -12,13 +12,16 @@ impl CapacityBGController {
         matches!(state, BGState::Init | BGState::Active)
     }
 
-    fn compact_sealed_runtime(info: &mut BlockGroupInfo) {
-        info.replicas.clear();
-        info.op_state = BGOpState::Idle;
+    fn filter_state(
+        bgs: impl IntoIterator<Item = Arc<BlockGroupInfo>>,
+        state: Option<BGState>,
+    ) -> Vec<Arc<BlockGroupInfo>> {
+        bgs.into_iter()
+            .filter(|bg| state.is_none_or(|state| bg.state == state))
+            .collect()
     }
 
-    fn insert_sealed(&self, mut info: BlockGroupInfo) {
-        Self::compact_sealed_runtime(&mut info);
+    fn insert_sealed(&self, info: BlockGroupInfo) {
         let bg_id = info.bg_id;
         let replica_set = info.replica_set.clone();
         self.sealed.write().unwrap().insert(bg_id, Arc::new(info));
@@ -28,8 +31,7 @@ impl CapacityBGController {
         }
     }
 
-    fn update_sealed(&self, old: &BlockGroupInfo, mut new: BlockGroupInfo) {
-        Self::compact_sealed_runtime(&mut new);
+    fn update_sealed(&self, old: &BlockGroupInfo, new: BlockGroupInfo) {
         if old.replica_set != new.replica_set {
             let mut by_worker = self.sealed_by_worker.write().unwrap();
             BGIndex::update_worker_to_bgs_for_replica(
@@ -55,8 +57,52 @@ impl CapacityBGController {
         self.sealed.read().unwrap().values().cloned().collect()
     }
 
-    fn snapshot_sealed(&self) -> HashMap<BgId, Arc<BlockGroupInfo>> {
-        self.sealed.read().unwrap().clone()
+    fn reset_sealed_replica_states(&self) {
+        let mut sealed = self.sealed.write().unwrap();
+        for bg in sealed.values_mut() {
+            Arc::make_mut(bg).reset_runtime_replicas();
+        }
+    }
+
+    fn set_sealed_op_state(&self, bg_id: BgId, op_state: BGOpState) {
+        let mut sealed = self.sealed.write().unwrap();
+        if let Some(bg) = sealed.get_mut(&bg_id) {
+            Arc::make_mut(bg).op_state = op_state;
+        }
+    }
+
+    fn get_sealed_replica_state(&self, bg_id: BgId, worker_id: u32) -> ReplicaState {
+        self.sealed
+            .read()
+            .unwrap()
+            .get(&bg_id)
+            .map(|bg| bg.replica_state(worker_id))
+            .unwrap_or(ReplicaState::Pending)
+    }
+
+    fn set_sealed_replica_state(&self, bg_id: BgId, worker_id: u32, state: ReplicaState) {
+        let mut sealed = self.sealed.write().unwrap();
+        let Some(bg) = sealed.get_mut(&bg_id) else {
+            return;
+        };
+        Arc::make_mut(bg).set_replica_state(worker_id, state, orpc::common::LocalTime::mills());
+    }
+
+    fn apply_sealed_replica_report(&self, worker_id: u32, report: &WorkerBGReport) -> usize {
+        let now = orpc::common::LocalTime::mills();
+        let mut sealed = self.sealed.write().unwrap();
+        let Some(bg) = sealed.get_mut(&report.bg_id) else {
+            return 0;
+        };
+        if !bg.replica_set.contains(&worker_id) {
+            log::warn!(
+                "worker {} reported sealed capacity bg_id={} but is not in replica_set; skip replica report",
+                worker_id,
+                report.bg_id
+            );
+            return 0;
+        }
+        usize::from(Arc::make_mut(bg).set_replica_state(worker_id, report.state, now))
     }
 }
 
@@ -71,28 +117,17 @@ impl BGController for CapacityBGController {
             .or_else(|| self.sealed.read().unwrap().get(&bg_id).cloned())
     }
 
-    fn list_bgs(&self, scope: BGListScope) -> Vec<Arc<BlockGroupInfo>> {
-        match scope {
-            BGListScope::Active => self.active.list_bgs(),
-            BGListScope::Sealed => self.list_sealed(),
-            BGListScope::All => {
-                let mut bgs = self.active.list_bgs();
-                bgs.extend(self.list_sealed());
-                bgs
-            }
-        }
+    fn list_bgs(&self, state: Option<BGState>) -> Vec<Arc<BlockGroupInfo>> {
+        let mut bgs = self.active.list_bgs();
+        bgs.extend(self.list_sealed());
+        Self::filter_state(bgs, state)
     }
 
-    fn snapshot_bgs(&self, scope: BGListScope) -> HashMap<BgId, Arc<BlockGroupInfo>> {
-        match scope {
-            BGListScope::Active => self.active.snapshot_bgs(),
-            BGListScope::Sealed => self.snapshot_sealed(),
-            BGListScope::All => {
-                let mut bgs = self.active.snapshot_bgs();
-                bgs.extend(self.snapshot_sealed());
-                bgs
-            }
-        }
+    fn snapshot_bgs(&self, state: Option<BGState>) -> HashMap<BgId, Arc<BlockGroupInfo>> {
+        self.list_bgs(state)
+            .into_iter()
+            .map(|bg| (bg.bg_id, bg))
+            .collect()
     }
 
     fn restore_bgs(&self, bgs: HashMap<BgId, Arc<BlockGroupInfo>>) {
@@ -105,7 +140,7 @@ impl BGController for CapacityBGController {
                 continue;
             }
             let mut sealed_bg = (*bg).clone();
-            Self::compact_sealed_runtime(&mut sealed_bg);
+            sealed_bg.sync_runtime_replicas_with_set();
             for &worker_id in &sealed_bg.replica_set {
                 by_worker.entry(worker_id).or_default().insert(bg_id);
             }
@@ -139,7 +174,7 @@ impl BGController for CapacityBGController {
             }
             (false, true) => {
                 self.remove_sealed(old);
-                new.reset_runtime_replicas();
+                new.sync_runtime_replicas_with_set();
                 self.active.insert_bg(new);
             }
             (false, false) => self.update_sealed(old, new),
@@ -154,54 +189,32 @@ impl BGController for CapacityBGController {
         }
     }
 
-    fn bgs_on_worker(&self, worker_id: u32, scope: BGListScope) -> Vec<Arc<BlockGroupInfo>> {
-        match scope {
-            BGListScope::Active => self.active.bgs_on_worker(worker_id),
-            BGListScope::Sealed => {
-                let by_worker = self.sealed_by_worker.read().unwrap();
-                let Some(bg_ids) = by_worker.get(&worker_id) else {
-                    return Vec::new();
-                };
-                let sealed = self.sealed.read().unwrap();
-                bg_ids
-                    .iter()
-                    .filter_map(|bg_id| sealed.get(bg_id).cloned())
-                    .collect()
-            }
-            BGListScope::All => {
-                let mut bgs = self.active.bgs_on_worker(worker_id);
-                bgs.extend(self.bgs_on_worker(worker_id, BGListScope::Sealed));
-                bgs
-            }
+    fn bgs_on_worker(&self, worker_id: u32, state: Option<BGState>) -> Vec<Arc<BlockGroupInfo>> {
+        let mut bgs = self.active.bgs_on_worker(worker_id);
+        let by_worker = self.sealed_by_worker.read().unwrap();
+        if let Some(bg_ids) = by_worker.get(&worker_id) {
+            let sealed = self.sealed.read().unwrap();
+            bgs.extend(bg_ids.iter().filter_map(|bg_id| sealed.get(bg_id).cloned()));
         }
+        Self::filter_state(bgs, state)
     }
 
-    fn worker_primary_counts(&self, scope: BGListScope) -> HashMap<u32, u32> {
-        match scope {
-            BGListScope::Active => self.active.worker_primary_counts(),
-            BGListScope::Sealed => {
-                let mut counts = HashMap::new();
-                for bg in self.sealed.read().unwrap().values() {
-                    *counts.entry(bg.primary.node_id).or_default() += 1;
-                }
-                counts
-            }
-            BGListScope::All => {
-                let mut counts = self.active.worker_primary_counts();
-                for (worker_id, count) in self.worker_primary_counts(BGListScope::Sealed) {
-                    *counts.entry(worker_id).or_default() += count;
-                }
-                counts
-            }
+    fn worker_primary_counts(&self, state: Option<BGState>) -> HashMap<u32, u32> {
+        let mut counts = HashMap::new();
+        for bg in self.list_bgs(state) {
+            *counts.entry(bg.primary.node_id).or_default() += 1;
         }
+        counts
     }
 
     fn reset_replica_states(&self) {
         self.active.reset_replica_states();
+        self.reset_sealed_replica_states();
     }
 
     fn set_op_state(&self, bg_id: BgId, op_state: BGOpState) {
         self.active.set_op_state(bg_id, op_state);
+        self.set_sealed_op_state(bg_id, op_state);
     }
 
     fn update_bg_stats(&self, bg_stats: &HashMap<BgId, BGStats>) {
@@ -209,22 +222,32 @@ impl BGController for CapacityBGController {
     }
 
     fn get_replica_state(&self, bg_id: BgId, worker_id: u32) -> ReplicaState {
-        self.active.get_replica_state(bg_id, worker_id)
+        if self.active.contains_bg(bg_id) {
+            self.active.get_replica_state(bg_id, worker_id)
+        } else {
+            self.get_sealed_replica_state(bg_id, worker_id)
+        }
     }
 
     fn set_replica_state(&self, bg_id: BgId, worker_id: u32, state: ReplicaState) {
-        self.active.set_replica_state(bg_id, worker_id, state);
+        if self.active.contains_bg(bg_id) {
+            self.active.set_replica_state(bg_id, worker_id, state);
+        } else {
+            self.set_sealed_replica_state(bg_id, worker_id, state);
+        }
     }
 
     fn apply_replica_reports(&self, worker_id: u32, reports: &[WorkerBGReport]) -> usize {
-        self.active.apply_replica_reports(worker_id, reports)
-    }
-
-    fn serving_replicas(&self, bg_id: BgId) -> Vec<u32> {
-        self.active.serving_replicas(bg_id)
-    }
-
-    fn resident_replicas(&self, bg_id: BgId) -> Vec<u32> {
-        self.active.resident_replicas(bg_id)
+        let mut changed = 0usize;
+        for report in reports {
+            if self.active.contains_bg(report.bg_id) {
+                changed += self
+                    .active
+                    .apply_replica_reports(worker_id, std::slice::from_ref(report));
+            } else {
+                changed += self.apply_sealed_replica_report(worker_id, report);
+            }
+        }
+        changed
     }
 }

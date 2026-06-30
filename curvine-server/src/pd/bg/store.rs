@@ -68,10 +68,6 @@ impl BGStore {
         Ok(self.put_op(BG_NEXT_ID_KEY.to_vec(), Serde::serialize(&next_id)?))
     }
 
-    pub fn write_batch(&self, ops: Vec<KvWrite>) -> CommonResult<()> {
-        self.store.write_batch(ops)
-    }
-
     pub fn put(&self, info: &BlockGroupInfo) -> CommonResult<()> {
         let key = self.bg_info_key(info.bg_id);
         let value = Serde::serialize(info)?;

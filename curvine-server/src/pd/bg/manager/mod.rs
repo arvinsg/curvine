@@ -38,7 +38,6 @@ mod tests;
 
 use capacity_controller::CapacityBGController;
 use controller::BGController;
-pub use controller::BGListScope;
 use hash_controller::HashBGController;
 use index::BGIndex;
 
@@ -70,20 +69,9 @@ impl BGManager {
         Ok(())
     }
 
-    pub fn reset_runtime_route_state_after_snapshot(&self) {
-        self.reset_replica_states();
-        log::info!("BG runtime replica state reset after snapshot restore");
-    }
-
     pub fn reset_replica_states(&self) {
         self.hash.reset_replica_states();
         self.capacity.reset_replica_states();
-    }
-
-    pub fn on_leader_start(&self) -> FsResult<()> {
-        self.reset_replica_states();
-        log::info!("BG runtime replica state reset on leader start");
-        Ok(())
     }
 
     fn restore_bgs_by_kind(
@@ -102,12 +90,7 @@ impl BGManager {
                     hash_bgs.insert(bg.bg_id, Arc::new(bg));
                 }
                 BGKind::Capacity => {
-                    if matches!(bg.state, BGState::Init | BGState::Active) {
-                        bg.reset_runtime_replicas();
-                    } else {
-                        bg.replicas.clear();
-                        bg.op_state = BGOpState::Idle;
-                    }
+                    bg.reset_runtime_replicas();
                     capacity_bgs.insert(bg.bg_id, Arc::new(bg));
                 }
             }
@@ -151,24 +134,24 @@ impl BGManager {
         self.controller(kind).get_bg(bg_id)
     }
 
-    pub fn list_bgs(&self, kind: BGKind, scope: BGListScope) -> Vec<Arc<BlockGroupInfo>> {
-        self.controller(kind).list_bgs(scope)
+    pub fn list_bgs(&self, kind: BGKind, state: Option<BGState>) -> Vec<Arc<BlockGroupInfo>> {
+        self.controller(kind).list_bgs(state)
     }
 
     pub fn list_all_bgs(&self) -> Vec<Arc<BlockGroupInfo>> {
-        let mut bgs = self.hash.list_bgs(BGListScope::All);
-        bgs.extend(self.capacity.list_bgs(BGListScope::All));
+        let mut bgs = self.hash.list_bgs(None);
+        bgs.extend(self.capacity.list_bgs(None));
         bgs
     }
 
     pub(crate) fn snapshot_all_bgs(&self) -> HashMap<BgId, Arc<BlockGroupInfo>> {
-        let mut bgs = self.hash.snapshot_bgs(BGListScope::All);
-        bgs.extend(self.capacity.snapshot_bgs(BGListScope::All));
+        let mut bgs = self.hash.snapshot_bgs(None);
+        bgs.extend(self.capacity.snapshot_bgs(None));
         bgs
     }
 
-    pub fn worker_primary_counts(&self, kind: BGKind, scope: BGListScope) -> HashMap<u32, u32> {
-        self.controller(kind).worker_primary_counts(scope)
+    pub fn worker_primary_counts(&self, kind: BGKind, state: Option<BGState>) -> HashMap<u32, u32> {
+        self.controller(kind).worker_primary_counts(state)
     }
 
     pub fn get_next_bg_id(&self) -> FsResult<BgId> {
@@ -191,17 +174,13 @@ impl BGManager {
         &self,
         kind: BGKind,
         worker_id: u32,
-        scope: BGListScope,
+        state: Option<BGState>,
     ) -> Vec<Arc<BlockGroupInfo>> {
-        self.controller(kind).bgs_on_worker(worker_id, scope)
+        self.controller(kind).bgs_on_worker(worker_id, state)
     }
 
     pub fn get_bgs_by_state(&self, kind: BGKind, state: BGState) -> Vec<Arc<BlockGroupInfo>> {
-        self.controller(kind)
-            .list_bgs(BGListScope::All)
-            .into_iter()
-            .filter(|bg| bg.state == state)
-            .collect()
+        self.controller(kind).list_bgs(Some(state))
     }
 
     pub fn get_replica_state(&self, kind: BGKind, bg_id: BgId, worker_id: u32) -> ReplicaState {
@@ -270,11 +249,34 @@ impl BGManager {
         }
     }
 
-    pub fn serving_replicas(&self, kind: BGKind, bg_id: BgId) -> Vec<u32> {
-        self.controller(kind).serving_replicas(bg_id)
+    pub fn replica_set_workers(&self, kind: BGKind, bg_id: BgId) -> Vec<u32> {
+        self.get_bg(kind, bg_id)
+            .map(|bg| bg.replica_set.clone())
+            .unwrap_or_default()
     }
 
-    pub fn resident_replicas(&self, kind: BGKind, bg_id: BgId) -> Vec<u32> {
-        self.controller(kind).resident_replicas(bg_id)
+    pub fn active_replica_workers(&self, kind: BGKind, bg_id: BgId) -> Vec<u32> {
+        self.get_bg(kind, bg_id)
+            .map(|bg| {
+                bg.replica_set
+                    .iter()
+                    .copied()
+                    .filter(|worker_id| bg.replica_state(*worker_id) == ReplicaState::Active)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn active_isr_workers(&self, kind: BGKind, bg_id: BgId) -> Vec<u32> {
+        self.get_bg(kind, bg_id)
+            .map(|bg| {
+                bg.isr
+                    .iter()
+                    .copied()
+                    .filter(|worker_id| bg.replica_set.contains(worker_id))
+                    .filter(|worker_id| bg.replica_state(*worker_id) == ReplicaState::Active)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }

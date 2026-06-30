@@ -18,6 +18,6 @@ pub mod state_machine;
 mod store;
 
 pub use id_allocator::BgIdAllocator;
-pub use manager::{BGListScope, BGManager};
+pub use manager::BGManager;
 pub(crate) use manager::{PrepareCreateResult, PrepareDeleteResult, PrepareUpdateResult};
 pub use store::BGStore;

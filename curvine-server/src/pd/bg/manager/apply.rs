@@ -42,7 +42,7 @@ impl BGManager {
         kind: BGKind,
         bg_id: BgId,
         worker_id: u32,
-    ) -> FsResult<()> {
+    ) -> FsResult<ApplyOutcome> {
         let bg = self
             .get_bg(kind, bg_id)
             .ok_or_else(|| FsError::common(format!("bg {} not found", bg_id)))?;
@@ -65,12 +65,17 @@ impl BGManager {
         self.propose_update_bg(entry, "propose_remove_replica")
     }
 
-    pub fn propose_add_replica(&self, kind: BGKind, bg_id: BgId, worker_id: u32) -> FsResult<()> {
+    pub fn propose_add_replica(
+        &self,
+        kind: BGKind,
+        bg_id: BgId,
+        worker_id: u32,
+    ) -> FsResult<ApplyOutcome> {
         let bg = self
             .get_bg(kind, bg_id)
             .ok_or_else(|| FsError::common(format!("bg {} not found", bg_id)))?;
         if bg.replica_set.contains(&worker_id) {
-            return Ok(());
+            return Ok(ApplyOutcome::SkippedNoop);
         }
         let mut new_rs = bg.replica_set.clone();
         new_rs.push(worker_id);
@@ -93,13 +98,13 @@ impl BGManager {
         bg_id: BgId,
         from_worker: u32,
         to_worker: u32,
-    ) -> FsResult<()> {
+    ) -> FsResult<ApplyOutcome> {
         let bg = self
             .get_bg(kind, bg_id)
             .ok_or_else(|| FsError::common(format!("bg {} not found", bg_id)))?;
         let current_owner = bg.primary.node_id;
         if current_owner != from_worker {
-            return Ok(());
+            return Ok(ApplyOutcome::SkippedNoop);
         }
         let new_epoch = bg.primary.epoch.saturating_add(1);
         let primary = BGPrimary {
@@ -120,7 +125,7 @@ impl BGManager {
         self.propose_update_bg(entry, "propose_transfer_primary")
     }
 
-    pub fn propose_seal_bg(&self, kind: BGKind, bg_id: BgId) -> FsResult<()> {
+    pub fn propose_seal_bg(&self, kind: BGKind, bg_id: BgId) -> FsResult<ApplyOutcome> {
         self.propose_bg_state_transition(kind, bg_id, BGState::Sealed, "propose_seal_bg")
     }
 
@@ -130,12 +135,15 @@ impl BGManager {
         bg_id: BgId,
         target_state: BGState,
         op_name: &str,
-    ) -> FsResult<()> {
+    ) -> FsResult<ApplyOutcome> {
         let Some(bg) = self.get_bg(kind, bg_id) else {
-            return Ok(());
+            return Ok(ApplyOutcome::not_found(format!(
+                "{:?} bg {} not found",
+                kind, bg_id
+            )));
         };
         if bg.state == target_state {
-            return Ok(());
+            return Ok(ApplyOutcome::SkippedNoop);
         }
         let entry = BGUpdateEntry {
             op_ms: orpc::common::LocalTime::mills(),
@@ -150,9 +158,12 @@ impl BGManager {
         self.propose_update_bg(entry, op_name)
     }
 
-    pub fn propose_delete_bg(&self, kind: BGKind, bg_id: BgId) -> FsResult<()> {
+    pub fn propose_delete_bg(&self, kind: BGKind, bg_id: BgId) -> FsResult<ApplyOutcome> {
         let Some(bg) = self.get_bg(kind, bg_id) else {
-            return Ok(());
+            return Ok(ApplyOutcome::not_found(format!(
+                "{:?} bg {} not found",
+                kind, bg_id
+            )));
         };
         let expected_epoch = bg.bg_epoch;
         let entry = BGDeleteEntry {
@@ -162,54 +173,48 @@ impl BGManager {
             expected_bg_epoch: expected_epoch,
         };
         let outcome = self.journal_client.propose(PdEntry::DeleteBG(entry))?;
-        match outcome {
-            ApplyOutcome::Applied | ApplyOutcome::SkippedNoop | ApplyOutcome::NotFound { .. } => {
-                Ok(())
-            }
-            ApplyOutcome::SkippedStale { reason } => {
-                log::warn!(
-                    "propose_delete_bg bg_id={} returned Stale (expected_bg_epoch={}): {}",
-                    bg_id,
-                    expected_epoch,
-                    reason
-                );
-                Err(FsError::stale_entry("delete_bg", expected_epoch, reason))
-            }
+        if let ApplyOutcome::SkippedStale { reason } = &outcome {
+            log::warn!(
+                "propose_delete_bg bg_id={} returned Stale (expected_bg_epoch={}): {}",
+                bg_id,
+                expected_epoch,
+                reason
+            );
         }
+        Ok(outcome)
     }
 
-    pub(crate) fn propose_update_bg(&self, entry: BGUpdateEntry, kind: &str) -> FsResult<()> {
+    pub(crate) fn propose_update_bg(
+        &self,
+        entry: BGUpdateEntry,
+        kind: &str,
+    ) -> FsResult<ApplyOutcome> {
         let expected_epoch = entry.expected_bg_epoch;
         let bg_id = entry.bg_id;
         let outcome = self.journal_client.propose(PdEntry::UpdateBG(entry))?;
-        match outcome {
-            ApplyOutcome::Applied | ApplyOutcome::SkippedNoop => Ok(()),
-            ApplyOutcome::SkippedStale { reason } => {
-                log::warn!(
-                    "{} bg_id={} returned Stale (expected_bg_epoch={}): {}",
-                    kind,
-                    bg_id,
-                    expected_epoch,
-                    reason
-                );
-                Err(FsError::stale_entry("update_bg", expected_epoch, reason))
-            }
-            ApplyOutcome::NotFound { reason } => Err(FsError::not_found(reason)),
+        if let ApplyOutcome::SkippedStale { reason } = &outcome {
+            log::warn!(
+                "{} bg_id={} returned Stale (expected_bg_epoch={}): {}",
+                kind,
+                bg_id,
+                expected_epoch,
+                reason
+            );
         }
+        Ok(outcome)
     }
 
-    pub fn propose_batch_update_bg(&self, entry: BGBatchUpdateEntry) -> FsResult<()> {
+    pub fn propose_batch_update_bg(&self, entry: BGBatchUpdateEntry) -> FsResult<ApplyOutcome> {
         let bg_id_for_log = entry.updates.first().map(|u| u.bg_id);
         let outcome = self.journal_client.propose(PdEntry::BatchUpdateBG(entry))?;
-        match outcome {
-            ApplyOutcome::Applied | ApplyOutcome::SkippedNoop => Ok(()),
-            ApplyOutcome::SkippedStale { reason } => Err(FsError::stale_entry(
-                "batch_update_bg",
-                format!("bg_id={:?}", bg_id_for_log),
-                reason,
-            )),
-            ApplyOutcome::NotFound { reason } => Err(FsError::not_found(reason)),
+        if let ApplyOutcome::SkippedStale { reason } = &outcome {
+            log::warn!(
+                "propose_batch_update_bg bg_id={:?} returned Stale: {}",
+                bg_id_for_log,
+                reason
+            );
         }
+        Ok(outcome)
     }
 
     pub fn apply_allocate_bg_id(&self, entry: &BGIdAllocatorEntry) -> FsResult<ApplyOutcome> {
@@ -240,7 +245,7 @@ impl BGManager {
     pub fn apply_create_bg(&self, entry: &BGEntry) -> FsResult<ApplyOutcome> {
         match self.prepare_create_bg(&entry.info)? {
             PrepareCreateResult::Applied(plan) => {
-                self.write_batch(vec![plan.op])?;
+                self.store.put(&plan.info).map_err(FsError::from)?;
                 self.insert_bg(plan.info);
                 Ok(ApplyOutcome::Applied)
             }
@@ -251,7 +256,7 @@ impl BGManager {
     pub fn apply_update_bg(&self, entry: &BGUpdateEntry) -> FsResult<ApplyOutcome> {
         match self.prepare_update_bg(entry)? {
             PrepareUpdateResult::Applied(plan) => {
-                self.write_batch(vec![plan.op])?;
+                self.store.put(&plan.new_info).map_err(FsError::from)?;
                 self.update_bg(&plan.old_info, plan.new_info.clone());
                 self.cleanup_isr_penalties(&plan.old_info, &plan.new_info);
                 Ok(ApplyOutcome::Applied)
@@ -263,7 +268,9 @@ impl BGManager {
     pub fn apply_delete_bg(&self, entry: &BGDeleteEntry) -> FsResult<ApplyOutcome> {
         match self.prepare_delete_bg(entry)? {
             PrepareDeleteResult::Applied(plan) => {
-                self.write_batch(vec![plan.op])?;
+                self.store
+                    .delete(plan.old_info.bg_id)
+                    .map_err(FsError::from)?;
                 self.remove_bg(&plan.old_info);
                 Ok(ApplyOutcome::Applied)
             }
@@ -277,15 +284,8 @@ impl BGManager {
             return Ok(PrepareCreateResult::Outcome(ApplyOutcome::SkippedNoop));
         }
         let mut runtime_info = info.clone();
-        if runtime_info.kind == BGKind::Hash
-            || matches!(runtime_info.state, BGState::Init | BGState::Active)
-        {
-            runtime_info.reset_runtime_replicas();
-        } else {
-            runtime_info.replicas.clear();
-            runtime_info.op_state = BGOpState::Idle;
-        }
-        let op = self.bg_put_op(&runtime_info)?;
+        runtime_info.reset_runtime_replicas();
+        let op = self.store.bg_put_op(&runtime_info).map_err(FsError::from)?;
         Ok(PrepareCreateResult::Applied(PreparedBGCreate {
             info: runtime_info,
             op,
@@ -312,7 +312,7 @@ impl BGManager {
             }
         };
         Self::validate_bg_info(&new_info)?;
-        let op = self.bg_put_op(&new_info)?;
+        let op = self.store.bg_put_op(&new_info).map_err(FsError::from)?;
         Ok(PrepareUpdateResult::Applied(PreparedBGUpdate {
             old_info,
             new_info,
@@ -334,7 +334,7 @@ impl BGManager {
         }
         Ok(PrepareDeleteResult::Applied(PreparedBGDelete {
             old_info: (*existing).clone(),
-            op: self.bg_delete_op(entry.bg_id),
+            op: self.store.bg_delete_op(entry.bg_id),
         }))
     }
 
@@ -408,18 +408,6 @@ impl BGManager {
             )));
         }
         Ok(())
-    }
-
-    pub(crate) fn bg_put_op(&self, info: &BlockGroupInfo) -> FsResult<KvWrite> {
-        self.store.bg_put_op(info).map_err(Into::into)
-    }
-
-    pub(crate) fn bg_delete_op(&self, bg_id: BgId) -> KvWrite {
-        self.store.bg_delete_op(bg_id)
-    }
-
-    pub(crate) fn write_batch(&self, ops: Vec<KvWrite>) -> FsResult<()> {
-        self.store.write_batch(ops).map_err(Into::into)
     }
 
     pub(crate) fn insert_bg(&self, info: BlockGroupInfo) {

@@ -1,5 +1,4 @@
 use super::fixtures::*;
-use crate::pd::bg::BGListScope;
 use crate::pd::journal::entry::{BGDeleteEntry, BGIdAllocatorEntry};
 use crate::pd::journal::ApplyOutcome;
 use curvine_common::state::{BGKind, BGState, BgId};
@@ -99,13 +98,12 @@ fn apply_update_bg_cases() {
                 assert_eq!(bg.replica_set, replica_set, "{}", case.name);
                 assert_eq!(bg.isr, isr, "{}", case.name);
                 assert!(
-                    mgr.bgs_on_worker(BGKind::Hash, 101, BGListScope::All)
-                        .is_empty(),
+                    mgr.bgs_on_worker(BGKind::Hash, 101, None).is_empty(),
                     "{}",
                     case.name
                 );
                 assert_eq!(
-                    mgr.bgs_on_worker(BGKind::Hash, 103, BGListScope::All).len(),
+                    mgr.bgs_on_worker(BGKind::Hash, 103, None).len(),
                     1,
                     "{}",
                     case.name
@@ -142,9 +140,7 @@ fn delete_bg_cleans_indexes_and_penalties() {
 
     assert_eq!(outcome, ApplyOutcome::Applied);
     assert!(mgr.get_bg(BGKind::Hash, 1).is_none());
-    assert!(mgr
-        .bgs_on_worker(BGKind::Hash, 100, BGListScope::All)
-        .is_empty());
+    assert!(mgr.bgs_on_worker(BGKind::Hash, 100, None).is_empty());
     assert!(!mgr.is_isr_rejoin_blocked(BGKind::Hash, 1, 101));
 }
 
@@ -218,7 +214,7 @@ fn make_capacity_bg(
 }
 
 #[test]
-fn capacity_sealed_bg_keeps_metadata_but_not_runtime_replicas() {
+fn capacity_sealed_bg_keeps_metadata_and_replica_state() {
     let mgr = test_manager();
     let bg = make_capacity_bg(10, 20, BGState::Active, vec![100, 101]);
     assert_eq!(create_bg(&mgr, bg), ApplyOutcome::Applied);
@@ -237,12 +233,15 @@ fn capacity_sealed_bg_keeps_metadata_but_not_runtime_replicas() {
     let sealed = mgr.get_bg(BGKind::Capacity, 10).unwrap();
     assert_eq!(sealed.state, BGState::Sealed);
     assert_eq!(sealed.replica_set, vec![100, 101]);
-    assert!(sealed.replicas.is_empty());
+    assert_eq!(
+        sealed.replica_state(100),
+        curvine_common::state::ReplicaState::Active
+    );
     assert!(mgr
-        .bgs_on_worker(BGKind::Capacity, 100, BGListScope::Active)
+        .bgs_on_worker(BGKind::Capacity, 100, Some(BGState::Active))
         .is_empty());
     assert_eq!(
-        mgr.bgs_on_worker(BGKind::Capacity, 100, BGListScope::Sealed)
+        mgr.bgs_on_worker(BGKind::Capacity, 100, Some(BGState::Sealed))
             .len(),
         1
     );
