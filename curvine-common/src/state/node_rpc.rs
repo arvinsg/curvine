@@ -13,24 +13,42 @@
 // limitations under the License.
 
 use crate::state::meta_node_info::{InodesStats, NodeGroupInfo};
-use crate::state::meta_node_mode::PathRouteEntry;
 use crate::state::node_info::{NodePayload, SystemStats};
 use crate::state::node_state::{NodeAddress, NodeBase, NodeType};
 use crate::state::task_node_info::TaskNodeStats;
 use crate::state::worker_node_info::StorageStats;
-use crate::state::{BGStats, BlockGroupInfo, ReplicaState};
+use crate::state::PathRouteEntry;
+use crate::state::{BGKind, BGStats, BgId, BlockGroupInfo, ReplicaState, TableId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use super::{PeerInfo, RwPolicy};
 
-/// Per-BG report from worker: replica state + stats
+/// Per-BG report from worker: replica epoch, state and stats.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerBGReport {
-    pub bg_id: u32,
+    #[serde(default)]
+    pub kind: BGKind,
+    pub bg_id: BgId,
+    pub bg_epoch: u64,
     pub state: ReplicaState,
     #[serde(default)]
     pub stats: BGStats,
+    #[serde(default)]
+    pub isr_remove_candidates: Vec<u32>,
+}
+
+impl Default for WorkerBGReport {
+    fn default() -> Self {
+        Self {
+            kind: BGKind::Hash,
+            bg_id: 0,
+            bg_epoch: 0,
+            state: ReplicaState::Pending,
+            stats: BGStats::default(),
+            isr_remove_candidates: Vec::new(),
+        }
+    }
 }
 
 /// Node register request
@@ -67,11 +85,7 @@ pub enum HeartbeatPayload {
 pub struct WorkerHeartbeatPayload {
     pub storage_stats: HashMap<String, StorageStats>,
     pub sys_stats: SystemStats,
-    /// BG epochs for staleness detection (bg_id -> epoch).
-    ///
-    #[serde(default)]
-    pub bg_epochs: HashMap<u32, u64>,
-    /// Per-BG replica state + stats.
+    /// Per-BG replica epoch, state and stats.
     #[serde(default)]
     pub bg_reports: Vec<WorkerBGReport>,
 }
@@ -102,7 +116,7 @@ pub struct HeartbeatResponse {
     pub epoch: u64,
     pub mount_version: u64,
     #[serde(default)]
-    pub table_epochs: HashMap<u32, u64>,
+    pub table_epochs: HashMap<TableId, u64>,
     pub payload: HeartbeatResponsePayload,
 }
 
@@ -118,7 +132,7 @@ pub enum HeartbeatResponsePayload {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkerHeartbeatResponse {
     pub add_bgs: Vec<BlockGroupInfo>,
-    pub remove_bgs: Vec<u32>,
+    pub remove_bgs: Vec<BgId>,
     pub update_bgs: Vec<BlockGroupInfo>,
 }
 
@@ -126,23 +140,11 @@ pub struct WorkerHeartbeatResponse {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskHeartbeatResponse {}
 
-/// Route update action (full sync or incremental)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum RouteUpdateAction {
-    FullSync {
-        routes: Vec<PathRouteEntry>,
-    },
-    Incremental {
-        added: Vec<PathRouteEntry>,
-        removed: Vec<String>,
-    },
-}
-
-/// Path route table update (static mode)
+/// Path route table update. PD currently publishes a full static route table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PathRouteUpdate {
     pub version: u64,
-    pub action: RouteUpdateAction,
+    pub routes: Vec<PathRouteEntry>,
 }
 
 /// Group update action (add or remove groups)

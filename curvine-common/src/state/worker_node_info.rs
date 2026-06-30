@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::StorageType;
-use super::{BgId, WorkerBGReport};
+use super::WorkerBGReport;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -22,9 +22,6 @@ use std::collections::HashMap;
 pub struct WorkerNodePayload {
     pub storage_specs: HashMap<String, StorageSpec>,
 
-    /// BG epochs (updated from heartbeat, not persisted). Keys serve as the BG ID list.
-    #[serde(skip)]
-    pub bg_epochs: HashMap<BgId, u64>,
     #[serde(skip)]
     pub storage_stats: HashMap<String, StorageStats>,
     /// Per-BG replica state + stats (updated from heartbeat, not persisted)
