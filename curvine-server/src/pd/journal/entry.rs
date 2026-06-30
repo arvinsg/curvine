@@ -138,6 +138,7 @@ pub struct BGEntry {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct BGUpdateEntry {
     pub op_ms: u64,
+    pub kind: curvine_common::state::BGKind,
     pub bg_id: BgId,
     pub expected_bg_epoch: u64,
     pub state: Option<curvine_common::state::BGState>,
@@ -157,6 +158,7 @@ pub struct BGBatchUpdateEntry {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct BGDeleteEntry {
     pub op_ms: u64,
+    pub kind: curvine_common::state::BGKind,
     pub bg_id: BgId,
     pub expected_bg_epoch: u64,
 }

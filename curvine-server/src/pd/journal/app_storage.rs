@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::pd::bg::BGManager;
+use crate::pd::bgtable::BGTableManager;
 use crate::pd::config::ConfigManager;
 use crate::pd::journal::entry::PdEntry;
 use crate::pd::metaroute::MetaRouteManager;
@@ -39,6 +40,7 @@ pub struct PdAppStorage {
     node_manager: Arc<NodeManager>,
     pool_manager: Arc<PoolManager>,
     bg_manager: Arc<BGManager>,
+    bgtable_manager: Arc<BGTableManager>,
     namespace_manager: Arc<NamespaceManager>,
     metaroute_manager: Arc<MetaRouteManager>,
 }
@@ -52,6 +54,7 @@ impl PdAppStorage {
         node_manager: Arc<NodeManager>,
         pool_manager: Arc<PoolManager>,
         bg_manager: Arc<BGManager>,
+        bgtable_manager: Arc<BGTableManager>,
         namespace_manager: Arc<NamespaceManager>,
         metaroute_manager: Arc<MetaRouteManager>,
     ) -> Self {
@@ -63,6 +66,7 @@ impl PdAppStorage {
             node_manager,
             pool_manager,
             bg_manager,
+            bgtable_manager,
             namespace_manager,
             metaroute_manager,
         }
@@ -149,32 +153,25 @@ impl PdAppStorage {
             }
             PdEntry::CreateBG(entry) => {
                 info!("Apply CreateBG bg_id={}", entry.info.bg_id);
-                self.bg_manager
-                    .apply_create_bg_with_role(&entry, is_leader)?;
+                self.bgtable_manager.apply_create_bg(&entry)?;
             }
             PdEntry::UpdateBG(entry) => {
                 info!(
                     "Apply UpdateBG bg_id={}, expected_epoch={}",
                     entry.bg_id, entry.expected_bg_epoch
                 );
-                let _ = self
-                    .bg_manager
-                    .apply_update_bg_with_role(&entry, is_leader)?;
+                let _ = self.bgtable_manager.apply_update_bg(&entry)?;
             }
             PdEntry::DeleteBG(ref entry) => {
                 info!(
                     "Apply DeleteBG bg_id={}, expected_epoch={}",
                     entry.bg_id, entry.expected_bg_epoch
                 );
-                let _ = self
-                    .bg_manager
-                    .apply_delete_bg_with_role(entry, is_leader)?;
+                let _ = self.bgtable_manager.apply_delete_bg(entry)?;
             }
             PdEntry::BatchUpdateBG(entry) => {
                 info!("Apply BatchUpdateBG updates={}", entry.updates.len());
-                let _ = self
-                    .bg_manager
-                    .apply_batch_update_bg_with_role(&entry, is_leader)?;
+                let _ = self.bgtable_manager.apply_batch_update_bg(&entry)?;
             }
             PdEntry::AddPathRoute(ref entry) => {
                 info!(
@@ -231,7 +228,9 @@ impl AppStorage for PdAppStorage {
         self.node_manager.restore()?;
         self.pool_manager.restore()?;
         self.bg_manager.restore()?;
-        self.bg_manager.reset_runtime_route_state_after_snapshot();
+        self.bg_manager.reset_replica_states();
+        self.bgtable_manager
+            .restore(&self.bg_manager.snapshot_all_bgs())?;
         self.namespace_manager.restore()?;
         self.mount_manager.restore()?;
         self.metaroute_manager.restore()?;
