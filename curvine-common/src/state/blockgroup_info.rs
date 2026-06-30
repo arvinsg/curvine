@@ -289,8 +289,7 @@ impl BlockGroupInfo {
 }
 
 /// Client BG route view. It intentionally exposes only replicas that
-/// belong to the PD-published ISR / serving set. Full BG metadata remains
-/// available through BlockGroupInfo for management APIs.
+/// belong to the PD-published ISR / serving set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockGroupRouteView {
     pub bg_id: BgId,
