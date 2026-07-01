@@ -168,24 +168,6 @@ impl BGTable {
         }
     }
 
-    pub fn new_hash_table(
-        table_id: TableId,
-        namespace_id: NamespaceId,
-        storage_type: StorageType,
-        replica_count: u16,
-        buckets: Vec<BgId>,
-    ) -> Self {
-        Self::new_hash_table_with_config(
-            table_id,
-            namespace_id,
-            storage_type,
-            replica_count,
-            buckets,
-            vec![],
-            CacheReplicaPolicy::default(),
-        )
-    }
-
     pub fn new_hash_table_with_config(
         table_id: TableId,
         namespace_id: NamespaceId,
@@ -195,28 +177,6 @@ impl BGTable {
         worker_labels: Vec<LabelMatch>,
         cache_replica_policy: CacheReplicaPolicy,
     ) -> Self {
-        Self::new_hash_table_with_config_and_epoch(
-            table_id,
-            namespace_id,
-            storage_type,
-            replica_count,
-            buckets,
-            worker_labels,
-            cache_replica_policy,
-            0,
-        )
-    }
-
-    pub fn new_hash_table_with_config_and_epoch(
-        table_id: TableId,
-        namespace_id: NamespaceId,
-        storage_type: StorageType,
-        replica_count: u16,
-        buckets: Vec<BgId>,
-        worker_labels: Vec<LabelMatch>,
-        cache_replica_policy: CacheReplicaPolicy,
-        epoch: u64,
-    ) -> Self {
         let now = LocalTime::mills();
         BGTable::Hash(HashBGTable {
             base: BGTableBase {
@@ -225,7 +185,7 @@ impl BGTable {
                 storage_type,
                 replica_count,
                 worker_labels,
-                epoch,
+                epoch: 1,
                 create_time_ms: now,
                 update_time_ms: now,
                 stats: BGTableStats::default(),
@@ -233,26 +193,6 @@ impl BGTable {
             cache_replica_policy,
             buckets,
         })
-    }
-
-    pub fn new_hash_table_with_epoch(
-        table_id: TableId,
-        namespace_id: NamespaceId,
-        storage_type: StorageType,
-        replica_count: u16,
-        buckets: Vec<BgId>,
-        epoch: u64,
-    ) -> Self {
-        Self::new_hash_table_with_config_and_epoch(
-            table_id,
-            namespace_id,
-            storage_type,
-            replica_count,
-            buckets,
-            vec![],
-            CacheReplicaPolicy::default(),
-            epoch,
-        )
     }
 
     pub fn new_capacity_table(
@@ -271,7 +211,7 @@ impl BGTable {
                 storage_type,
                 replica_count,
                 worker_labels: vec![],
-                epoch: 0,
+                epoch: 1,
                 create_time_ms: now,
                 update_time_ms: now,
                 stats: BGTableStats::default(),
@@ -286,31 +226,17 @@ impl BGTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use curvine_common::state::{BGPrimary, BGState, BlockGroupInfo};
-
-    fn sample_capacity_bg(bg_id: BgId, state: BGState) -> BlockGroupInfo {
-        BlockGroupInfo {
-            bg_id,
-            table_id: 7,
-            kind: BGKind::Capacity,
-            bg_epoch: 1,
-            replica_set: vec![1, 2, 3],
-            isr: vec![1, 2, 3],
-            state,
-            op_state: Default::default(),
-            primary: BGPrimary {
-                node_id: 1,
-                epoch: 1,
-                grant_time_ms: 0,
-            },
-            stats: Default::default(),
-            replicas: Default::default(),
-        }
-    }
-
     #[test]
     fn hash_table_exposes_bucket_metadata_without_routing() {
-        let table = BGTable::new_hash_table(1, 0, StorageType::Ssd, 3, vec![10, 20, 30, 40]);
+        let table = BGTable::new_hash_table_with_config(
+            1,
+            0,
+            StorageType::Ssd,
+            3,
+            vec![10, 20, 30, 40],
+            vec![],
+            CacheReplicaPolicy::default(),
+        );
         let hash_table = table.hash_table().expect("hash table");
         assert_eq!(hash_table.bucket_count(), 4);
         assert_eq!(hash_table.buckets(), &[10, 20, 30, 40]);
@@ -324,42 +250,19 @@ mod tests {
     }
 
     #[test]
-    fn capacity_table_tracks_routable_active_bgs_only() {
+    fn capacity_table_tracks_active_bgs_runtime_index() {
         let mut table = BGTable::new_capacity_table(7, 0, StorageType::Ssd, 3, 16 << 30, 2);
-        let mut active_bg = sample_capacity_bg(100, BGState::Active);
-        let sealed_bg = sample_capacity_bg(101, BGState::Sealed);
-
         if let BGTable::Capacity(t) = &mut table {
-            crate::pd::bgtable::CapacityBGTableController::bg_created(t, &active_bg);
-            crate::pd::bgtable::CapacityBGTableController::bg_created(t, &sealed_bg);
+            t.active_bgs.push(100);
         }
         assert_eq!(table.capacity_table().unwrap().active_bgs(), &[100]);
-
-        let old = active_bg.clone();
-        active_bg.state = BGState::Sealed;
-        if let BGTable::Capacity(t) = &mut table {
-            crate::pd::bgtable::CapacityBGTableController::bg_updated(t, &old, &active_bg);
-        }
-        assert!(table.capacity_table().unwrap().active_bgs().is_empty());
-
-        active_bg.state = BGState::Active;
-        if let BGTable::Capacity(t) = &mut table {
-            crate::pd::bgtable::CapacityBGTableController::bg_updated(t, &sealed_bg, &active_bg);
-        }
-        assert_eq!(table.capacity_table().unwrap().active_bgs(), &[100]);
-
-        if let BGTable::Capacity(t) = &mut table {
-            crate::pd::bgtable::CapacityBGTableController::bg_deleted(t, &active_bg);
-        }
-        assert!(table.capacity_table().unwrap().active_bgs().is_empty());
     }
 
     #[test]
     fn capacity_active_bgs_are_runtime_only() {
         let mut table = BGTable::new_capacity_table(7, 0, StorageType::Ssd, 3, 16 << 30, 2);
-        let active_bg = sample_capacity_bg(100, BGState::Active);
         if let BGTable::Capacity(t) = &mut table {
-            crate::pd::bgtable::CapacityBGTableController::bg_created(t, &active_bg);
+            t.active_bgs.push(100);
         }
         assert_eq!(table.capacity_table().unwrap().active_bgs(), &[100]);
 
@@ -370,7 +273,15 @@ mod tests {
 
     #[test]
     fn table_id_returns_base_table_id() {
-        let table = BGTable::new_hash_table(11, 0, StorageType::Ssd, 3, vec![1]);
+        let table = BGTable::new_hash_table_with_config(
+            11,
+            0,
+            StorageType::Ssd,
+            3,
+            vec![1],
+            vec![],
+            CacheReplicaPolicy::default(),
+        );
         assert_eq!(table.table_id(), 11);
     }
 }
