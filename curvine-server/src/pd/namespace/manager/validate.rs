@@ -1,15 +1,17 @@
 use super::*;
-use crate::pd::bgtable::BGTable;
-use curvine_common::state::BGKind;
+use crate::pd::bgtable::{BGTable, HashBGTable};
+use curvine_common::state::{BGKind, BlockGroupInfo, CacheReplicaPolicy};
 
 impl NamespaceManager {
     pub(super) fn validate_create_request(&self, request: &CreateNamespaceRequest) -> FsResult<()> {
         validate_namespace_name(&request.name)?;
         if request.block_size == 0 {
-            return Err(FsError::common("namespace block_size must be > 0"));
+            return Err(FsError::invalid_argument(
+                "namespace block_size must be > 0",
+            ));
         }
         if request.write_buffer_config.is_some() {
-            return Err(FsError::common(
+            return Err(FsError::invalid_argument(
                 "write_buffer_config / Capacity BGTable is not supported in phase 1",
             ));
         }
@@ -127,7 +129,7 @@ impl NamespaceManager {
                 table.replica_count()
             )));
         }
-        let hash_table = table.hash_table().expect("hash table");
+        let hash_table = hash_table_of(table)?;
         let bucket_count = hash_table.bucket_count();
         if bucket_count != ns.cache_tier_config.bucket_count {
             return Err(FsError::common(format!(
@@ -150,20 +152,26 @@ impl NamespaceManager {
 
 fn validate_table_buckets_match_creates(
     table: &BGTable,
-    creates: &[curvine_common::state::BlockGroupInfo],
+    creates: &[BlockGroupInfo],
 ) -> FsResult<()> {
     let created_bg_ids: Vec<BgId> = creates
         .iter()
         .filter(|bg| bg.table_id == table.table_id())
         .map(|bg| bg.bg_id)
         .collect();
-    if table.hash_table().expect("hash table").buckets() != created_bg_ids.as_slice() {
+    if hash_table_of(table)?.buckets() != created_bg_ids.as_slice() {
         return Err(FsError::common(format!(
             "table {} buckets do not match create BG ids",
             table.table_id()
         )));
     }
     Ok(())
+}
+
+fn hash_table_of(table: &BGTable) -> FsResult<&HashBGTable> {
+    table
+        .hash_table()
+        .ok_or_else(|| FsError::common(format!("table {} is not a Hash BGTable", table.table_id())))
 }
 
 fn validate_namespace_info(info: &NamespaceInfo) -> FsResult<()> {
@@ -175,10 +183,12 @@ fn validate_namespace_info(info: &NamespaceInfo) -> FsResult<()> {
     }
     validate_namespace_name(&info.name)?;
     if info.block_size == 0 {
-        return Err(FsError::common("namespace block_size must be > 0"));
+        return Err(FsError::invalid_argument(
+            "namespace block_size must be > 0",
+        ));
     }
     if info.write_buffer_config.is_some() || info.write_buffer_table.is_some() {
-        return Err(FsError::common(
+        return Err(FsError::invalid_argument(
             "write_buffer_config / Capacity BGTable is not supported in phase 1",
         ));
     }
@@ -190,63 +200,71 @@ fn validate_namespace_info(info: &NamespaceInfo) -> FsResult<()> {
     Ok(())
 }
 
+/// A namespace name must be non-empty and contain only `[A-Za-z0-9._-]`.
 fn validate_namespace_name(name: &str) -> FsResult<()> {
-    if name.trim().is_empty() {
-        return Err(FsError::common("namespace name must not be empty"));
-    }
-    if name.trim() != name {
-        return Err(FsError::common(
-            "namespace name must not contain leading or trailing whitespace",
+    if name.is_empty() {
+        return Err(FsError::invalid_argument(
+            "namespace name must not be empty",
         ));
+    }
+    let valid = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !valid {
+        return Err(FsError::invalid_argument(format!(
+            "namespace name '{}' has invalid characters (allowed: A-Za-z0-9._-)",
+            name
+        )));
     }
     Ok(())
 }
 
 fn validate_cache_tier_config(config: &CacheTierConfig) -> FsResult<()> {
     if config.pools.is_empty() {
-        return Err(FsError::common("cache_tier_config.pools must not be empty"));
+        return Err(FsError::invalid_argument(
+            "cache_tier_config.pools must not be empty",
+        ));
     }
     if config.pools.len() > MAX_TABLES_PER_NAMESPACE {
-        return Err(FsError::common(format!(
+        return Err(FsError::invalid_argument(format!(
             "too many cache tiers: {}, max={}",
             config.pools.len(),
             MAX_TABLES_PER_NAMESPACE
         )));
     }
     if config.pools.iter().collect::<HashSet<_>>().len() != config.pools.len() {
-        return Err(FsError::common(
+        return Err(FsError::invalid_argument(
             "cache_tier_config.pools must not contain duplicate pool types",
         ));
     }
     if config.replica_count == 0 {
-        return Err(FsError::common(
+        return Err(FsError::invalid_argument(
             "cache_tier_config.replica_count must be > 0",
         ));
     }
     if config.bucket_count == 0 {
-        return Err(FsError::common(
+        return Err(FsError::invalid_argument(
             "cache_tier_config.bucket_count must be > 0",
         ));
     }
     Ok(())
 }
 
-fn validate_cache_replica_policy(
-    policy: &curvine_common::state::CacheReplicaPolicy,
-    replica_count: u16,
-) -> FsResult<()> {
+fn validate_cache_replica_policy(policy: &CacheReplicaPolicy, replica_count: u16) -> FsResult<()> {
     if policy.min_isr == 0 {
-        return Err(FsError::common("cache_replica_policy.min_isr must be > 0"));
+        return Err(FsError::invalid_argument(
+            "cache_replica_policy.min_isr must be > 0",
+        ));
     }
     if policy.min_isr > replica_count {
-        return Err(FsError::common(format!(
+        return Err(FsError::invalid_argument(format!(
             "cache_replica_policy.min_isr {} must be <= replica_count {}",
             policy.min_isr, replica_count
         )));
     }
     if let CacheAckPolicy::AtLeast(n) = policy.ack_policy {
         if n == 0 || n > replica_count {
-            return Err(FsError::common(format!(
+            return Err(FsError::invalid_argument(format!(
                 "cache_replica_policy.ack_policy AtLeast({}) must be in 1..=replica_count {}",
                 n, replica_count
             )));
