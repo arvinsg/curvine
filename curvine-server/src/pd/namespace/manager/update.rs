@@ -97,18 +97,17 @@ impl NamespaceManager {
             }
         };
 
-        let namespace_ops = vec![self.store.namespace_put_op(&updated)?];
-        let outcome = self.bgtable_manager.apply_namespace_policy_update(
-            updated.id,
-            &updated.cache_replica_policy,
-            namespace_ops,
-        )?;
-        if !matches!(outcome, ApplyOutcome::Applied | ApplyOutcome::SkippedNoop) {
-            return Ok(outcome);
-        }
+        let plan = self
+            .bgtable_manager
+            .plan_namespace_policy_update(updated.id, &updated.cache_replica_policy)?;
 
+        let mut ops = vec![self.store.namespace_put_op(&updated)?];
+        ops.extend(plan.ops.iter().cloned());
+        self.store.commit_batch(ops)?;
+
+        self.bgtable_manager.commit_namespace_policy_update(plan);
         index.insert(updated);
-        Ok(outcome)
+        Ok(ApplyOutcome::Applied)
     }
 
     #[cfg(test)]

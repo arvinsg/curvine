@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::NamespaceStore;
-use crate::pd::bgtable::{BGTable, BGTableManager};
+use crate::pd::bgtable::{BGTable, BGTableManager, TablePlanResult};
 use crate::pd::journal::entry::{NamespaceCreateEntry, NamespaceUpdateEntry};
 use crate::pd::journal::{self, ApplyOutcome, PdEntry};
 use crate::pd::store::{KvStore, KvWrite};

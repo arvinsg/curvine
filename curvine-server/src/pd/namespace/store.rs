@@ -57,6 +57,11 @@ impl NamespaceStore {
         Ok(self.put_op(NEXT_NAMESPACE_ID_KEY.to_vec(), Serde::serialize(&next_id)?))
     }
 
+    /// Atomically commit a batch of KvWrites.
+    pub fn commit_batch(&self, ops: Vec<KvWrite>) -> CommonResult<()> {
+        self.store.write_batch(ops)
+    }
+
     pub fn get_namespace(&self, id: NamespaceId) -> CommonResult<Option<NamespaceInfo>> {
         let key = Self::namespace_key(id);
         match self.store.get(NS, &key)? {

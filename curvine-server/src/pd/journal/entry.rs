@@ -174,15 +174,11 @@ pub struct NamespaceCreateEntry {
     pub next_namespace_id: NamespaceId,
 }
 
-/// Namespace update entry: a field-level patch applied under a per-record
-/// version CAS. Only the patch delta is carried (not a full NamespaceInfo); the
-/// apply side reads the current record and applies the patch, which is
-/// deterministic because apply is serialized and replay always starts from the
-/// snapshot baseline. `op_ms` is the authoritative update timestamp — apply must
-/// use it rather than a local clock so replicas stay identical.
+/// Namespace update entry.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct NamespaceUpdateEntry {
     pub op_ms: u64,
+
     pub expected_version: u64,
     pub patch: UpdateNamespaceRequest,
 }

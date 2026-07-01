@@ -119,18 +119,21 @@ impl NamespaceManager {
             return Ok(outcome);
         }
 
-        let namespace_ops = self.namespace_kv_writes(entry)?;
-        let outcome = self.bgtable_manager.apply_namespace_bg_create(
-            &entry.tables,
-            &entry.bgs,
-            namespace_ops,
-        )?;
-        if !matches!(outcome, ApplyOutcome::Applied | ApplyOutcome::SkippedNoop) {
-            return Ok(outcome);
-        }
+        let plan = match self
+            .bgtable_manager
+            .plan_namespace_bg_create(&entry.tables, &entry.bgs)?
+        {
+            TablePlanResult::Applied(plan) => plan,
+            TablePlanResult::Outcome(outcome) => return Ok(outcome),
+        };
 
+        let mut ops = self.namespace_kv_writes(entry)?;
+        ops.extend(plan.ops.iter().cloned());
+        self.store.commit_batch(ops)?;
+
+        self.bgtable_manager.commit_namespace_bg_create(plan);
         index.insert(entry.namespace.clone());
-        Ok(outcome)
+        Ok(ApplyOutcome::Applied)
     }
 
     /// KvWrites for the namespace's own metadata (next-id counter + info),
