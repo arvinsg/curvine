@@ -13,13 +13,14 @@
 // limitations under the License.
 
 use super::NamespaceStore;
-use crate::pd::bgtable::BGTableManager;
+use crate::pd::bgtable::{BGTable, BGTableManager};
 use crate::pd::journal::entry::NamespaceCreateEntry;
 use crate::pd::journal::{self, ApplyOutcome, PdEntry};
 use crate::pd::store::{KvStore, KvWrite};
 use curvine_common::state::{
-    make_table_id, BgId, CacheAckPolicy, CacheTierConfig, CreateNamespaceRequest, NamespaceId,
-    NamespaceInfo, INVALID_NAMESPACE_ID, MAX_NAMESPACE_ID, MAX_TABLES_PER_NAMESPACE,
+    make_table_id, BgId, BlockGroupInfo, CacheAckPolicy, CacheTierConfig, CreateNamespaceRequest,
+    NamespaceId, NamespaceInfo, TableId, INVALID_NAMESPACE_ID, MAX_NAMESPACE_ID,
+    MAX_TABLES_PER_NAMESPACE,
 };
 use curvine_common::utils::SerdeUtils as Serde;
 use curvine_common::{FsError, FsResult};
