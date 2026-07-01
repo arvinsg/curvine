@@ -65,6 +65,7 @@ pub struct HashBGTableSummary {
     pub table_id: TableId,
     pub epoch: u64,
     pub cache_replica_policy: CacheReplicaPolicy,
+    /// Dense bucket route views. The index must match the Hash BGTable bucket index.
     pub buckets: Vec<BlockGroupRouteView>,
 }
 

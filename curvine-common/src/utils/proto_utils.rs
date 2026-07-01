@@ -1816,7 +1816,7 @@ impl ProtoUtils {
 
     pub fn cache_read_policy_to_pb(policy: &CacheReadPolicy) -> i32 {
         match policy {
-            CacheReadPolicy::LocalFirst => CacheReadPolicyProto::LocalFirst as i32,
+            CacheReadPolicy::Nearest => CacheReadPolicyProto::Nearest as i32,
             CacheReadPolicy::PrimaryFirst => CacheReadPolicyProto::PrimaryFirst as i32,
             CacheReadPolicy::Random => CacheReadPolicyProto::Random as i32,
         }
@@ -1824,7 +1824,7 @@ impl ProtoUtils {
 
     pub fn cache_read_policy_from_pb(policy: i32) -> FsResult<CacheReadPolicy> {
         match policy {
-            x if x == CacheReadPolicyProto::LocalFirst as i32 => Ok(CacheReadPolicy::LocalFirst),
+            x if x == CacheReadPolicyProto::Nearest as i32 => Ok(CacheReadPolicy::Nearest),
             x if x == CacheReadPolicyProto::PrimaryFirst as i32 => {
                 Ok(CacheReadPolicy::PrimaryFirst)
             }
