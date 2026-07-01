@@ -116,16 +116,18 @@ fn apply_create_namespace_outcome_cases() {
 }
 
 #[test]
-fn create_namespace_does_not_publish_namespace_when_bg_metadata_rejects() {
+fn apply_rejects_malformed_committed_entry_without_publishing() {
     let (ns_manager, bg_manager, bgtable_manager) = test_managers();
     let mut entry = ns_manager
         .test_build_create_entry(request("ns1"), 1, 1)
         .unwrap();
     entry.bgs[1].bg_id = entry.bgs[0].bg_id;
 
-    let result = ns_manager.apply_create_namespace(&entry, true);
+    // A malformed committed entry must not abort the apply loop: it is rejected
+    // as a stale outcome, and nothing is published.
+    let outcome = ns_manager.apply_create_namespace(&entry, true).unwrap();
 
-    assert!(result.is_err());
+    assert!(matches!(outcome, ApplyOutcome::SkippedStale { .. }));
     assert!(ns_manager.get_namespace_by_name("ns1").is_none());
     assert!(bgtable_manager
         .get_table(entry.namespace.cache_tier_tables[0])

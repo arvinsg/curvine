@@ -63,6 +63,7 @@ pub enum ErrorKind {
     StaleEntry = 26,
     NotFound = 27,
     InvalidArgument = 28,
+    AlreadyExists = 29,
 
     #[num_enum(default)]
     Common = 10000,
@@ -183,6 +184,11 @@ pub enum FsError {
     #[error("{0}")]
     InvalidArgument(ErrorImpl<StringError>),
 
+    // Target object (namespace/pool/etc.) already exists. Generic counterpart to
+    // the file-specific FileAlreadyExists.
+    #[error("{0}")]
+    AlreadyExists(ErrorImpl<StringError>),
+
     // Other errors that are not defined.
     #[error("{0}")]
     Common(ErrorImpl<StringError>),
@@ -266,6 +272,12 @@ impl FsError {
         Self::InvalidArgument(ErrorImpl::with_source(msg.into().into()))
     }
 
+    /// Construct a generic already-exists error (for non-file objects like
+    /// namespaces, pools, mounts).
+    pub fn already_exists(msg: impl Into<String>) -> Self {
+        Self::AlreadyExists(ErrorImpl::with_source(msg.into().into()))
+    }
+
     pub fn file_exists(path: impl AsRef<str>) -> Self {
         let msg = format!("{}  already exists", path.as_ref());
         Self::FileAlreadyExists(ErrorImpl::with_source(msg.into()))
@@ -338,6 +350,7 @@ impl FsError {
             FsError::StaleEntry(_) => ErrorKind::StaleEntry,
             FsError::NotFound(_) => ErrorKind::NotFound,
             FsError::InvalidArgument(_) => ErrorKind::InvalidArgument,
+            FsError::AlreadyExists(_) => ErrorKind::AlreadyExists,
             FsError::Common(_) => ErrorKind::Common,
         }
     }
@@ -457,6 +470,7 @@ impl ErrorExt for FsError {
             FsError::StaleEntry(e) => FsError::StaleEntry(e.ctx(ctx)),
             FsError::NotFound(e) => FsError::NotFound(e.ctx(ctx)),
             FsError::InvalidArgument(e) => FsError::InvalidArgument(e.ctx(ctx)),
+            FsError::AlreadyExists(e) => FsError::AlreadyExists(e.ctx(ctx)),
             FsError::Common(e) => FsError::Common(e.ctx(ctx)),
         }
     }
@@ -491,6 +505,7 @@ impl ErrorExt for FsError {
             FsError::StaleEntry(e) => e.encode(ErrorKind::StaleEntry),
             FsError::NotFound(e) => e.encode(ErrorKind::NotFound),
             FsError::InvalidArgument(e) => e.encode(ErrorKind::InvalidArgument),
+            FsError::AlreadyExists(e) => e.encode(ErrorKind::AlreadyExists),
             FsError::Common(e) => e.encode(ErrorKind::Common),
         }
     }
@@ -528,6 +543,7 @@ impl ErrorExt for FsError {
             ErrorKind::StaleEntry => FsError::StaleEntry(de.into_string()),
             ErrorKind::NotFound => FsError::NotFound(de.into_string()),
             ErrorKind::InvalidArgument => FsError::InvalidArgument(de.into_string()),
+            ErrorKind::AlreadyExists => FsError::AlreadyExists(de.into_string()),
             ErrorKind::Common => FsError::Common(de.into_string()),
         }
     }
