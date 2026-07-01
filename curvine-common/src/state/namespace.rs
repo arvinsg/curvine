@@ -18,44 +18,52 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub type NamespaceId = u16;
-// TODO
-pub const TABLE_SLOT_BITS: u16 = 4;
-pub const TABLE_SLOT_MASK: u16 = 0x000f;
-pub const MAX_NAMESPACE_ID: NamespaceId = 0x0fff;
-pub const INVALID_NAMESPACE_ID: NamespaceId = 0;
-pub const INVALID_TABLE_ID: TableId = 0;
-pub const MAX_CACHE_TIER_TABLES: usize = 15;
-pub const WRITE_BUFFER_TABLE_SLOT: u8 = 0x0f;
 
-// TODO
+// A `TableId` (u16) packs the owning namespace and the table's index within
+// that namespace:
+//
+//   15                    4 3          0
+//  ┌───────────────────────┬────────────┐
+//  │     namespace_id      │ table_index│
+//  └───────────────────────┴────────────┘
+//
+// table_index is 4 bits, so a namespace can hold up to 16 tables (indices
+// 0..=15). Any index may be used freely; the caller decides which tables are
+// cache tiers and which is the write buffer.
+pub const TABLE_INDEX_BITS: u16 = 4;
+pub const TABLE_INDEX_MASK: u16 = (1 << TABLE_INDEX_BITS) - 1;
+pub const MAX_TABLES_PER_NAMESPACE: usize = 1 << TABLE_INDEX_BITS;
+
+pub const INVALID_NAMESPACE_ID: NamespaceId = 0;
+pub const MAX_NAMESPACE_ID: NamespaceId = (1 << (16 - TABLE_INDEX_BITS)) - 1;
+
 #[inline]
-pub fn make_table_id(namespace_id: NamespaceId, table_slot: u8) -> FsResult<TableId> {
+pub fn make_table_id(namespace_id: NamespaceId, table_index: u8) -> FsResult<TableId> {
     if namespace_id == INVALID_NAMESPACE_ID || namespace_id > MAX_NAMESPACE_ID {
         return Err(FsError::common(format!(
             "namespace_id out of range: {}",
             namespace_id
         )));
     }
-    if table_slot > TABLE_SLOT_MASK as u8 {
+    if table_index as usize >= MAX_TABLES_PER_NAMESPACE {
         return Err(FsError::common(format!(
-            "table_slot out of range: {}",
-            table_slot
+            "table_index out of range: {} (valid 0..{})",
+            table_index, MAX_TABLES_PER_NAMESPACE
         )));
     }
-    Ok((namespace_id << TABLE_SLOT_BITS) | table_slot as TableId)
+    Ok((namespace_id << TABLE_INDEX_BITS) | table_index as TableId)
 }
 
 #[inline]
-pub fn namespace_id_from_table_id(table_id: TableId) -> NamespaceId {
-    table_id >> TABLE_SLOT_BITS
+pub fn namespace_id_of(table_id: TableId) -> NamespaceId {
+    table_id >> TABLE_INDEX_BITS
 }
 
 #[inline]
-pub fn table_slot_from_table_id(table_id: TableId) -> u8 {
-    (table_id & TABLE_SLOT_MASK) as u8
+pub fn table_index_of(table_id: TableId) -> u8 {
+    (table_id & TABLE_INDEX_MASK) as u8
 }
 
-// TODO
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LabelMatch {
     pub key: String,
@@ -185,13 +193,19 @@ mod tests {
     #[test]
     fn table_id_round_trip() {
         let table_id = make_table_id(0x0123, 0x0a).unwrap();
-        assert_eq!(namespace_id_from_table_id(table_id), 0x0123);
-        assert_eq!(table_slot_from_table_id(table_id), 0x0a);
+        assert_eq!(namespace_id_of(table_id), 0x0123);
+        assert_eq!(table_index_of(table_id), 0x0a);
     }
 
     #[test]
     fn table_id_rejects_invalid_namespace() {
         assert!(make_table_id(0, 0).is_err());
         assert!(make_table_id(MAX_NAMESPACE_ID + 1, 0).is_err());
+    }
+
+    #[test]
+    fn table_id_rejects_out_of_range_index() {
+        assert!(make_table_id(1, MAX_TABLES_PER_NAMESPACE as u8).is_err());
+        assert!(make_table_id(1, (MAX_TABLES_PER_NAMESPACE - 1) as u8).is_ok());
     }
 }
