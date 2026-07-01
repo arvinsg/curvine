@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod error;
 pub mod http_handler;
 mod manager;
 mod store;
 
+pub use error::NamespaceError;
 pub use manager::NamespaceManager;
 pub use store::NamespaceStore;
