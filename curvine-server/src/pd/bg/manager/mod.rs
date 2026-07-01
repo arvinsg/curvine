@@ -98,23 +98,6 @@ impl BGManager {
         Ok((hash_bgs, capacity_bgs))
     }
 
-    pub(crate) fn restore_all_bgs(&self, bgs: HashMap<BgId, Arc<BlockGroupInfo>>) {
-        let mut hash_bgs = HashMap::new();
-        let mut capacity_bgs = HashMap::new();
-        for (bg_id, bg) in bgs {
-            match bg.kind {
-                BGKind::Hash => {
-                    hash_bgs.insert(bg_id, bg);
-                }
-                BGKind::Capacity => {
-                    capacity_bgs.insert(bg_id, bg);
-                }
-            }
-        }
-        self.hash.restore_bgs(hash_bgs);
-        self.capacity.restore_bgs(capacity_bgs);
-    }
-
     pub(crate) fn ensure_next_id_at_least(&self, floor: BgId) -> FsResult<Option<(BgId, BgId)>> {
         self.id_allocator.ensure_next_id_at_least(floor)
     }
