@@ -30,6 +30,27 @@ impl NamespaceManager {
         Ok(())
     }
 
+    /// Validate a patched namespace before proposing an update.
+    pub(super) fn validate_update_result(
+        &self,
+        current: &NamespaceInfo,
+        updated: &NamespaceInfo,
+    ) -> FsResult<()> {
+        validate_namespace_info(updated)?;
+        if updated.id != current.id
+            || updated.name != current.name
+            || updated.cache_tier_config != current.cache_tier_config
+            || updated.cache_tier_tables != current.cache_tier_tables
+            || updated.write_buffer_table != current.write_buffer_table
+            || updated.create_time_ms != current.create_time_ms
+        {
+            return Err(FsError::invalid_argument(
+                "namespace update may only change mutable metadata (block_size, ttl, cache_replica_policy, properties)",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_namespace_id_cas(&self, entry: &NamespaceCreateEntry) -> FsResult<()> {
         if entry.expected_next_namespace_id != entry.namespace.id {
             return Err(FsError::common(format!(
@@ -174,7 +195,7 @@ fn hash_table_of(table: &BGTable) -> FsResult<&HashBGTable> {
         .ok_or_else(|| FsError::common(format!("table {} is not a Hash BGTable", table.table_id())))
 }
 
-fn validate_namespace_info(info: &NamespaceInfo) -> FsResult<()> {
+pub(super) fn validate_namespace_info(info: &NamespaceInfo) -> FsResult<()> {
     if info.id == INVALID_NAMESPACE_ID || info.id > MAX_NAMESPACE_ID {
         return Err(FsError::common(format!(
             "namespace_id out of range: {}",

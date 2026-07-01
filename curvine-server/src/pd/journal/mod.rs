@@ -22,6 +22,6 @@ pub use apply_outcome::ApplyOutcome;
 pub use client::Client;
 pub use entry::{
     BGBatchUpdateEntry, BGDeleteEntry, BGEntry, BGIdAllocatorEntry, BGUpdateEntry, ConfigEntry,
-    MountAddEntry, MountEntry, MountUpdateEntry, NamespaceCreateEntry, PathRouteAddEntry,
-    PathRouteRemoveEntry, PdEntry, RegisterNodeEntry, UnMountEntry,
+    MountAddEntry, MountEntry, MountUpdateEntry, NamespaceCreateEntry, NamespaceUpdateEntry,
+    PathRouteAddEntry, PathRouteRemoveEntry, PdEntry, RegisterNodeEntry, UnMountEntry,
 };

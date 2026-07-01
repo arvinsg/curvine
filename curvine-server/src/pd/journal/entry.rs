@@ -15,7 +15,7 @@
 use crate::pd::bgtable::BGTable;
 use curvine_common::state::{
     BGPrimary, BgId, BlockGroupInfo, ConfigInfo, MountInfo, NamespaceId, NamespaceInfo, NodeInfo,
-    NodeState, PathRouteEntry, PeerInfo, RwPolicy,
+    NodeState, PathRouteEntry, PeerInfo, RwPolicy, UpdateNamespaceRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -174,6 +174,19 @@ pub struct NamespaceCreateEntry {
     pub next_namespace_id: NamespaceId,
 }
 
+/// Namespace update entry: a field-level patch applied under a per-record
+/// version CAS. Only the patch delta is carried (not a full NamespaceInfo); the
+/// apply side reads the current record and applies the patch, which is
+/// deterministic because apply is serialized and replay always starts from the
+/// snapshot baseline. `op_ms` is the authoritative update timestamp — apply must
+/// use it rather than a local clock so replicas stay identical.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct NamespaceUpdateEntry {
+    pub op_ms: u64,
+    pub expected_version: u64,
+    pub patch: UpdateNamespaceRequest,
+}
+
 /// Add or update one static MetaRoute path rule with table-version CAS.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct PathRouteAddEntry {
@@ -206,6 +219,7 @@ pub enum PdEntry {
 
     // Namespace management
     CreateNamespace(NamespaceCreateEntry),
+    UpdateNamespace(NamespaceUpdateEntry),
 
     // BG management
     AllocateBGId(BGIdAllocatorEntry),
@@ -232,6 +246,7 @@ impl PdEntry {
             PdEntry::UpdateNodePayload(_) => "update_node_payload",
             PdEntry::RemoveNode(_) => "remove_node",
             PdEntry::CreateNamespace(_) => "create_namespace",
+            PdEntry::UpdateNamespace(_) => "update_namespace",
             PdEntry::AllocateBGId(_) => "allocate_bg_id",
             PdEntry::CreateBG(_) => "create_bg",
             PdEntry::UpdateBG(_) => "update_bg",

@@ -249,7 +249,10 @@ fn hash_tier_bg_count(request: &CreateNamespaceRequest) -> FsResult<u64> {
         .ok_or_else(|| FsError::common("namespace BG count overflow"))
 }
 
-fn apply_outcome_to_result(outcome: ApplyOutcome, namespace_id: NamespaceId) -> FsResult<()> {
+pub(super) fn apply_outcome_to_result(
+    outcome: ApplyOutcome,
+    namespace_id: NamespaceId,
+) -> FsResult<()> {
     match outcome {
         ApplyOutcome::Applied | ApplyOutcome::SkippedNoop => Ok(()),
         ApplyOutcome::SkippedStale { reason } => Err(FsError::stale_entry(

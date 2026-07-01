@@ -186,6 +186,21 @@ impl CreateNamespaceRequest {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateNamespaceRequest {
+    pub id: NamespaceId,
+    #[serde(default)]
+    pub block_size: Option<u32>,
+    #[serde(default)]
+    pub default_ttl_ms: Option<Option<u64>>,
+    #[serde(default)]
+    pub ttl_action: Option<TtlAction>,
+    #[serde(default)]
+    pub cache_replica_policy: Option<CacheReplicaPolicy>,
+    #[serde(default)]
+    pub properties: Option<HashMap<String, String>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

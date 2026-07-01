@@ -144,6 +144,13 @@ impl PdAppStorage {
                     .namespace_manager
                     .apply_create_namespace(&entry, is_leader)?;
             }
+            PdEntry::UpdateNamespace(entry) => {
+                info!(
+                    "Apply UpdateNamespace id={}, expected_version={}",
+                    entry.patch.id, entry.expected_version
+                );
+                let _ = self.namespace_manager.apply_update_namespace(&entry)?;
+            }
             PdEntry::AllocateBGId(entry) => {
                 info!(
                     "Apply AllocateBGId expected_next={}, next={}",

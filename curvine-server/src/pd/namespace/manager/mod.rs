@@ -14,7 +14,7 @@
 
 use super::NamespaceStore;
 use crate::pd::bgtable::{BGTable, BGTableManager};
-use crate::pd::journal::entry::NamespaceCreateEntry;
+use crate::pd::journal::entry::{NamespaceCreateEntry, NamespaceUpdateEntry};
 use crate::pd::journal::{self, ApplyOutcome, PdEntry};
 use crate::pd::store::{KvStore, KvWrite};
 use curvine_common::state::{
@@ -31,6 +31,7 @@ use std::sync::{Arc, RwLock};
 mod create;
 #[cfg(test)]
 mod tests;
+mod update;
 mod validate;
 
 #[derive(Default)]

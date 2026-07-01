@@ -17,7 +17,10 @@ use crate::pd::http_handler::PdHttpHandler;
 use crate::pd::namespace::{NamespaceError, NamespaceManager};
 use axum::{extract::Query, http::StatusCode, response::IntoResponse, Extension, Json};
 use curvine_common::error::FsError;
-use curvine_common::state::{CreateNamespaceRequest, NamespaceId, NamespaceInfo};
+use curvine_common::state::{
+    CreateNamespaceRequest, NamespaceId, NamespaceInfo, UpdateNamespaceRequest,
+};
+use curvine_common::FsResult;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -27,20 +30,11 @@ pub struct NamespaceQueryParams {
     pub name: Option<String>,
 }
 
-/// POST /api/v1/namespace — create a namespace and return the created info.
-pub async fn create_namespace_handler(
-    Extension(instance): Extension<Arc<PdHttpHandler>>,
-    Json(request): Json<CreateNamespaceRequest>,
-) -> impl IntoResponse {
-    let name = request.name.clone();
-    let manager = &instance.namespace_manager;
-    let result = manager.create_namespace(request).and_then(|()| {
-        manager.get_namespace_by_name(&name).ok_or_else(|| {
-            FsError::common(format!("namespace {} created but not found", name))
-        })
-    });
+/// Turn a namespace `FsResult<NamespaceInfo>` into an API response, mapping
+/// errors through `NamespaceError` for a stable code + HTTP status.
+fn namespace_response(result: FsResult<NamespaceInfo>) -> ApiResponse<NamespaceInfo> {
     match result {
-        Ok(namespace) => ApiResponse::success((*namespace).clone()),
+        Ok(namespace) => ApiResponse::success(namespace),
         Err(e) => {
             let err = NamespaceError::from_fs_error(e);
             ApiResponse::<NamespaceInfo>::error(
@@ -52,7 +46,39 @@ pub async fn create_namespace_handler(
     }
 }
 
-/// GET /api/v1/namespace — query by `?id=`, `?name=`, or list all when neither is set.
+/// POST /api/v1/namespace — create a namespace and return the created info.
+pub async fn create_namespace_handler(
+    Extension(instance): Extension<Arc<PdHttpHandler>>,
+    Json(request): Json<CreateNamespaceRequest>,
+) -> impl IntoResponse {
+    let name = request.name.clone();
+    let manager = &instance.namespace_manager;
+    let result = manager.create_namespace(request).and_then(|()| {
+        manager
+            .get_namespace_by_name(&name)
+            .map(|ns| (*ns).clone())
+            .ok_or_else(|| FsError::common(format!("namespace {} created but not found", name)))
+    });
+    namespace_response(result)
+}
+
+/// PUT /api/v1/namespace — apply a field-level patch and return the updated info.
+pub async fn update_namespace_handler(
+    Extension(instance): Extension<Arc<PdHttpHandler>>,
+    Json(request): Json<UpdateNamespaceRequest>,
+) -> impl IntoResponse {
+    let id = request.id;
+    let manager = &instance.namespace_manager;
+    let result = manager.update_namespace(request).and_then(|()| {
+        manager
+            .get_namespace(id)
+            .map(|ns| (*ns).clone())
+            .ok_or_else(|| FsError::common(format!("namespace {} updated but not found", id)))
+    });
+    namespace_response(result)
+}
+
+/// GET /api/v1/namespace — query by `id or name`, or list all when neither is set.
 pub async fn list_or_get_namespace_handler(
     Extension(instance): Extension<Arc<PdHttpHandler>>,
     Query(params): Query<NamespaceQueryParams>,
