@@ -13,14 +13,13 @@
 // limitations under the License.
 
 use super::NamespaceStore;
-use crate::pd::bg::BGManager;
 use crate::pd::bgtable::BGTableManager;
 use crate::pd::journal::entry::NamespaceCreateEntry;
 use crate::pd::journal::{self, ApplyOutcome, PdEntry};
 use crate::pd::store::{KvStore, KvWrite};
 use curvine_common::state::{
     make_table_id, BgId, CacheAckPolicy, CacheTierConfig, CreateNamespaceRequest, NamespaceId,
-    NamespaceInfo, TableId, INVALID_NAMESPACE_ID, MAX_TABLES_PER_NAMESPACE, MAX_NAMESPACE_ID,
+    NamespaceInfo, INVALID_NAMESPACE_ID, MAX_NAMESPACE_ID, MAX_TABLES_PER_NAMESPACE,
 };
 use curvine_common::utils::SerdeUtils as Serde;
 use curvine_common::{FsError, FsResult};
@@ -29,7 +28,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 mod create;
-mod restore;
 #[cfg(test)]
 mod tests;
 mod validate;
@@ -73,7 +71,6 @@ impl NamespaceIndex {
 }
 
 pub struct NamespaceManager {
-    bg_manager: Arc<BGManager>,
     index: RwLock<NamespaceIndex>,
     bgtable_manager: Arc<BGTableManager>,
     journal_client: Arc<journal::Client>,
@@ -83,13 +80,11 @@ pub struct NamespaceManager {
 impl NamespaceManager {
     pub fn new(
         store: Arc<dyn KvStore>,
-        bg_manager: Arc<BGManager>,
         bgtable_manager: Arc<BGTableManager>,
         journal_client: Arc<journal::Client>,
     ) -> Self {
         Self {
             store: Arc::new(NamespaceStore::new(store)),
-            bg_manager,
             bgtable_manager,
             journal_client,
             index: RwLock::new(NamespaceIndex::default()),
@@ -108,46 +103,38 @@ impl NamespaceManager {
         self.index.read().unwrap().list()
     }
 
-    /// Test-only: build a NamespaceManager with cheap in-memory dependencies.
-    /// Lets other modules (e.g. mount) get a real resolver without standing up
-    /// the full BGManager / scheduler stack themselves.
+    pub fn restore(&self) -> FsResult<()> {
+        let namespaces = self.store.list_namespaces()?;
+        let max_namespace_id = namespaces
+            .iter()
+            .map(|ns| ns.id)
+            .max()
+            .unwrap_or(INVALID_NAMESPACE_ID);
+
+        self.heal_next_id(max_namespace_id)?;
+        *self.index.write().unwrap() = NamespaceIndex::from_namespaces(namespaces);
+        Ok(())
+    }
+
+    fn heal_next_id(&self, max_namespace_id: NamespaceId) -> FsResult<()> {
+        let floor = max_namespace_id.saturating_add(1).max(1);
+        let current = self.store.get_next_namespace_id()?;
+        if current < floor {
+            log::warn!(
+                "namespace restore self-heal: repair next_namespace_id from {} to {}",
+                current,
+                floor
+            );
+            self.store.set_next_namespace_id(floor)?;
+        }
+        Ok(())
+    }
+
+    /// Test-only: build a NamespaceManager on cheap in-memory dependencies,
     #[cfg(test)]
     pub fn new_for_test() -> Arc<Self> {
-        use crate::pd::bg::BGStore;
-        use crate::pd::config::ConfigManager;
-        use crate::pd::node::{NodeManager, NodeStore};
-        use crate::pd::pool::PoolManager;
-        use crate::pd::store::memory_kv_engine::MemoryKvEngine;
-        use curvine_common::conf::JournalConf;
-        use curvine_common::raft::RaftClient;
-
-        let store: Arc<dyn KvStore> = Arc::new(MemoryKvEngine::new());
-        let journal_conf = JournalConf::default();
-        let raft = RaftClient::from_conf(journal_conf.create_runtime(), &journal_conf);
-        let jc = Arc::new(journal::Client::new(raft));
-        let config_manager = Arc::new(ConfigManager::new(
-            Arc::new(MemoryKvEngine::new()),
-            jc.clone(),
-            HashMap::new(),
-        ));
-        let node_store = Arc::new(NodeStore::new(Arc::new(MemoryKvEngine::new())));
-        let node_manager = Arc::new(NodeManager::new(
-            node_store,
-            config_manager.clone(),
-            jc.clone(),
-        ));
-        let pool_manager = Arc::new(PoolManager::new(node_manager));
-        let bg_store = Arc::new(BGStore::new(store.clone()));
-        let bg_manager = Arc::new(BGManager::new(bg_store, jc.clone()));
-        let table_store = Arc::new(crate::pd::bgtable::BGTableStore::new(store.clone()));
-        let bgtable_manager = Arc::new(crate::pd::bgtable::BGTableManager::new(
-            table_store,
-            bg_manager.clone(),
-            pool_manager,
-            config_manager,
-            vec![],
-        ));
-        Arc::new(Self::new(store, bg_manager, bgtable_manager, jc))
+        let (bgtable_manager, store, jc) = BGTableManager::new_for_test();
+        Arc::new(Self::new(store, bgtable_manager, jc))
     }
 
     /// Test-only: insert a namespace directly into the in-memory index, bypassing Raft propose.
