@@ -20,6 +20,7 @@ use curvine_common::state::{
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+// TODO
 #[derive(Default)]
 pub struct CapacityBGTableController {
     tables: RwLock<HashMap<TableId, Arc<CapacityBGTable>>>,
@@ -79,7 +80,7 @@ impl CapacityBGTableController {
             .insert(table.base.table_id, Arc::new(table));
     }
 
-    pub fn remove_table(&self, table_id: TableId) {
+    pub fn remove_table_runtime(&self, table_id: TableId) {
         self.tables.write().unwrap().remove(&table_id);
     }
 
@@ -120,11 +121,14 @@ impl CapacityBGTableController {
     pub fn update_table_stats(&self, table_id: TableId, stats: BGTableStats) {
         let mut tables = self.tables.write().unwrap();
         if let Some(table) = tables.get_mut(&table_id) {
-            Arc::make_mut(table).base.stats = stats;
+            Arc::make_mut(table).update_stats(stats);
         }
     }
 
-    pub fn rebuild_indexes(table: &mut CapacityBGTable, bgs: &HashMap<BgId, Arc<BlockGroupInfo>>) {
+    pub fn rebuild_runtime_indexes(
+        table: &mut CapacityBGTable,
+        bgs: &HashMap<BgId, Arc<BlockGroupInfo>>,
+    ) {
         table.active_bgs.clear();
         for bg in bgs.values() {
             if bg.table_id == table.base.table_id {
