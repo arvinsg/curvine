@@ -25,9 +25,7 @@ fn restore_reloads_committed_namespace_state() {
 
     // Restore reloads from the KV store: committed state is unchanged and the
     // BG id floor is healed to max(bg_id)+1.
-    bgtable_manager
-        .restore(&bg_manager.snapshot_all_bgs())
-        .unwrap();
+    bgtable_manager.restore().unwrap();
     ns_manager.restore().unwrap();
 
     assert!(ns_manager.get_namespace_by_name("ns1").is_some());

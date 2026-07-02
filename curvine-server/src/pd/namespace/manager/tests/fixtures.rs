@@ -80,7 +80,6 @@ pub fn test_managers() -> (
 
     let bg_store = Arc::new(BGStore::new(store.clone()));
     let bg_manager = Arc::new(BGManager::new(bg_store, jc.clone()));
-    bg_manager.restore().unwrap();
     let table_store = Arc::new(crate::pd::bgtable::BGTableStore::new(store.clone()));
     let bgtable_manager = Arc::new(crate::pd::bgtable::BGTableManager::new(
         table_store,
@@ -89,9 +88,7 @@ pub fn test_managers() -> (
         config_manager,
         vec![],
     ));
-    bgtable_manager
-        .restore(&bg_manager.snapshot_all_bgs())
-        .unwrap();
+    bgtable_manager.restore().unwrap();
     let ns_manager = Arc::new(NamespaceManager::new(
         store,
         bgtable_manager.clone(),

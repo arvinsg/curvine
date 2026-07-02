@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::pd::bg::BGManager;
 use crate::pd::bgtable::BGTableManager;
 use crate::pd::config::ConfigManager;
 use crate::pd::journal::entry::PdEntry;
@@ -39,7 +38,6 @@ pub struct PdAppStorage {
     mount_manager: Arc<MountManager>,
     node_manager: Arc<NodeManager>,
     pool_manager: Arc<PoolManager>,
-    bg_manager: Arc<BGManager>,
     bgtable_manager: Arc<BGTableManager>,
     namespace_manager: Arc<NamespaceManager>,
     metaroute_manager: Arc<MetaRouteManager>,
@@ -53,7 +51,6 @@ impl PdAppStorage {
         mount_manager: Arc<MountManager>,
         node_manager: Arc<NodeManager>,
         pool_manager: Arc<PoolManager>,
-        bg_manager: Arc<BGManager>,
         bgtable_manager: Arc<BGTableManager>,
         namespace_manager: Arc<NamespaceManager>,
         metaroute_manager: Arc<MetaRouteManager>,
@@ -65,7 +62,6 @@ impl PdAppStorage {
             mount_manager,
             node_manager,
             pool_manager,
-            bg_manager,
             bgtable_manager,
             namespace_manager,
             metaroute_manager,
@@ -156,7 +152,7 @@ impl PdAppStorage {
                     "Apply AllocateBGId expected_next={}, next={}",
                     entry.expected_next_bg_id, entry.next_bg_id
                 );
-                let _ = self.bg_manager.apply_allocate_bg_id(&entry)?;
+                let _ = self.bgtable_manager.apply_allocate_bg_id(&entry)?;
             }
             PdEntry::CreateBG(entry) => {
                 info!("Apply CreateBG bg_id={}", entry.info.bg_id);
@@ -234,10 +230,7 @@ impl AppStorage for PdAppStorage {
         self.config_manager.restore()?;
         self.node_manager.restore()?;
         self.pool_manager.restore()?;
-        self.bg_manager.restore()?;
-        self.bg_manager.reset_replica_states();
-        self.bgtable_manager
-            .restore(&self.bg_manager.snapshot_all_bgs())?;
+        self.bgtable_manager.restore()?;
         self.namespace_manager.restore()?;
         self.mount_manager.restore()?;
         self.metaroute_manager.restore()?;
