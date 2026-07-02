@@ -341,7 +341,7 @@ impl BGTable {
 mod tests {
     use super::*;
     #[test]
-    fn hash_table_exposes_bucket_metadata_without_routing() {
+    fn hash_table_exposes_buckets() {
         let table = BGTable::new_hash_table_with_config(
             1,
             0,
@@ -357,14 +357,14 @@ mod tests {
     }
 
     #[test]
-    fn capacity_table_is_distinct_from_hash_table() {
+    fn capacity_distinct_from_hash() {
         let table = BGTable::new_capacity_table(2, 0, StorageType::Ssd, 3, 16 << 30, 4);
         assert!(table.hash_table().is_none());
         assert!(table.capacity_table().is_some());
     }
 
     #[test]
-    fn capacity_table_tracks_active_bgs_runtime_index() {
+    fn capacity_tracks_active_bgs() {
         let mut table = BGTable::new_capacity_table(7, 0, StorageType::Ssd, 3, 16 << 30, 2);
         if let BGTable::Capacity(t) = &mut table {
             t.active_bgs.push(100);
@@ -421,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_active_bgs_are_runtime_only() {
+    fn capacity_active_bgs_not_persisted() {
         let mut table = BGTable::new_capacity_table(7, 0, StorageType::Ssd, 3, 16 << 30, 2);
         if let BGTable::Capacity(t) = &mut table {
             t.active_bgs.push(100);
@@ -434,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn table_id_returns_base_table_id() {
+    fn table_id_reads_base() {
         let table = BGTable::new_hash_table_with_config(
             11,
             0,

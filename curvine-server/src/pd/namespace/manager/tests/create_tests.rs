@@ -4,7 +4,7 @@ use crate::pd::bgtable::BGTable;
 use curvine_common::state::{make_table_id, CacheTierConfig, StorageType, WriteBufferConfig};
 
 #[test]
-fn create_namespace_materializes_hash_table_and_bgs() {
+fn create_materializes_table_and_bgs() {
     let (ns_manager, bg_manager, bgtable_manager) = test_managers();
     let entry = ns_manager
         .test_build_create_entry(request("ns1"), 1, 1)
@@ -116,7 +116,7 @@ fn apply_create_namespace_outcome_cases() {
 }
 
 #[test]
-fn apply_rejects_malformed_committed_entry_without_publishing() {
+fn apply_rejects_malformed_entry() {
     let (ns_manager, bg_manager, bgtable_manager) = test_managers();
     let mut entry = ns_manager
         .test_build_create_entry(request("ns1"), 1, 1)

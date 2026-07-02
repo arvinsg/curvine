@@ -28,7 +28,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 mod apply;
-pub(crate) use apply::{PrepareCreateResult, PrepareDeleteResult, PrepareUpdateResult};
+pub(crate) use apply::{
+    PrepareCreateResult, PrepareDeleteResult, PrepareUpdateResult, PreparedBGCreate,
+    PreparedBGDelete, PreparedBGUpdate,
+};
 mod capacity_controller;
 mod controller;
 mod hash_controller;

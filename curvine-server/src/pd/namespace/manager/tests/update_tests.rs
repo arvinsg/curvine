@@ -26,7 +26,7 @@ fn patch(id: NamespaceId) -> UpdateNamespaceRequest {
 }
 
 #[test]
-fn update_patches_only_specified_fields_and_bumps_version() {
+fn update_patches_specified_fields() {
     let (ns_manager, _bg, _bgt) = seed_ns1();
     let before = ns_manager.get_namespace(1).unwrap();
 
@@ -54,7 +54,7 @@ fn update_patches_only_specified_fields_and_bumps_version() {
 }
 
 #[test]
-fn update_clears_ttl_with_some_none() {
+fn update_clears_ttl() {
     let (ns_manager, _bg, _bgt) = seed_ns1();
     // First set a TTL, then clear it.
     let set = ns_manager
@@ -77,7 +77,7 @@ fn update_clears_ttl_with_some_none() {
 }
 
 #[test]
-fn update_cache_replica_policy_propagates_to_hash_table_and_bumps_epoch() {
+fn update_policy_propagates_to_tables() {
     let (ns_manager, _bg, bgtable_manager) = seed_ns1();
     let table_id = make_table_id(1, 0).unwrap();
     let epoch_before = bgtable_manager.get_table(table_id).unwrap().epoch();
@@ -105,7 +105,7 @@ fn update_cache_replica_policy_propagates_to_hash_table_and_bumps_epoch() {
 }
 
 #[test]
-fn update_stale_version_is_rejected() {
+fn update_rejects_stale_version() {
     let (ns_manager, _bg, _bgt) = seed_ns1();
     // Build an entry, then advance the record so its expected_version goes stale.
     let stale = ns_manager
@@ -127,7 +127,7 @@ fn update_stale_version_is_rejected() {
 }
 
 #[test]
-fn update_reapply_same_entry_is_stale() {
+fn update_reapply_is_stale() {
     let (ns_manager, _bg, _bgt) = seed_ns1();
     let entry = ns_manager
         .test_build_update_entry(UpdateNamespaceRequest {
@@ -149,7 +149,7 @@ fn update_reapply_same_entry_is_stale() {
 }
 
 #[test]
-fn update_missing_namespace_is_not_found() {
+fn update_missing_is_not_found() {
     let (ns_manager, _bg, _bgt) = test_managers();
     let err = ns_manager
         .test_build_update_entry(patch(999))

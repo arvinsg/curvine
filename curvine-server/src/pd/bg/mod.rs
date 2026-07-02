@@ -19,5 +19,8 @@ mod store;
 
 pub use id_allocator::BgIdAllocator;
 pub use manager::BGManager;
-pub(crate) use manager::{PrepareCreateResult, PrepareDeleteResult, PrepareUpdateResult};
+pub(crate) use manager::{
+    PrepareCreateResult, PrepareDeleteResult, PrepareUpdateResult, PreparedBGCreate,
+    PreparedBGDelete, PreparedBGUpdate,
+};
 pub use store::BGStore;

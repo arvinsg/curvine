@@ -123,8 +123,8 @@ impl NamespaceManager {
             .bgtable_manager
             .plan_namespace_bg_create(&entry.tables, &entry.bgs)?
         {
-            TablePlanResult::Applied(plan) => plan,
-            TablePlanResult::Outcome(outcome) => return Ok(outcome),
+            PrepareTablesResult::Applied(plan) => plan,
+            PrepareTablesResult::Outcome(outcome) => return Ok(outcome),
         };
 
         let mut ops = self.namespace_kv_writes(entry)?;

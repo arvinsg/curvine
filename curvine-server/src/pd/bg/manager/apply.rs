@@ -1,17 +1,17 @@
 use super::*;
 
-pub(crate) struct PreparedBGCreate {
+pub struct PreparedBGCreate {
     pub info: BlockGroupInfo,
     pub op: KvWrite,
 }
 
-pub(crate) struct PreparedBGUpdate {
+pub struct PreparedBGUpdate {
     pub old_info: BlockGroupInfo,
     pub new_info: BlockGroupInfo,
     pub op: KvWrite,
 }
 
-pub(crate) struct PreparedBGDelete {
+pub struct PreparedBGDelete {
     pub old_info: BlockGroupInfo,
     pub op: KvWrite,
 }
