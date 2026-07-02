@@ -75,7 +75,7 @@ impl NamespaceManager {
         for (table_index, pool_type) in request.cache_tier_config.pools.iter().copied().enumerate()
         {
             let table_id = make_table_id(namespace_id, table_index as u8)?;
-            let plan = self.bgtable_manager.build_hash_table_plan(
+            let plan = self.bgtable_manager.hash_placement().build_hash_table_plan(
                 table_id,
                 namespace_id,
                 pool_type,

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::pd::bgtable::table_map::TableEntry;
 use curvine_common::state::{
     BGKind, BgId, CacheReplicaPolicy, LabelMatch, NamespaceId, StorageType, TableId,
 };
@@ -94,6 +95,30 @@ impl CapacityBGTable {
     }
 
     pub fn update_stats(&mut self, stats: BGTableStats) {
+        self.base.update_stats(stats);
+    }
+}
+
+impl TableEntry for HashBGTable {
+    fn table_id(&self) -> TableId {
+        self.base.table_id
+    }
+    fn epoch(&self) -> u64 {
+        self.base.epoch
+    }
+    fn update_stats(&mut self, stats: BGTableStats) {
+        self.base.update_stats(stats);
+    }
+}
+
+impl TableEntry for CapacityBGTable {
+    fn table_id(&self) -> TableId {
+        self.base.table_id
+    }
+    fn epoch(&self) -> u64 {
+        self.base.epoch
+    }
+    fn update_stats(&mut self, stats: BGTableStats) {
         self.base.update_stats(stats);
     }
 }

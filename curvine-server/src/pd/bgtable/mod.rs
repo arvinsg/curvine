@@ -21,7 +21,6 @@ mod table;
 
 pub use capacity::CapacityBGTableController;
 pub use hash::HashBGTableController;
-pub use manager::BGTableManager;
-pub use manager::{BGTableNamespaceReconcileReport, BGTableReconcileReport};
+pub use manager::{BGTableManager, TablePlan, TablePlanResult};
 pub use store::BGTableStore;
 pub use table::{BGTable, BGTableBase, BGTableStats, CapacityBGTable, HashBGTable};
