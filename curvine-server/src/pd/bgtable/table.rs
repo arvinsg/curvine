@@ -12,12 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::pd::bgtable::table_map::TableEntry;
+use crate::pd::bgtable::table_registry::TableEntry;
 use curvine_common::state::{
-    BGKind, BgId, CacheReplicaPolicy, LabelMatch, NamespaceId, StorageType, TableId,
+    BGKind, BGState, BgId, BlockGroupInfo, CacheReplicaPolicy, LabelMatch, NamespaceId,
+    StorageType, TableId,
 };
+use curvine_common::{FsError, FsResult};
 use orpc::common::LocalTime;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Aggregate stats for a BGTable.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -96,6 +100,38 @@ impl CapacityBGTable {
 
     pub fn update_stats(&mut self, stats: BGTableStats) {
         self.base.update_stats(stats);
+    }
+
+    pub fn on_bg_created(&mut self, bg: &BlockGroupInfo) {
+        if Self::is_writable(bg) && !self.active_bgs.contains(&bg.bg_id) {
+            self.active_bgs.push(bg.bg_id);
+        }
+    }
+
+    pub fn on_bg_updated(&mut self, old: &BlockGroupInfo, new: &BlockGroupInfo) {
+        if Self::is_writable(old) {
+            self.active_bgs.retain(|id| *id != old.bg_id);
+        }
+        self.on_bg_created(new);
+    }
+
+    pub fn on_bg_deleted(&mut self, bg: &BlockGroupInfo) {
+        if Self::is_writable(bg) {
+            self.active_bgs.retain(|id| *id != bg.bg_id);
+        }
+    }
+
+    pub fn rebuild_active_index(&mut self, bgs: &HashMap<BgId, Arc<BlockGroupInfo>>) {
+        self.active_bgs.clear();
+        for bg in bgs.values() {
+            if bg.table_id == self.base.table_id {
+                self.on_bg_created(bg);
+            }
+        }
+    }
+
+    fn is_writable(bg: &BlockGroupInfo) -> bool {
+        bg.kind == BGKind::Capacity && bg.state == BGState::Active
     }
 }
 
@@ -193,6 +229,59 @@ impl BGTable {
         }
     }
 
+    pub fn on_bg_created(&mut self, bg: &BlockGroupInfo) {
+        if let BGTable::Capacity(table) = self {
+            table.on_bg_created(bg);
+        }
+    }
+
+    pub fn on_bg_updated(&mut self, old: &BlockGroupInfo, new: &BlockGroupInfo) {
+        if let BGTable::Capacity(table) = self {
+            table.on_bg_updated(old, new);
+        }
+    }
+
+    pub fn on_bg_deleted(&mut self, bg: &BlockGroupInfo) {
+        if let BGTable::Capacity(table) = self {
+            table.on_bg_deleted(bg);
+        }
+    }
+
+    pub fn rebuild_active_index(&mut self, bgs: &HashMap<BgId, Arc<BlockGroupInfo>>) {
+        if let BGTable::Capacity(table) = self {
+            table.rebuild_active_index(bgs);
+        }
+    }
+
+    pub fn bump_epoch(&mut self) {
+        let base = match self {
+            BGTable::Hash(t) => &mut t.base,
+            BGTable::Capacity(t) => &mut t.base,
+        };
+        base.epoch = base.epoch.saturating_add(1);
+        base.update_time_ms = LocalTime::mills();
+    }
+
+    pub fn matches_bg(&self, bg: &BlockGroupInfo) -> FsResult<()> {
+        if bg.table_id != self.table_id() {
+            return Err(FsError::common(format!(
+                "bg {} table mismatch: bg.table_id={}, table_id={}",
+                bg.bg_id,
+                bg.table_id,
+                self.table_id()
+            )));
+        }
+        if bg.kind != self.kind() {
+            return Err(FsError::common(format!(
+                "bg {} kind mismatch: bg.kind={:?}, table.kind={:?}",
+                bg.bg_id,
+                bg.kind,
+                self.kind()
+            )));
+        }
+        Ok(())
+    }
+
     pub fn new_hash_table_with_config(
         table_id: TableId,
         namespace_id: NamespaceId,
@@ -281,6 +370,54 @@ mod tests {
             t.active_bgs.push(100);
         }
         assert_eq!(table.capacity_table().unwrap().active_bgs(), &[100]);
+    }
+
+    #[test]
+    fn capacity_on_bg_events() {
+        use curvine_common::state::{BGPrimary, BGState};
+
+        fn sample_bg(bg_id: BgId, state: BGState) -> BlockGroupInfo {
+            BlockGroupInfo {
+                bg_id,
+                table_id: 7,
+                kind: BGKind::Capacity,
+                bg_epoch: 1,
+                replica_set: vec![1, 2, 3],
+                isr: vec![1, 2, 3],
+                state,
+                op_state: Default::default(),
+                primary: BGPrimary {
+                    node_id: 1,
+                    epoch: 1,
+                    grant_time_ms: 0,
+                },
+                stats: Default::default(),
+                replicas: Default::default(),
+            }
+        }
+
+        let mut table = match BGTable::new_capacity_table(7, 0, StorageType::Ssd, 3, 16 << 30, 2) {
+            BGTable::Capacity(table) => table,
+            BGTable::Hash(_) => panic!("expected capacity table"),
+        };
+        let mut active_bg = sample_bg(100, BGState::Active);
+        let sealed_bg = sample_bg(101, BGState::Sealed);
+
+        table.on_bg_created(&active_bg);
+        table.on_bg_created(&sealed_bg); // sealed is not writable -> ignored
+        assert_eq!(table.active_bgs(), &[100]);
+
+        let old = active_bg.clone();
+        active_bg.state = BGState::Sealed;
+        table.on_bg_updated(&old, &active_bg);
+        assert!(table.active_bgs().is_empty());
+
+        active_bg.state = BGState::Active;
+        table.on_bg_updated(&sealed_bg, &active_bg);
+        assert_eq!(table.active_bgs(), &[100]);
+
+        table.on_bg_deleted(&active_bg);
+        assert!(table.active_bgs().is_empty());
     }
 
     #[test]

@@ -17,18 +17,17 @@ use curvine_common::state::TableId;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-/// Minimal view a controller table must expose to be stored in a `TableMap`.
 pub trait TableEntry {
     fn table_id(&self) -> TableId;
     fn epoch(&self) -> u64;
     fn update_stats(&mut self, stats: BGTableStats);
 }
 
-pub struct TableMap<T> {
+pub struct TableRegistry<T> {
     tables: RwLock<HashMap<TableId, Arc<T>>>,
 }
 
-impl<T> Default for TableMap<T> {
+impl<T> Default for TableRegistry<T> {
     fn default() -> Self {
         Self {
             tables: RwLock::new(HashMap::new()),
@@ -36,7 +35,7 @@ impl<T> Default for TableMap<T> {
     }
 }
 
-impl<T: TableEntry + Clone> TableMap<T> {
+impl<T: TableEntry + Clone> TableRegistry<T> {
     pub fn get(&self, table_id: TableId) -> Option<Arc<T>> {
         self.tables.read().unwrap().get(&table_id).cloned()
     }

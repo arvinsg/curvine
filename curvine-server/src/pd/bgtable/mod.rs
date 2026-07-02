@@ -13,14 +13,19 @@
 // limitations under the License.
 
 mod capacity;
+mod control;
 mod hash;
 mod manager;
+mod mutator;
 pub mod placement;
 mod store;
 mod table;
+mod table_registry;
 
-pub use capacity::CapacityBGTableController;
-pub use hash::HashBGTableController;
-pub use manager::{BGTableManager, TablePlan, TablePlanResult};
+pub use capacity::{CapacityBGTableControl, CapacityPlacement};
+pub use control::BGTableControl;
+pub use hash::{HashBGTableControl, HashPlacement};
+pub use mutator::{BGMutator, TablePlan, TablePlanResult};
+pub use manager::BGTableManager;
 pub use store::BGTableStore;
 pub use table::{BGTable, BGTableBase, BGTableStats, CapacityBGTable, HashBGTable};
