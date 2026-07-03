@@ -1,5 +1,6 @@
-mod controller;
-mod planner;
+mod control;
+mod placement;
 mod replica;
 
-pub use controller::HashBGTableController;
+pub use control::HashBGTableControl;
+pub use placement::HashPlacement;
