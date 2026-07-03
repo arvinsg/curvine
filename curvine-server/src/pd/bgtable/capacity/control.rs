@@ -12,133 +12,115 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::pd::bgtable::{BGTable, BGTableStats, CapacityBGTable};
-use curvine_common::state::{
-    BGKind, BGState, BGTableSummary, BgId, BlockGroupInfo, BlockGroupRouteView,
-    CapacityBGTableSummary, TableId,
-};
+use crate::pd::bg::BGManager;
+use crate::pd::bgtable::capacity::CapacityPlacement;
+use crate::pd::bgtable::table::TableRegistry;
+use crate::pd::bgtable::{BGTable, BGTableControl, BGTableStats, BGTableStore, CapacityBGTable};
+use curvine_common::state::{BgId, BlockGroupInfo, TableId};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
-// TODO
-#[derive(Default)]
-pub struct CapacityBGTableController {
-    tables: RwLock<HashMap<TableId, Arc<CapacityBGTable>>>,
+/// Total manager of Capacity BGTables: owns the table registry and the
+/// BG-domain dependencies (store, BG manager) for the active-BG lifecycle
+/// (phase-2).
+pub struct CapacityBGTableControl {
+    tables: TableRegistry<CapacityBGTable>,
+    store: Arc<BGTableStore>,
+    bg_manager: Arc<BGManager>,
 }
 
-impl CapacityBGTableController {
-    pub fn new() -> Self {
-        Self::default()
+impl CapacityBGTableControl {
+    pub fn new(store: Arc<BGTableStore>, bg_manager: Arc<BGManager>) -> Self {
+        Self {
+            tables: TableRegistry::default(),
+            store,
+            bg_manager,
+        }
+    }
+
+    pub fn placement(&self) -> CapacityPlacement<'_> {
+        CapacityPlacement::new(self)
     }
 
     pub fn get_capacity_table(&self, table_id: TableId) -> Option<Arc<CapacityBGTable>> {
-        self.tables.read().unwrap().get(&table_id).cloned()
+        self.tables.get(table_id)
     }
 
-    pub fn get_table(&self, table_id: TableId) -> Option<Arc<BGTable>> {
+    pub fn put_table(&self, table: CapacityBGTable) {
+        self.tables.put(table);
+    }
+
+    pub fn restore_tables(&self, tables: HashMap<TableId, Arc<CapacityBGTable>>) {
+        self.tables.replace_all(tables);
+    }
+}
+
+impl BGTableControl for CapacityBGTableControl {
+    fn store(&self) -> &BGTableStore {
+        &self.store
+    }
+
+    fn bg_manager(&self) -> &BGManager {
+        &self.bg_manager
+    }
+
+    fn get_table(&self, table_id: TableId) -> Option<Arc<BGTable>> {
         self.get_capacity_table(table_id)
             .map(|table| Arc::new(BGTable::Capacity((*table).clone())))
     }
 
-    pub fn list_tables(&self) -> Vec<Arc<BGTable>> {
+    fn list_tables(&self) -> Vec<Arc<BGTable>> {
         self.tables
-            .read()
-            .unwrap()
             .values()
-            .map(|table| Arc::new(BGTable::Capacity((**table).clone())))
+            .into_iter()
+            .map(|table| Arc::new(BGTable::Capacity((*table).clone())))
             .collect()
     }
 
-    pub fn table_epochs(&self) -> HashMap<TableId, u64> {
+    fn snapshot_tables(&self) -> HashMap<TableId, Arc<BGTable>> {
         self.tables
-            .read()
-            .unwrap()
-            .iter()
-            .map(|(&id, table)| (id, table.base.epoch))
+            .snapshot()
+            .into_iter()
+            .map(|(id, table)| (id, Arc::new(BGTable::Capacity((*table).clone()))))
             .collect()
     }
 
-    pub fn snapshot_tables(&self) -> HashMap<TableId, Arc<BGTable>> {
-        self.tables
-            .read()
-            .unwrap()
-            .iter()
-            .map(|(&id, table)| (id, Arc::new(BGTable::Capacity((**table).clone()))))
-            .collect()
+    fn table_epochs(&self) -> HashMap<TableId, u64> {
+        self.tables.epochs()
     }
 
-    // TODO
-    pub fn replace_tables_runtime(&self, tables: HashMap<TableId, Arc<CapacityBGTable>>) {
-        *self.tables.write().unwrap() = tables;
-    }
-
-    // TODO
-    pub fn replace_table_runtime(&self, table: CapacityBGTable) {
-        self.tables
-            .write()
-            .unwrap()
-            .insert(table.base.table_id, Arc::new(table));
-    }
-
-    pub fn remove_table_runtime(&self, table_id: TableId) {
-        self.tables.write().unwrap().remove(&table_id);
-    }
-
-    // TODO
-    pub fn bg_created(table: &mut CapacityBGTable, bg: &BlockGroupInfo) {
-        if Self::is_routable_capacity_bg(bg) && !table.active_bgs.contains(&bg.bg_id) {
-            table.active_bgs.push(bg.bg_id);
+    fn apply_create_table(&self, table: BGTable) {
+        if let BGTable::Capacity(table) = table {
+            self.tables.put(table);
         }
     }
 
-    // TODO
-    pub fn bg_updated(table: &mut CapacityBGTable, old: &BlockGroupInfo, new: &BlockGroupInfo) {
-        if Self::is_routable_capacity_bg(old) {
-            table.active_bgs.retain(|id| *id != old.bg_id);
-        }
-        Self::bg_created(table, new);
-    }
-
-    // TODO
-    pub fn bg_deleted(table: &mut CapacityBGTable, bg: &BlockGroupInfo) {
-        if Self::is_routable_capacity_bg(bg) {
-            table.active_bgs.retain(|id| *id != bg.bg_id);
+    fn apply_update_table(&self, table: BGTable) {
+        if let BGTable::Capacity(table) = table {
+            self.tables.put(table);
         }
     }
 
-    // TODO
-    pub fn build_route_summary(
-        table: &CapacityBGTable,
-        views: Vec<BlockGroupRouteView>,
-    ) -> BGTableSummary {
-        BGTableSummary::Capacity(CapacityBGTableSummary {
-            table_id: table.base.table_id,
-            epoch: table.base.epoch,
-            active_bgs: views,
-        })
+    fn apply_delete_table(&self, table_id: TableId) {
+        self.tables.remove(table_id);
     }
 
-    pub fn update_table_stats(&self, table_id: TableId, stats: BGTableStats) {
-        let mut tables = self.tables.write().unwrap();
-        if let Some(table) = tables.get_mut(&table_id) {
-            Arc::make_mut(table).update_stats(stats);
+    // The `table` handed in already carries its refreshed `active_bgs` (the
+    // caller ran `on_bg_*`), so we just store it. This is runtime-only state
+    // (`#[serde(skip)]`) — no table row / epoch change.
+    fn refresh_bg_index(&self, table: BGTable) {
+        if let BGTable::Capacity(table) = table {
+            self.tables.put(table);
         }
     }
 
-    pub fn rebuild_runtime_indexes(
-        table: &mut CapacityBGTable,
-        bgs: &HashMap<BgId, Arc<BlockGroupInfo>>,
-    ) {
-        table.active_bgs.clear();
-        for bg in bgs.values() {
-            if bg.table_id == table.base.table_id {
-                Self::bg_created(table, bg);
-            }
-        }
+    fn update_table_stats(&self, table_id: TableId, stats: BGTableStats) {
+        self.tables.update_stats(table_id, stats);
     }
 
-    // TODO
-    fn is_routable_capacity_bg(bg: &BlockGroupInfo) -> bool {
-        bg.kind == BGKind::Capacity && bg.state == BGState::Active
+    // Capacity tables maintain a derived active-BG index; the table type owns
+    // that invariant, so we just drive the rebuild.
+    fn rebuild_indexes(&self, table: &mut BGTable, bgs: &HashMap<BgId, Arc<BlockGroupInfo>>) {
+        table.rebuild_active_index(bgs);
     }
 }

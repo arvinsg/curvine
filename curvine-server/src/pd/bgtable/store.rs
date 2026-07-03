@@ -53,6 +53,13 @@ impl BGTableStore {
         ))
     }
 
+    pub fn table_delete_op(&self, table_id: TableId) -> KvWrite {
+        KvWrite::Delete {
+            ns: NS.to_string(),
+            key: self.table_key(table_id).to_vec(),
+        }
+    }
+
     pub fn write_batch(&self, ops: Vec<KvWrite>) -> CommonResult<()> {
         self.store.write_batch(ops)
     }

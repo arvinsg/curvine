@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::pd::journal::entry::BGUpdateEntry;
 use curvine_common::state::{
     BGKind, BGState, BgId, BlockGroupInfo, CacheReplicaPolicy, LabelMatch, NamespaceId,
     StorageType, TableId,
@@ -101,20 +102,20 @@ impl CapacityBGTable {
     }
 
     pub fn on_bg_created(&mut self, bg: &BlockGroupInfo) {
-        if Self::is_writable(bg) && !self.active_bgs.contains(&bg.bg_id) {
+        if Self::is_writeable(bg) && !self.active_bgs.contains(&bg.bg_id) {
             self.active_bgs.push(bg.bg_id);
         }
     }
 
     pub fn on_bg_updated(&mut self, old: &BlockGroupInfo, new: &BlockGroupInfo) {
-        if Self::is_writable(old) {
+        if Self::is_writeable(old) {
             self.active_bgs.retain(|id| *id != old.bg_id);
         }
         self.on_bg_created(new);
     }
 
     pub fn on_bg_deleted(&mut self, bg: &BlockGroupInfo) {
-        if Self::is_writable(bg) {
+        if Self::is_writeable(bg) {
             self.active_bgs.retain(|id| *id != bg.bg_id);
         }
     }
@@ -128,7 +129,7 @@ impl CapacityBGTable {
         }
     }
 
-    fn is_writable(bg: &BlockGroupInfo) -> bool {
+    pub(crate) fn is_writeable(bg: &BlockGroupInfo) -> bool {
         bg.kind == BGKind::Capacity && bg.state == BGState::Active
     }
 }
@@ -242,6 +243,17 @@ impl BGTable {
     pub fn on_bg_deleted(&mut self, bg: &BlockGroupInfo) {
         if let BGTable::Capacity(table) = self {
             table.on_bg_deleted(bg);
+        }
+    }
+
+    pub fn bg_change_bumps_table_epoch(&self, old: &BlockGroupInfo, entry: &BGUpdateEntry) -> bool {
+        match self {
+            BGTable::Hash(_) => {
+                let isr_changed = entry.isr.as_ref().is_some_and(|isr| *isr != old.isr);
+                let primary_changed = entry.primary.as_ref().is_some_and(|p| *p != old.primary);
+                isr_changed || primary_changed
+            }
+            BGTable::Capacity(_) => false,
         }
     }
 
