@@ -13,7 +13,6 @@ pub struct PreparedBGUpdate {
 
 pub struct PreparedBGDelete {
     pub old_info: BlockGroupInfo,
-    pub op: KvWrite,
 }
 
 pub(crate) enum UpdateBuildResult {
@@ -189,6 +188,15 @@ impl BGManager {
 
     // ---- raft propose (submit a built entry) -------------------------------
 
+    pub fn propose_create_bg(&self, entry: BGEntry) -> FsResult<ApplyOutcome> {
+        let bg_id = entry.info.bg_id;
+        let outcome = self.journal_client.propose(PdEntry::CreateBG(entry))?;
+        if let ApplyOutcome::SkippedStale { reason } = &outcome {
+            log::warn!("propose_create_bg bg_id={} stale: {}", bg_id, reason);
+        }
+        Ok(outcome)
+    }
+
     pub fn propose_update_bg(&self, entry: BGUpdateEntry) -> FsResult<ApplyOutcome> {
         let (bg_id, expected) = (entry.bg_id, entry.expected_bg_epoch);
         let outcome = self.journal_client.propose(PdEntry::UpdateBG(entry))?;
@@ -347,7 +355,6 @@ impl BGManager {
         }
         Ok(PrepareDeleteResult::Applied(PreparedBGDelete {
             old_info: (*existing).clone(),
-            op: self.store.bg_delete_op(entry.bg_id),
         }))
     }
 

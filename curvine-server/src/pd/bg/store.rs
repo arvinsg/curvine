@@ -46,11 +46,22 @@ impl BGStore {
         }
     }
 
+    fn delete_op(&self, key: Vec<u8>) -> KvWrite {
+        KvWrite::Delete {
+            ns: NS.to_string(),
+            key,
+        }
+    }
+
     pub fn bg_put_op(&self, info: &BlockGroupInfo) -> CommonResult<KvWrite> {
         Ok(self.put_op(
             self.bg_info_key(info.bg_id).to_vec(),
             Serde::serialize(info)?,
         ))
+    }
+
+    pub fn bg_delete_op(&self, bg_id: BgId) -> KvWrite {
+        self.delete_op(self.bg_info_key(bg_id).to_vec())
     }
 
     pub fn next_bg_id_op(&self, next_id: BgId) -> CommonResult<KvWrite> {
