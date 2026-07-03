@@ -29,9 +29,9 @@ use std::sync::{Arc, RwLock};
 
 mod apply;
 pub(crate) use apply::{
-    PrepareCreateResult, PrepareDeleteResult, PrepareUpdateResult, PreparedBGCreate,
-    PreparedBGDelete, PreparedBGUpdate,
+    PrepareCreateResult, PrepareDeleteResult, PrepareUpdateResult, PreparedBGUpdate,
 };
+pub use apply::{BuiltDelete, BuiltUpdate};
 mod capacity_controller;
 mod controller;
 mod hash_controller;

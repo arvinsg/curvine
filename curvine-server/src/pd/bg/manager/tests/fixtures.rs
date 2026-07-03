@@ -60,6 +60,7 @@ pub(super) fn update_entry(bg_id: BgId, expected: u64) -> BGUpdateEntry {
         isr: None,
         primary: None,
         expected_bg_epoch: expected,
+        bump_table_epoch: false,
     }
 }
 

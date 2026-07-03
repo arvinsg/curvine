@@ -98,7 +98,7 @@ impl ReplicaState {
 }
 
 /// Primary info.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BGPrimary {
     pub node_id: u32,
     pub epoch: u64,

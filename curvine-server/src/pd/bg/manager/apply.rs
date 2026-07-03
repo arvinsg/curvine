@@ -21,7 +21,7 @@ pub(crate) enum UpdateBuildResult {
     Outcome(ApplyOutcome),
 }
 
-pub(crate) enum PrepareCreateResult {
+pub enum PrepareCreateResult {
     Applied(PreparedBGCreate),
     Outcome(ApplyOutcome),
 }
@@ -36,168 +36,181 @@ pub(crate) enum PrepareDeleteResult {
     Outcome(ApplyOutcome),
 }
 
-impl BGManager {
-    pub fn propose_remove_replica(
-        &self,
-        kind: BGKind,
-        bg_id: BgId,
-        worker_id: u32,
-    ) -> FsResult<ApplyOutcome> {
-        let bg = self
-            .get_bg(kind, bg_id)
-            .ok_or_else(|| FsError::common(format!("bg {} not found", bg_id)))?;
-        let new_rs: Vec<u32> = bg
-            .replica_set
-            .iter()
-            .filter(|&&w| w != worker_id)
-            .copied()
-            .collect();
-        let entry = BGUpdateEntry {
-            op_ms: orpc::common::LocalTime::mills(),
-            kind,
-            bg_id,
-            state: None,
-            replica_set: Some(new_rs),
-            isr: Some(bg.isr.iter().copied().filter(|&w| w != worker_id).collect()),
-            primary: None,
-            expected_bg_epoch: bg.bg_epoch,
-        };
-        self.propose_update_bg(entry, "propose_remove_replica")
-    }
+/// Result of building a BG-update intent: either a ready-to-propose entry, or a
+/// short-circuit outcome (the op is a no-op or the BG is gone) that the caller
+/// returns directly without proposing.
+pub enum BuiltUpdate {
+    Built(BGUpdateEntry),
+    ShortCircuit(ApplyOutcome),
+}
 
-    pub fn propose_add_replica(
+/// Result of building a BG-delete intent. See `BuiltUpdate`.
+pub enum BuiltDelete {
+    Built(BGDeleteEntry),
+    ShortCircuit(ApplyOutcome),
+}
+
+impl BGManager {
+    // ---- BG-domain intent builders -----------------------------------------
+
+    pub fn build_add_replica_entry(
         &self,
         kind: BGKind,
         bg_id: BgId,
         worker_id: u32,
-    ) -> FsResult<ApplyOutcome> {
-        let bg = self
-            .get_bg(kind, bg_id)
-            .ok_or_else(|| FsError::common(format!("bg {} not found", bg_id)))?;
+    ) -> BuiltUpdate {
+        let Some(bg) = self.get_bg(kind, bg_id) else {
+            return BuiltUpdate::ShortCircuit(ApplyOutcome::not_found(format!(
+                "bg {} not found",
+                bg_id
+            )));
+        };
         if bg.replica_set.contains(&worker_id) {
-            return Ok(ApplyOutcome::SkippedNoop);
+            return BuiltUpdate::ShortCircuit(ApplyOutcome::SkippedNoop);
         }
         let mut new_rs = bg.replica_set.clone();
         new_rs.push(worker_id);
-        let entry = BGUpdateEntry {
+        BuiltUpdate::Built(BGUpdateEntry {
             op_ms: orpc::common::LocalTime::mills(),
             kind,
             bg_id,
+            expected_bg_epoch: bg.bg_epoch,
             state: None,
             replica_set: Some(new_rs),
             isr: Some(bg.isr.clone()),
             primary: None,
-            expected_bg_epoch: bg.bg_epoch,
-        };
-        self.propose_update_bg(entry, "propose_add_replica")
+            bump_table_epoch: false,
+        })
     }
 
-    pub fn propose_transfer_primary(
+    pub fn build_remove_replica_entry(
+        &self,
+        kind: BGKind,
+        bg_id: BgId,
+        worker_id: u32,
+    ) -> BuiltUpdate {
+        let Some(bg) = self.get_bg(kind, bg_id) else {
+            return BuiltUpdate::ShortCircuit(ApplyOutcome::not_found(format!(
+                "bg {} not found",
+                bg_id
+            )));
+        };
+        let new_rs: Vec<u32> = bg
+            .replica_set
+            .iter()
+            .copied()
+            .filter(|&w| w != worker_id)
+            .collect();
+        let new_isr: Vec<u32> = bg.isr.iter().copied().filter(|&w| w != worker_id).collect();
+        BuiltUpdate::Built(BGUpdateEntry {
+            op_ms: orpc::common::LocalTime::mills(),
+            kind,
+            bg_id,
+            expected_bg_epoch: bg.bg_epoch,
+            state: None,
+            replica_set: Some(new_rs),
+            isr: Some(new_isr),
+            primary: None,
+            bump_table_epoch: false,
+        })
+    }
+
+    pub fn build_transfer_primary_entry(
         &self,
         kind: BGKind,
         bg_id: BgId,
         from_worker: u32,
         to_worker: u32,
-    ) -> FsResult<ApplyOutcome> {
-        let bg = self
-            .get_bg(kind, bg_id)
-            .ok_or_else(|| FsError::common(format!("bg {} not found", bg_id)))?;
-        let current_owner = bg.primary.node_id;
-        if current_owner != from_worker {
-            return Ok(ApplyOutcome::SkippedNoop);
+    ) -> BuiltUpdate {
+        let Some(bg) = self.get_bg(kind, bg_id) else {
+            return BuiltUpdate::ShortCircuit(ApplyOutcome::not_found(format!(
+                "bg {} not found",
+                bg_id
+            )));
+        };
+        if bg.primary.node_id != from_worker {
+            return BuiltUpdate::ShortCircuit(ApplyOutcome::SkippedNoop);
         }
-        let new_epoch = bg.primary.epoch.saturating_add(1);
         let primary = BGPrimary {
             node_id: to_worker,
-            epoch: new_epoch,
+            epoch: bg.primary.epoch.saturating_add(1),
             grant_time_ms: orpc::common::LocalTime::mills(),
         };
-        let entry = BGUpdateEntry {
+        BuiltUpdate::Built(BGUpdateEntry {
             op_ms: orpc::common::LocalTime::mills(),
             kind,
             bg_id,
+            expected_bg_epoch: bg.bg_epoch,
             state: None,
             replica_set: None,
             isr: None,
             primary: Some(primary),
-            expected_bg_epoch: bg.bg_epoch,
-        };
-        self.propose_update_bg(entry, "propose_transfer_primary")
+            bump_table_epoch: false,
+        })
     }
 
-    pub fn propose_seal_bg(&self, kind: BGKind, bg_id: BgId) -> FsResult<ApplyOutcome> {
-        self.propose_bg_state_transition(kind, bg_id, BGState::Sealed, "propose_seal_bg")
-    }
-
-    fn propose_bg_state_transition(
-        &self,
-        kind: BGKind,
-        bg_id: BgId,
-        target_state: BGState,
-        op_name: &str,
-    ) -> FsResult<ApplyOutcome> {
+    pub fn build_seal_entry(&self, kind: BGKind, bg_id: BgId) -> BuiltUpdate {
         let Some(bg) = self.get_bg(kind, bg_id) else {
-            return Ok(ApplyOutcome::not_found(format!(
-                "{:?} bg {} not found",
-                kind, bg_id
+            return BuiltUpdate::ShortCircuit(ApplyOutcome::not_found(format!(
+                "bg {} not found",
+                bg_id
             )));
         };
-        if bg.state == target_state {
-            return Ok(ApplyOutcome::SkippedNoop);
+        if bg.state == BGState::Sealed {
+            return BuiltUpdate::ShortCircuit(ApplyOutcome::SkippedNoop);
         }
-        let entry = BGUpdateEntry {
+        BuiltUpdate::Built(BGUpdateEntry {
             op_ms: orpc::common::LocalTime::mills(),
             kind,
             bg_id,
-            state: Some(target_state),
+            expected_bg_epoch: bg.bg_epoch,
+            state: Some(BGState::Sealed),
             replica_set: None,
             isr: None,
             primary: None,
-            expected_bg_epoch: bg.bg_epoch,
-        };
-        self.propose_update_bg(entry, op_name)
+            bump_table_epoch: false,
+        })
     }
 
-    pub fn propose_delete_bg(&self, kind: BGKind, bg_id: BgId) -> FsResult<ApplyOutcome> {
+    pub fn build_delete_entry(&self, kind: BGKind, bg_id: BgId) -> BuiltDelete {
         let Some(bg) = self.get_bg(kind, bg_id) else {
-            return Ok(ApplyOutcome::not_found(format!(
-                "{:?} bg {} not found",
-                kind, bg_id
+            return BuiltDelete::ShortCircuit(ApplyOutcome::not_found(format!(
+                "bg {} not found",
+                bg_id
             )));
         };
-        let expected_epoch = bg.bg_epoch;
-        let entry = BGDeleteEntry {
+        BuiltDelete::Built(BGDeleteEntry {
             op_ms: orpc::common::LocalTime::mills(),
             kind,
             bg_id,
-            expected_bg_epoch: expected_epoch,
-        };
-        let outcome = self.journal_client.propose(PdEntry::DeleteBG(entry))?;
+            expected_bg_epoch: bg.bg_epoch,
+        })
+    }
+
+    // ---- raft propose (submit a built entry) -------------------------------
+
+    pub fn propose_update_bg(&self, entry: BGUpdateEntry) -> FsResult<ApplyOutcome> {
+        let (bg_id, expected) = (entry.bg_id, entry.expected_bg_epoch);
+        let outcome = self.journal_client.propose(PdEntry::UpdateBG(entry))?;
         if let ApplyOutcome::SkippedStale { reason } = &outcome {
             log::warn!(
-                "propose_delete_bg bg_id={} returned Stale (expected_bg_epoch={}): {}",
+                "propose_update_bg bg_id={} (expected_bg_epoch={}) stale: {}",
                 bg_id,
-                expected_epoch,
+                expected,
                 reason
             );
         }
         Ok(outcome)
     }
 
-    pub(crate) fn propose_update_bg(
-        &self,
-        entry: BGUpdateEntry,
-        kind: &str,
-    ) -> FsResult<ApplyOutcome> {
-        let expected_epoch = entry.expected_bg_epoch;
-        let bg_id = entry.bg_id;
-        let outcome = self.journal_client.propose(PdEntry::UpdateBG(entry))?;
+    pub fn propose_delete_bg(&self, entry: BGDeleteEntry) -> FsResult<ApplyOutcome> {
+        let (bg_id, expected) = (entry.bg_id, entry.expected_bg_epoch);
+        let outcome = self.journal_client.propose(PdEntry::DeleteBG(entry))?;
         if let ApplyOutcome::SkippedStale { reason } = &outcome {
             log::warn!(
-                "{} bg_id={} returned Stale (expected_bg_epoch={}): {}",
-                kind,
+                "propose_delete_bg bg_id={} (expected_bg_epoch={}) stale: {}",
                 bg_id,
-                expected_epoch,
+                expected,
                 reason
             );
         }

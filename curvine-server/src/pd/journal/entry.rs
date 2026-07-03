@@ -145,6 +145,9 @@ pub struct BGUpdateEntry {
     pub replica_set: Option<Vec<u32>>,
     pub isr: Option<Vec<u32>>,
     pub primary: Option<BGPrimary>,
+
+    #[serde(default)]
+    pub bump_table_epoch: bool,
 }
 
 /// Atomically applies multiple BG updates.
