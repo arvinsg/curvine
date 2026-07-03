@@ -87,19 +87,19 @@ impl BGTableControl for CapacityBGTableControl {
         self.tables.epochs()
     }
 
-    fn apply_create_table(&self, table: BGTable) {
+    fn on_table_created(&self, table: BGTable) {
         if let BGTable::Capacity(table) = table {
             self.tables.put(table);
         }
     }
 
-    fn apply_update_table(&self, table: BGTable) {
+    fn on_table_updated(&self, table: BGTable) {
         if let BGTable::Capacity(table) = table {
             self.tables.put(table);
         }
     }
 
-    fn apply_delete_table(&self, table_id: TableId) {
+    fn on_table_removed(&self, table_id: TableId) {
         self.tables.remove(table_id);
     }
 

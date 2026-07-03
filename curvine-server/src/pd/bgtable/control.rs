@@ -78,9 +78,9 @@ pub trait BGTableControl {
     fn snapshot_tables(&self) -> HashMap<TableId, Arc<BGTable>>;
     fn table_epochs(&self) -> HashMap<TableId, u64>;
 
-    fn apply_create_table(&self, table: BGTable);
-    fn apply_update_table(&self, table: BGTable);
-    fn apply_delete_table(&self, table_id: TableId);
+    fn on_table_created(&self, table: BGTable);
+    fn on_table_updated(&self, table: BGTable);
+    fn on_table_removed(&self, table_id: TableId);
     fn refresh_bg_index(&self, table: BGTable);
     fn update_table_stats(&self, table_id: TableId, stats: BGTableStats);
     fn rebuild_indexes(&self, table: &mut BGTable, bgs: &HashMap<BgId, Arc<BlockGroupInfo>>);
@@ -179,7 +179,7 @@ pub trait BGTableControl {
         // Epoch bumped → this is a client-visible table change; otherwise it is
         // just a runtime BG-index refresh.
         if bump_table_epoch {
-            self.apply_update_table(table);
+            self.on_table_updated(table);
         } else {
             self.refresh_bg_index(table);
         }
@@ -267,29 +267,14 @@ pub trait BGTableControl {
         )))
     }
 
-    // ---- table commit (install the in-memory result of a committed plan) ----
-    //
-    // All three table commits live here so the two-phase surface is uniform;
-    // the manager only routes plans to the owning kind's control.
-
-    /// Install newly-created tables (namespace-create).
-    fn commit_create_table(&self, mut plan: PreparedTables) {
-        for table in plan.take_tables() {
-            self.apply_create_table(table);
-        }
-    }
-
-    /// Install updated tables (each already carries its bumped epoch).
+    /// Install the updated tables from a committed `prepare_policy_update` plan
+    /// into the in-memory registry (each already carries its bumped epoch). The
+    /// durable write happened in the caller's `commit_batch`; this is only the
+    /// index hook. Create uses `commit_namespace_bg_create` (cross-kind) and
+    /// delete has no production path yet, so only the update commit is wired.
     fn commit_update_table(&self, mut plan: PreparedTables) {
         for table in plan.take_tables() {
-            self.apply_update_table(table);
-        }
-    }
-
-    /// Drop the tables named by a committed delete plan.
-    fn commit_delete_table(&self, mut plan: PreparedTables) {
-        for table in plan.take_tables() {
-            self.apply_delete_table(table.table_id());
+            self.on_table_updated(table);
         }
     }
 }
