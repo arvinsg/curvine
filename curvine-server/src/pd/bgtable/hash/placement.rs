@@ -39,10 +39,6 @@ impl<'a> HashPlacement<'a> {
         Self { controller }
     }
 
-    pub(super) fn controller(&self) -> &HashBGTableControl {
-        self.controller
-    }
-
     fn balance_policy_strategy(&self) -> String {
         self.controller
             .config_manager
@@ -54,6 +50,26 @@ impl<'a> HashPlacement<'a> {
             .config_manager
             .get_u32(keys::PD_BG_REBUILD_TOLERANT_RATIO_BPS) as f64
             / 10_000.0
+    }
+
+    fn build_context<'c>(
+        &self,
+        inputs: &'c PlacementInputs,
+        table_id: TableId,
+        bucket_count: u32,
+        replica_count: u16,
+    ) -> HashPlacementContext<'c> {
+        let tolerant = self.rebuild_tolerant_ratio();
+        HashPlacementContext {
+            common: PlacementContext {
+                workers: &inputs.workers,
+                tolerant_ratio: tolerant,
+                primary_tolerant_ratio: tolerant,
+            },
+            table_id,
+            bucket_count,
+            replica_count,
+        }
     }
 
     /// Build per-table WorkerLoadSnapshot map for the given table.
@@ -68,63 +84,79 @@ impl<'a> HashPlacement<'a> {
     ) -> HashMap<u32, WorkerLoadSnapshot> {
         let pool_type = table.storage_type();
         let live_workers = self.controller.pool_manager.get_live_workers(pool_type);
-
-        let table_bgs: Vec<Arc<BlockGroupInfo>> = if init {
-            vec![]
+        let table_bgs = if init {
+            Vec::new()
         } else {
-            let bgs = self.controller.bg_manager.snapshot_all_bgs();
-            table
-                .hash_table()
-                .expect("hash table")
-                .buckets()
-                .iter()
-                .filter_map(|&id| bgs.get(&id).cloned())
-                .collect()
+            self.table_bgs(table)
         };
 
         live_workers
             .iter()
-            .map(|&wid| {
-                let (bg_count, primary_count) = if init {
-                    (0, 0)
-                } else {
-                    let bg = table_bgs
-                        .iter()
-                        .filter(|b| b.replica_set.contains(&wid))
-                        .count() as u32;
-                    let primary = table_bgs
-                        .iter()
-                        .filter(|b| b.primary.node_id == wid)
-                        .count() as u32;
-                    (bg, primary)
-                };
-                let labels = self
-                    .controller
-                    .pool_manager
-                    .get_worker_labels(wid)
-                    .unwrap_or_default();
-                let (capacity, used) = self
-                    .controller
-                    .pool_manager
-                    .get_worker_storage_stats(wid, media)
-                    .unwrap_or((0, 0));
-                (
-                    wid,
-                    WorkerLoadSnapshot {
-                        worker_id: wid,
-                        actual_bg: bg_count,
-                        actual_primary: primary_count,
-                        pending_bg_add: 0,
-                        pending_bg_remove: 0,
-                        pending_primary_in: 0,
-                        pending_primary_out: 0,
-                        capacity_bytes: capacity as u64,
-                        used_bytes: used as u64,
-                        labels,
-                    },
-                )
-            })
+            .map(|&wid| (wid, self.worker_snapshot(wid, media, &table_bgs, init)))
             .collect()
+    }
+
+    /// Existing BGs of a Hash table, resolved from the bucket list.
+    fn table_bgs(&self, table: &BGTable) -> Vec<Arc<BlockGroupInfo>> {
+        let bgs = self.controller.bg_manager.snapshot_all_bgs();
+        table
+            .hash_table()
+            .expect("hash table")
+            .buckets()
+            .iter()
+            .filter_map(|&id| bgs.get(&id).cloned())
+            .collect()
+    }
+
+    /// One worker's load snapshot: actual BG/primary counts (zero on init),
+    /// labels, and storage stats.
+    fn worker_snapshot(
+        &self,
+        wid: u32,
+        media: StorageType,
+        table_bgs: &[Arc<BlockGroupInfo>],
+        init: bool,
+    ) -> WorkerLoadSnapshot {
+        let (actual_bg, actual_primary) = if init {
+            (0, 0)
+        } else {
+            Self::count_worker_load(table_bgs, wid)
+        };
+        let labels = self
+            .controller
+            .pool_manager
+            .get_worker_labels(wid)
+            .unwrap_or_default();
+        let (capacity, used) = self
+            .controller
+            .pool_manager
+            .get_worker_storage_stats(wid, media)
+            .unwrap_or((0, 0));
+        WorkerLoadSnapshot {
+            worker_id: wid,
+            actual_bg,
+            actual_primary,
+            pending_bg_add: 0,
+            pending_bg_remove: 0,
+            pending_primary_in: 0,
+            pending_primary_out: 0,
+            capacity_bytes: capacity,
+            used_bytes: used,
+            labels,
+        }
+    }
+
+    /// Count how many of `table_bgs` place a replica (and a primary) on `wid`.
+    fn count_worker_load(table_bgs: &[Arc<BlockGroupInfo>], wid: u32) -> (u32, u32) {
+        let bg = table_bgs
+            .iter()
+            .filter(|b| b.replica_set.contains(&wid))
+            .count() as u32;
+        let primary = table_bgs
+            .iter()
+            .filter(|b| b.primary.node_id == wid)
+            .count() as u32;
+        (bg, primary)
     }
 
     pub fn build_hash_table_plan(
@@ -148,17 +180,7 @@ impl<'a> HashPlacement<'a> {
             cache_replica_policy.clone(),
         );
         let inputs = self.prepare_placement_inputs(pool_type, &table_for_snapshot, true)?;
-        let tolerant = self.rebuild_tolerant_ratio();
-        let ctx = HashPlacementContext {
-            common: PlacementContext {
-                workers: &inputs.workers,
-                tolerant_ratio: tolerant,
-                primary_tolerant_ratio: tolerant,
-            },
-            table_id,
-            bucket_count,
-            replica_count,
-        };
+        let ctx = self.build_context(&inputs, table_id, bucket_count, replica_count);
         let mut state = inputs.policy.prepare_hash(&ctx)?;
         build_hash_table(
             table_id,
@@ -190,20 +212,16 @@ impl<'a> HashPlacement<'a> {
             .ok_or_else(|| FsError::common(format!("table {} not found", bg.table_id)))?;
         let inputs = self.prepare_placement_inputs(table.storage_type(), &table, false)?;
 
-        let tolerant = self.rebuild_tolerant_ratio();
-        let ctx = HashPlacementContext {
-            common: PlacementContext {
-                workers: &inputs.workers,
-                tolerant_ratio: tolerant,
-                primary_tolerant_ratio: tolerant,
-            },
-            table_id: table.table_id(),
-            bucket_count: table.hash_table().expect("hash table").bucket_count(),
-            replica_count: table.replica_count(),
-        };
+        let ht = table.hash_table().expect("hash table");
+        let ctx = self.build_context(
+            &inputs,
+            table.table_id(),
+            ht.bucket_count(),
+            table.replica_count(),
+        );
         let worker_labels = ctx.worker_labels();
         let constrained = inputs.rule.filter(&ctx.worker_ids(), &worker_labels);
-        let mut st = inputs.policy.prepare_hash(&ctx)?;
+        let mut state = inputs.policy.prepare_hash(&ctx)?;
 
         let mut selected: Vec<u32> = Vec::with_capacity(count as usize);
         let mut exclude: HashSet<u32> = bg.replica_set.iter().copied().collect();
@@ -218,7 +236,7 @@ impl<'a> HashPlacement<'a> {
 
             let picked = select_with_fallback(
                 &ctx,
-                &mut st,
+                &mut state,
                 &inputs.rule,
                 inputs.policy.as_ref(),
                 &constrained,
@@ -230,7 +248,7 @@ impl<'a> HashPlacement<'a> {
 
             selected.push(picked);
             exclude.insert(picked);
-            st.record_bg_change(None, picked);
+            state.record_bg_change(None, picked);
         }
 
         if selected.len() < count as usize {
@@ -284,13 +302,11 @@ impl<'a> HashPlacement<'a> {
             .get_table(table_id)
             .ok_or_else(|| FsError::common(format!("table {} not found", table_id)))?;
         let table: BGTable = (*table_arc).clone();
+        let ht = table.hash_table().expect("hash table");
 
         let existing_bgs: Vec<BlockGroupInfo> = {
             let bgs = self.controller.bg_manager.snapshot_all_bgs();
-            table
-                .hash_table()
-                .expect("hash table")
-                .buckets()
+            ht.buckets()
                 .iter()
                 .filter(|&&id| id != 0)
                 .filter_map(|id| bgs.get(id).map(|arc| (**arc).clone()))
@@ -300,19 +316,15 @@ impl<'a> HashPlacement<'a> {
             return Ok(None);
         }
 
+        let bucket_count = ht.bucket_count();
         let inputs = self.prepare_placement_inputs(table.storage_type(), &table, false)?;
-        let tolerant = self.rebuild_tolerant_ratio();
-        let ctx = HashPlacementContext {
-            common: PlacementContext {
-                workers: &inputs.workers,
-                tolerant_ratio: tolerant,
-                primary_tolerant_ratio: tolerant,
-            },
-            table_id: table.table_id(),
-            bucket_count: table.hash_table().expect("hash table").bucket_count(),
-            replica_count: table.replica_count(),
-        };
-        let mut st = inputs.policy.prepare_hash(&ctx)?;
+        let ctx = self.build_context(
+            &inputs,
+            table.table_id(),
+            bucket_count,
+            table.replica_count(),
+        );
+        let mut state = inputs.policy.prepare_hash(&ctx)?;
 
         let result = placement_rebuild_hash_table(
             &table,
@@ -320,7 +332,7 @@ impl<'a> HashPlacement<'a> {
             &ctx,
             &inputs.rule,
             inputs.policy.as_ref(),
-            &mut st,
+            &mut state,
             &RebuildOptions::default(),
         )?;
 
@@ -350,9 +362,7 @@ impl<'a> HashPlacement<'a> {
             .changes
             .iter()
             .map(|(new_bg, old_bg)| {
-                let primary_changed = new_bg.primary.node_id != old_bg.primary.node_id
-                    || new_bg.primary.epoch != old_bg.primary.epoch
-                    || new_bg.primary.grant_time_ms != old_bg.primary.grant_time_ms;
+                let primary_changed = new_bg.primary != old_bg.primary;
                 let isr_changed = new_bg.isr != old_bg.isr;
                 BGUpdateEntry {
                     op_ms: now,
@@ -376,7 +386,8 @@ impl<'a> HashPlacement<'a> {
         }
     }
 
-    /// Rebuild all tables for a pool, calls rebuild_table for each table in the pool.
+    /// Rebuild every Hash table in a pool via `rebuild_hash_table`; a per-table
+    /// failure is logged and skipped so one bad table never aborts the sweep.
     pub fn rebuild_tables_for_pool(&self, pool_type: StorageType) -> FsResult<()> {
         let table_ids: Vec<TableId> = self
             .controller
