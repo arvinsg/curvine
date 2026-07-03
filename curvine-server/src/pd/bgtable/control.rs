@@ -13,13 +13,15 @@
 // limitations under the License.
 
 use crate::pd::bg::PreparedBGUpdate;
-use crate::pd::bg::{BGManager, PrepareCreateResult, PrepareDeleteResult, PrepareUpdateResult};
+use crate::pd::bg::{
+    BGManager, BuiltDelete, BuiltUpdate, PrepareCreateResult, PrepareUpdateResult,
+};
 use crate::pd::bgtable::{BGTable, BGTableStats, BGTableStore};
-use crate::pd::journal::entry::{BGDeleteEntry, BGEntry, BGUpdateEntry};
+use crate::pd::journal::entry::{BGBatchUpdateEntry, BGDeleteEntry, BGEntry, BGUpdateEntry};
 use crate::pd::journal::ApplyOutcome;
 use crate::pd::store::KvWrite;
 use curvine_common::state::{BgId, BlockGroupInfo, CacheReplicaPolicy, NamespaceId, TableId};
-use curvine_common::FsResult;
+use curvine_common::{FsError, FsResult};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -83,25 +85,42 @@ pub trait BGTableControl {
     fn update_table_stats(&self, table_id: TableId, stats: BGTableStats);
     fn rebuild_indexes(&self, table: &mut BGTable, bgs: &HashMap<BgId, Arc<BlockGroupInfo>>);
 
-    fn apply_create_bg(&self, entry: &BGEntry) -> FsResult<ApplyOutcome> {
-        let plan = match self.bg_manager().prepare_create_bg(&entry.info)? {
-            PrepareCreateResult::Applied(p) => p,
-            PrepareCreateResult::Outcome(o) => return Ok(o),
-        };
+    fn propose_create_bg(&self, info: BlockGroupInfo) -> FsResult<ApplyOutcome> {
+        self.bg_manager()
+            .propose_create_bg(BGEntry { op_ms: 0, info })
+    }
 
-        let Some(table) = self.get_table(plan.info.table_id) else {
-            return Ok(ApplyOutcome::not_found(format!(
-                "table {} not found",
-                plan.info.table_id
-            )));
+    fn propose_update_bg(&self, built: BuiltUpdate) -> FsResult<ApplyOutcome> {
+        let mut entry = match built {
+            BuiltUpdate::Built(entry) => entry,
+            BuiltUpdate::ShortCircuit(outcome) => return Ok(outcome),
         };
-        let mut table = (*table).clone();
-        table.matches_bg(&plan.info)?;
-        table.on_bg_created(&plan.info);
-        self.store().write_batch(vec![plan.op.clone()])?;
-        self.bg_manager().insert_bg(plan.info);
-        self.refresh_bg_index(table);
-        Ok(ApplyOutcome::Applied)
+        if let Some(bg) = self.bg_manager().get_bg(entry.kind, entry.bg_id) {
+            if let Some(table) = self.get_table(bg.table_id) {
+                entry.bump_table_epoch = table.bg_change_bumps_table_epoch(&bg, &entry);
+            }
+        }
+        self.bg_manager().propose_update_bg(entry)
+    }
+
+    fn propose_delete_bg(&self, built: BuiltDelete) -> FsResult<ApplyOutcome> {
+        match built {
+            BuiltDelete::Built(entry) => self.bg_manager().propose_delete_bg(entry),
+            BuiltDelete::ShortCircuit(outcome) => Ok(outcome),
+        }
+    }
+
+    fn apply_create_bg(&self, entry: &BGEntry) -> FsResult<ApplyOutcome> {
+        let outcome = self.bg_manager().apply_create_bg(entry)?;
+        if matches!(outcome, ApplyOutcome::Applied) {
+            if let Some(table) = self.get_table(entry.info.table_id) {
+                let mut table = (*table).clone();
+                table.matches_bg(&entry.info)?;
+                table.on_bg_created(&entry.info);
+                self.refresh_bg_index(table);
+            }
+        }
+        Ok(outcome)
     }
 
     fn apply_update_bg(&self, entry: &BGUpdateEntry) -> FsResult<ApplyOutcome> {
@@ -113,22 +132,18 @@ pub trait BGTableControl {
     }
 
     fn apply_delete_bg(&self, entry: &BGDeleteEntry) -> FsResult<ApplyOutcome> {
-        let plan = match self.bg_manager().prepare_delete_bg(entry)? {
-            PrepareDeleteResult::Applied(p) => p,
-            PrepareDeleteResult::Outcome(o) => return Ok(o),
-        };
-        let Some(table) = self.get_table(plan.old_info.table_id) else {
-            return Ok(ApplyOutcome::not_found(format!(
-                "table {} not found",
-                plan.old_info.table_id
-            )));
-        };
-        let mut table = (*table).clone();
-        table.on_bg_deleted(&plan.old_info);
-        self.store().write_batch(vec![plan.op.clone()])?;
-        self.bg_manager().remove_bg(&plan.old_info);
-        self.refresh_bg_index(table);
-        Ok(ApplyOutcome::Applied)
+        let removed = self.bg_manager().get_bg(entry.kind, entry.bg_id);
+        let outcome = self.bg_manager().apply_delete_bg(entry)?;
+        if matches!(outcome, ApplyOutcome::Applied) {
+            if let Some(bg) = removed {
+                if let Some(table) = self.get_table(bg.table_id) {
+                    let mut table = (*table).clone();
+                    table.on_bg_deleted(&bg);
+                    self.refresh_bg_index(table);
+                }
+            }
+        }
+        Ok(outcome)
     }
 
     /// Commit a prepared single-BG update. When `bump_table_epoch` is set the
@@ -169,6 +184,15 @@ pub trait BGTableControl {
             self.refresh_bg_index(table);
         }
         Ok(ApplyOutcome::Applied)
+    }
+
+    /// Apply a batched BG update (rebuild). Rebuild re-places BGs of a single
+    /// kind's tables, and only Hash tables are ever rebuilt, so the default
+    /// rejects. `HashBGTableControl` overrides it with the real recipe.
+    fn apply_batch_update(&self, _entry: &BGBatchUpdateEntry) -> FsResult<ApplyOutcome> {
+        Err(FsError::common(
+            "batch BG update is only supported for Hash tables",
+        ))
     }
 
     // ---- table lifecycle (two-phase: prepare a plan, commit  it) ---
@@ -212,13 +236,12 @@ pub trait BGTableControl {
         )))
     }
 
-    /// Plan a table-level update that changes client-visible behaviour, bumping
-    /// each affected table's epoch. Currently this is the `cache_replica_policy`
-    /// rewrite across a namespace's tables — a Hash concept, so the default is a
-    /// no-op plan and `HashBGTableControl` overrides it. Two-phase (method A):
-    /// returns the plan; the namespace manager commits it atomically with the
-    /// namespace row, then calls `commit_prepared_tables`.
-    fn prepare_update_table(
+    /// Plan the `cache_replica_policy` rewrite across a namespace's tables,
+    /// bumping each changed table's epoch. Policy is a Hash concept, so the
+    /// default is a no-op plan and `HashBGTableControl` overrides it. Two-phase
+    /// (method A): returns the plan; the namespace manager commits it atomically
+    /// with the namespace row, then calls `commit_update_table`.
+    fn prepare_policy_update(
         &self,
         _namespace_id: NamespaceId,
         _policy: &CacheReplicaPolicy,
@@ -244,11 +267,29 @@ pub trait BGTableControl {
         )))
     }
 
-    /// Install the in-memory tables from a committed `prepare_update_table`
-    /// (each already carries its bumped epoch).
-    fn commit_prepared_tables(&self, mut plan: PreparedTables) {
+    // ---- table commit (install the in-memory result of a committed plan) ----
+    //
+    // All three table commits live here so the two-phase surface is uniform;
+    // the manager only routes plans to the owning kind's control.
+
+    /// Install newly-created tables (namespace-create).
+    fn commit_create_table(&self, mut plan: PreparedTables) {
+        for table in plan.take_tables() {
+            self.apply_create_table(table);
+        }
+    }
+
+    /// Install updated tables (each already carries its bumped epoch).
+    fn commit_update_table(&self, mut plan: PreparedTables) {
         for table in plan.take_tables() {
             self.apply_update_table(table);
+        }
+    }
+
+    /// Drop the tables named by a committed delete plan.
+    fn commit_delete_table(&self, mut plan: PreparedTables) {
+        for table in plan.take_tables() {
+            self.apply_delete_table(table.table_id());
         }
     }
 }

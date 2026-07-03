@@ -1,3 +1,5 @@
-mod controller;
+mod control;
+mod placement;
 
-pub use controller::CapacityBGTableController;
+pub use control::CapacityBGTableControl;
+pub use placement::CapacityPlacement;

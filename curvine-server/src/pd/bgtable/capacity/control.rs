@@ -20,9 +20,7 @@ use curvine_common::state::{BgId, BlockGroupInfo, TableId};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Total manager of Capacity BGTables: owns the table registry and the
-/// BG-domain dependencies (store, BG manager) for the active-BG lifecycle
-/// (phase-2).
+/// Total manager of Capacity BGTables.
 pub struct CapacityBGTableControl {
     tables: TableRegistry<CapacityBGTable>,
     store: Arc<BGTableStore>,
@@ -105,9 +103,6 @@ impl BGTableControl for CapacityBGTableControl {
         self.tables.remove(table_id);
     }
 
-    // The `table` handed in already carries its refreshed `active_bgs` (the
-    // caller ran `on_bg_*`), so we just store it. This is runtime-only state
-    // (`#[serde(skip)]`) — no table row / epoch change.
     fn refresh_bg_index(&self, table: BGTable) {
         if let BGTable::Capacity(table) = table {
             self.tables.put(table);
