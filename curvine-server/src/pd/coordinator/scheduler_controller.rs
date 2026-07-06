@@ -1,0 +1,115 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::scheduler::{default_schedulers, CoordinatorEvent, Scheduler};
+use super::CoordinatorContext;
+use orpc::runtime::RpcRuntime;
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
+
+/// Manages all schedulers.
+pub struct SchedulerController {
+    schedulers: Vec<Arc<dyn Scheduler>>,
+    ctx: Arc<CoordinatorContext>,
+}
+
+impl SchedulerController {
+    pub fn new(ctx: Arc<CoordinatorContext>) -> Self {
+        let schedulers = default_schedulers(ctx.clone())
+            .into_iter()
+            .map(|s| -> Arc<dyn Scheduler> { s.into() })
+            .collect();
+        Self { schedulers, ctx }
+    }
+
+    /// Spawn one task per scheduler on the shared runtime.
+    pub fn run_all(&self, token: CancellationToken) {
+        let rt = &self.ctx.runtime;
+        for scheduler in &self.schedulers {
+            let scheduler = scheduler.clone();
+            let ctx = self.ctx.clone();
+            let t = token.clone();
+            rt.spawn(async move {
+                Self::run_scheduler(scheduler, ctx, t).await;
+            });
+        }
+    }
+
+    async fn run_scheduler(
+        scheduler: Arc<dyn Scheduler>,
+        ctx: Arc<CoordinatorContext>,
+        token: CancellationToken,
+    ) {
+        let mut interval = scheduler.min_interval();
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => break,
+                _ = tokio::time::sleep(interval) => {}
+            }
+
+            if !scheduler.is_schedule_allowed(&ctx) {
+                interval = scheduler.next_interval(interval);
+                continue;
+            }
+
+            let ops = scheduler.schedule(&ctx);
+            if ops.is_empty() {
+                interval = scheduler.next_interval(interval);
+            } else {
+                let name = scheduler.name();
+                let mut rejected = 0u32;
+                for mut op in ops {
+                    op.id = ctx.operator_controller.next_operator_id();
+                    if !ctx.operator_controller.add_operator(op) {
+                        rejected += 1;
+                    }
+                }
+                if rejected > 0 {
+                    log::warn!(
+                        "scheduler '{}': {} operator(s) rejected by operator_controller",
+                        name,
+                        rejected
+                    );
+                }
+                interval = scheduler.min_interval();
+            }
+        }
+        log::info!("Scheduler '{}' stopped", scheduler.name());
+    }
+
+    pub fn on_event(&self, event: &CoordinatorEvent) {
+        for scheduler in &self.schedulers {
+            scheduler.on_event(event);
+        }
+    }
+
+    pub fn on_leader_start(&self) {
+        for scheduler in &self.schedulers {
+            scheduler.on_leader_start();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheduler_controller_constructs() {
+        let ctx = crate::pd::coordinator::checker::tests_common::test_context(
+            std::collections::HashMap::new(),
+        );
+        let _controller = SchedulerController::new(ctx);
+    }
+}
