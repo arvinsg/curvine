@@ -1,8 +1,9 @@
 use super::HashBGTableControl;
 use crate::pd::bgtable::placement::{
-    build_hash_table, create_hash_policy, rebuild_hash_table as placement_rebuild_hash_table,
-    select_with_fallback, BuildHashTableResult, HashPlacementContext, HashPlacementPolicy,
-    LabelConstraint, LabelOp, PlacementContext, PlacementRule, RebuildOptions, WorkerLoadSnapshot,
+    build_hash_table, build_worker_snapshots, create_hash_policy,
+    rebuild_hash_table as placement_rebuild_hash_table, select_with_fallback, BuildHashTableResult,
+    HashPlacementContext, HashPlacementPolicy, LabelConstraint, LabelOp, PendingInfluence,
+    PlacementContext, PlacementRule, RebuildOptions, WorkerLoadSnapshot,
 };
 use crate::pd::bgtable::{BGTable, BGTableControl};
 use crate::pd::config::keys;
@@ -72,28 +73,33 @@ impl<'a> HashPlacement<'a> {
         }
     }
 
-    /// Build per-table WorkerLoadSnapshot map for the given table.
-    ///
-    /// When `init` is true (new table creation), all actual counts are zero.
-    /// When false, counts are derived from existing BGs in the table.
+    /// Build per-table WorkerLoadSnapshot map for the given table via the shared
+    /// snapshot builder. On `init` (new table) there are no existing BGs, so all
+    /// counts are zero. The control path carries no operator influence, so
+    /// pending deltas are default (zero) — only the scheduler passes real
+    /// `PendingInfluence`.
     fn build_hash_worker_snapshots(
         &self,
         table: &BGTable,
         media: StorageType,
         init: bool,
     ) -> HashMap<u32, WorkerLoadSnapshot> {
-        let pool_type = table.storage_type();
-        let live_workers = self.controller.pool_manager.get_live_workers(pool_type);
+        let live_workers = self
+            .controller
+            .pool_manager
+            .get_live_workers(table.storage_type());
         let table_bgs = if init {
             Vec::new()
         } else {
             self.table_bgs(table)
         };
-
-        live_workers
-            .iter()
-            .map(|&wid| (wid, self.worker_snapshot(wid, media, &table_bgs, init)))
-            .collect()
+        build_worker_snapshots(
+            &live_workers,
+            &table_bgs,
+            &self.controller.pool_manager,
+            &PendingInfluence::default(),
+            media,
+        )
     }
 
     /// Existing BGs of a Hash table, resolved from the bucket list.
@@ -106,57 +112,6 @@ impl<'a> HashPlacement<'a> {
             .iter()
             .filter_map(|&id| bgs.get(&id).cloned())
             .collect()
-    }
-
-    /// One worker's load snapshot: actual BG/primary counts (zero on init),
-    /// labels, and storage stats.
-    fn worker_snapshot(
-        &self,
-        wid: u32,
-        media: StorageType,
-        table_bgs: &[Arc<BlockGroupInfo>],
-        init: bool,
-    ) -> WorkerLoadSnapshot {
-        let (actual_bg, actual_primary) = if init {
-            (0, 0)
-        } else {
-            Self::count_worker_load(table_bgs, wid)
-        };
-        let labels = self
-            .controller
-            .pool_manager
-            .get_worker_labels(wid)
-            .unwrap_or_default();
-        let (capacity, used) = self
-            .controller
-            .pool_manager
-            .get_worker_storage_stats(wid, media)
-            .unwrap_or((0, 0));
-        WorkerLoadSnapshot {
-            worker_id: wid,
-            actual_bg,
-            actual_primary,
-            pending_bg_add: 0,
-            pending_bg_remove: 0,
-            pending_primary_in: 0,
-            pending_primary_out: 0,
-            capacity_bytes: capacity,
-            used_bytes: used,
-            labels,
-        }
-    }
-
-    /// Count how many of `table_bgs` place a replica (and a primary) on `wid`.
-    fn count_worker_load(table_bgs: &[Arc<BlockGroupInfo>], wid: u32) -> (u32, u32) {
-        let bg = table_bgs
-            .iter()
-            .filter(|b| b.replica_set.contains(&wid))
-            .count() as u32;
-        let primary = table_bgs
-            .iter()
-            .filter(|b| b.primary.node_id == wid)
-            .count() as u32;
-        (bg, primary)
     }
 
     pub fn build_hash_table_plan(
