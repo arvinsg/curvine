@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::pd::bg::BGManager;
+use crate::pd::bgtable::BGTableManager;
 use crate::pd::config::ConfigManager;
-use crate::pd::meta::MetaManager;
+use crate::pd::coordinator::{Coordinator, CoordinatorContext, OperatorController};
+use crate::pd::metaroute::MetaRouteManager;
 use crate::pd::mount::MountManager;
 use crate::pd::node::NodeManager;
 use crate::pd::pool::PoolManager;
-use crate::pd::schedule::{Manager, ManagerContext, OperatorController};
 use curvine_common::state::{
-    HeartbeatPayload, HeartbeatRequest, HeartbeatResponse, HeartbeatResponsePayload,
+    BGKind, HeartbeatPayload, HeartbeatRequest, HeartbeatResponse, HeartbeatResponsePayload,
     MetaHeartbeatResponse, NodePayload, NodeState, NodeType, RegisterRequest,
     TaskHeartbeatResponse, WorkerHeartbeatResponse,
 };
@@ -29,24 +29,22 @@ use orpc::runtime::RpcRuntime;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-// LeaderChecker / RaftLeaderChecker / AlwaysLeader were moved to
-// `pd/journal/leader.rs` to avoid a circular dependency with `journal::Client`.
-// Re-exports keep existing call sites (`crate::pd::cluster::manager::...`) working.
+// LeaderChecker / RaftLeaderChecker / AlwaysLeader live in the leaf module.
 #[cfg(test)]
-pub use crate::pd::journal::AlwaysLeader;
-pub use crate::pd::journal::{LeaderChecker, RaftLeaderChecker};
+pub use crate::pd::leader::AlwaysLeader;
+pub use crate::pd::leader::{LeaderChecker, RaftLeaderChecker};
 
-/// Cluster manager: ties node, pool, bg and schedule manager.
+/// Cluster manager: ties node, pool, bg and coordinator.
 /// Owns the leader lifecycle: starts/stops schedule+liveness loops on leader change.
 pub struct ClusterManager {
     cluster_id: String,
     node_manager: Arc<NodeManager>,
     pool_manager: Arc<PoolManager>,
-    bg_manager: Arc<BGManager>,
+    bgtable_manager: Arc<BGTableManager>,
     config_manager: Arc<ConfigManager>,
     mount_manager: Arc<MountManager>,
-    meta_manager: Arc<MetaManager>,
-    schedule_manager: Arc<Manager>,
+    metaroute_manager: Arc<MetaRouteManager>,
+    coordinator: Arc<Coordinator>,
     leader_checker: Arc<dyn LeaderChecker>,
     runtime: Arc<orpc::runtime::Runtime>,
     leader_token: Mutex<Option<CancellationToken>>,
@@ -57,36 +55,36 @@ impl ClusterManager {
         cluster_id: String,
         node_manager: Arc<NodeManager>,
         pool_manager: Arc<PoolManager>,
-        bg_manager: Arc<BGManager>,
+        bgtable_manager: Arc<BGTableManager>,
         config_manager: Arc<ConfigManager>,
         mount_manager: Arc<MountManager>,
-        meta_manager: Arc<MetaManager>,
+        metaroute_manager: Arc<MetaRouteManager>,
         leader_checker: Arc<dyn LeaderChecker>,
         runtime: Arc<orpc::runtime::Runtime>,
     ) -> Self {
         let operator_controller = Arc::new(OperatorController::new(
             config_manager.clone(),
-            bg_manager.clone(),
+            bgtable_manager.clone(),
         ));
-        let ctx = Arc::new(ManagerContext {
+        let ctx = Arc::new(CoordinatorContext {
             node_manager: node_manager.clone(),
             pool_manager: pool_manager.clone(),
-            bg_manager: bg_manager.clone(),
+            bgtable_manager: bgtable_manager.clone(),
             config_manager: config_manager.clone(),
             operator_controller,
             runtime: runtime.clone(),
         });
-        let schedule_manager = Arc::new(Manager::new(ctx));
+        let coordinator = Arc::new(Coordinator::new(ctx));
 
         Self {
             cluster_id,
             node_manager,
             pool_manager,
-            bg_manager,
+            bgtable_manager,
             config_manager,
             mount_manager,
-            meta_manager,
-            schedule_manager,
+            metaroute_manager,
+            coordinator,
             leader_checker,
             runtime,
             leader_token: Mutex::new(None),
@@ -122,18 +120,12 @@ impl ClusterManager {
             return true;
         }
         log::info!(
-            "PD became leader, rebuilding runtime route view and starting schedule/liveness loops"
+            "PD became leader, resetting BG replica runtime states and starting coordinator/liveness loops"
         );
-        if let Err(e) = self.bg_manager.on_leader_start() {
-            log::warn!(
-                "BG leader-start route epoch bump failed, will retry leader start: {}",
-                e
-            );
-            return false;
-        }
+        self.bgtable_manager.reset_replica_states();
         let token = CancellationToken::new();
         let event_rx = self.node_manager.subscribe();
-        self.schedule_manager.clone().start(event_rx, token.clone());
+        self.coordinator.clone().start(event_rx, token.clone());
         self.node_manager
             .clone()
             .start_liveness_loop(self.runtime.clone(), token.clone());
@@ -144,7 +136,7 @@ impl ClusterManager {
     fn on_leader_stop(&self) {
         let mut guard = self.leader_token.lock().unwrap();
         if let Some(token) = guard.take() {
-            log::info!("PD lost leadership, stopping schedule and liveness loops");
+            log::info!("PD lost leadership, stopping coordinator and liveness loops");
             token.cancel();
         }
     }
@@ -245,7 +237,10 @@ impl ClusterManager {
 
         let (node_info, new_epoch) = self.node_manager.register(req)?;
 
-        let worker_bgs = self.bg_manager.get_bgs_on_worker(node_info.base.node_id);
+        let worker_bgs =
+            self.bgtable_manager
+                .bg()
+                .bgs_on_worker(BGKind::Hash, node_info.base.node_id, None);
         // Wire format expects Vec<BlockGroupInfo>; deref-clone Arc-wrapped values.
         let worker_bgs: Vec<curvine_common::state::BlockGroupInfo> =
             worker_bgs.into_iter().map(|arc| (*arc).clone()).collect();
@@ -254,7 +249,7 @@ impl ClusterManager {
             error: None,
             epoch: new_epoch,
             mount_version: self.mount_manager.version(),
-            table_epochs: self.bg_manager.get_table_epochs(),
+            table_epochs: self.bgtable_manager.get_table_epochs(),
             payload: HeartbeatResponsePayload::Worker(WorkerHeartbeatResponse {
                 add_bgs: worker_bgs,
                 remove_bgs: vec![],
@@ -267,11 +262,12 @@ impl ClusterManager {
         self.validate_worker_heartbeat(&req)?;
         let mut resp = self.node_manager.handle_heartbeat(req.clone())?;
 
-        let reported_bg_epochs: std::collections::HashMap<u32, u64> =
+        let reported_bg_epoch_by_id: std::collections::HashMap<curvine_common::state::BgId, u64> =
             if let HeartbeatPayload::Worker(ref w) = req.payload {
                 if !w.bg_reports.is_empty() {
                     if let Err(e) = self
-                        .bg_manager
+                        .bgtable_manager
+                        .bg()
                         .apply_replica_reports(req.node_id, &w.bg_reports)
                     {
                         log::warn!(
@@ -281,31 +277,32 @@ impl ClusterManager {
                         );
                         resp.error = Some(format!("apply bg_reports failed: {}", e));
                     }
-                } else if !w.bg_epochs.is_empty() {
-                    let bg_ids: Vec<u32> = w.bg_epochs.keys().copied().collect();
                     if let Err(e) = self
-                        .bg_manager
-                        .promote_pending_replicas(req.node_id, &bg_ids)
+                        .bgtable_manager
+                        .reconcile_replicas(req.node_id, &w.bg_reports)
                     {
                         log::warn!(
-                            "worker heartbeat promote_pending_replicas soft error worker_id={}, err={}",
+                            "worker heartbeat bg table reconcile soft error worker_id={}, err={}",
                             req.node_id,
                             e
                         );
-                        resp.error = Some(format!("promote pending replicas failed: {}", e));
+                        resp.error = Some(format!("reconcile bg_reports failed: {}", e));
                     }
                 }
-                w.bg_epochs.clone()
+                w.bg_reports
+                    .iter()
+                    .map(|report| (report.bg_id, report.bg_epoch))
+                    .collect()
             } else {
                 std::collections::HashMap::new()
             };
 
         resp.mount_version = self.mount_manager.version();
-        resp.table_epochs = self.bg_manager.get_table_epochs();
+        resp.table_epochs = self.bgtable_manager.get_table_epochs();
 
         let commands = self
-            .schedule_manager
-            .dispatch_operators(req.node_id, &reported_bg_epochs);
+            .coordinator
+            .dispatch_operators(req.node_id, &reported_bg_epoch_by_id);
         if let HeartbeatResponsePayload::Worker(ref mut w) = resp.payload {
             w.add_bgs.extend(commands.add_bgs);
             w.remove_bgs.extend(commands.remove_bgs);
@@ -324,14 +321,14 @@ impl ClusterManager {
             path_route_update: None,
             node_group_update: None,
         };
-        meta_resp.path_route_update = self.meta_manager.get_path_route_update();
-        meta_resp.node_group_update = self.meta_manager.get_node_group_update();
+        meta_resp.path_route_update = self.metaroute_manager.get_path_route_update();
+        meta_resp.node_group_update = self.metaroute_manager.get_node_group_update();
 
         Ok(HeartbeatResponse {
             error: None,
             epoch: new_epoch,
             mount_version: self.mount_manager.version(),
-            table_epochs: self.bg_manager.get_table_epochs(),
+            table_epochs: self.bgtable_manager.get_table_epochs(),
             payload: HeartbeatResponsePayload::Meta(meta_resp),
         })
     }
@@ -340,10 +337,10 @@ impl ClusterManager {
         self.validate_meta_heartbeat(&req)?;
         let mut resp = self.node_manager.handle_heartbeat(req)?;
         resp.mount_version = self.mount_manager.version();
-        resp.table_epochs = self.bg_manager.get_table_epochs();
+        resp.table_epochs = self.bgtable_manager.get_table_epochs();
         if let HeartbeatResponsePayload::Meta(ref mut meta) = resp.payload {
-            meta.path_route_update = self.meta_manager.get_path_route_update();
-            meta.node_group_update = self.meta_manager.get_node_group_update();
+            meta.path_route_update = self.metaroute_manager.get_path_route_update();
+            meta.node_group_update = self.metaroute_manager.get_node_group_update();
         }
         Ok(resp)
     }
@@ -357,7 +354,7 @@ impl ClusterManager {
             error: None,
             epoch: new_epoch,
             mount_version: self.mount_manager.version(),
-            table_epochs: self.bg_manager.get_table_epochs(),
+            table_epochs: self.bgtable_manager.get_table_epochs(),
             payload: HeartbeatResponsePayload::Task(TaskHeartbeatResponse::default()),
         })
     }
@@ -366,7 +363,7 @@ impl ClusterManager {
         self.validate_task_heartbeat(&req)?;
         let mut resp = self.node_manager.handle_heartbeat(req)?;
         resp.mount_version = self.mount_manager.version();
-        resp.table_epochs = self.bg_manager.get_table_epochs();
+        resp.table_epochs = self.bgtable_manager.get_table_epochs();
         Ok(resp)
     }
 
@@ -382,19 +379,15 @@ impl ClusterManager {
         self.pool_manager.clone()
     }
 
-    pub fn bg_manager(&self) -> Arc<BGManager> {
-        self.bg_manager.clone()
+    pub fn bgtable_manager(&self) -> Arc<BGTableManager> {
+        self.bgtable_manager.clone()
     }
 
     pub fn config_manager(&self) -> Arc<ConfigManager> {
         self.config_manager.clone()
     }
 
-    pub fn route_path(&self, path: &str) -> Option<u64> {
-        self.meta_manager.route(path).ok()
-    }
-
-    pub fn meta_manager(&self) -> Arc<MetaManager> {
-        self.meta_manager.clone()
+    pub fn metaroute_manager(&self) -> Arc<MetaRouteManager> {
+        self.metaroute_manager.clone()
     }
 }

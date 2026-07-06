@@ -27,16 +27,16 @@ impl HashPrimaryValidityChecker {
             || ctx
                 .bgtable_manager
                 .bg()
-                .get_replica_state(BGKind::Hash, bg.bg_id, bg.primary.node_id)
+                .get_replica_state(bg.kind, bg.bg_id, bg.primary.node_id)
                 != ReplicaState::Active
     }
 
     fn build_primary_transfer(bg: &BlockGroupInfo, ctx: &CoordinatorContext) -> Option<BGOperator> {
         let old_worker = bg.primary.node_id;
-        let primary_counts = ctx.bgtable_manager.bg().worker_primary_counts(BGKind::Hash, None);
+        let primary_counts = ctx.bgtable_manager.bg().worker_primary_counts(bg.kind, None);
 
         // Select from Active replicas, excluding the current (invalid) owner
-        let serving = ctx.bgtable_manager.bg().active_isr_workers(BGKind::Hash, bg.bg_id);
+        let serving = ctx.bgtable_manager.bg().active_isr_workers(bg.kind, bg.bg_id);
         let candidates: Vec<u32> = serving.into_iter().filter(|&w| w != old_worker).collect();
 
         let new_owner = candidates
@@ -46,7 +46,7 @@ impl HashPrimaryValidityChecker {
 
         Some(
             OperatorBuilder::new(
-                BGKind::Hash,
+                bg.kind,
                 OperatorKind::PrimaryTransfer,
                 bg.bg_id,
                 format!(
@@ -65,6 +65,10 @@ impl HashPrimaryValidityChecker {
 impl super::Checker for HashPrimaryValidityChecker {
     fn name(&self) -> &str {
         "hash-primary-validity-checker"
+    }
+
+    fn supported_kinds(&self) -> &[BGKind] {
+        &[BGKind::Hash]
     }
 
     fn check_bg(&self, bg: &BlockGroupInfo, ctx: &CoordinatorContext) -> Option<BGOperator> {

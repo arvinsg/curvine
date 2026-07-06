@@ -18,7 +18,7 @@ use self::hash_replica::HashReplicaChecker;
 use self::pool_membership::PoolMembershipChecker;
 use crate::pd::config::keys;
 use crate::pd::coordinator::{BGOperator, CoordinatorContext};
-use curvine_common::state::{BlockGroupInfo, NodeInfo, NodeState};
+use curvine_common::state::{BGKind, BlockGroupInfo, NodeInfo, NodeState};
 
 pub mod hash_placement_rule;
 pub mod hash_primary_validity;
@@ -63,6 +63,11 @@ impl CheckerPriority {
 pub trait Checker: Send + Sync {
     fn name(&self) -> &str;
     fn priority(&self) -> u32;
+
+    /// BG kinds this checker's `check_bg` operates on.
+    fn supported_kinds(&self) -> &[BGKind] {
+        &[]
+    }
 
     /// Check a single BG. Returns an operator if the BG needs correction.
     fn check_bg(&self, bg: &BlockGroupInfo, ctx: &CoordinatorContext) -> Option<BGOperator>;
@@ -300,10 +305,7 @@ pub mod tests_common {
                 stats: Default::default(),
                 replicas: Default::default(),
             };
-            self.ctx
-                .bgtable_manager
-                .test_seed_bg(bg.clone())
-                .unwrap();
+            self.ctx.bgtable_manager.test_seed_bg(bg.clone()).unwrap();
             bg
         }
 
@@ -326,7 +328,12 @@ pub mod tests_common {
         /// Balance schedulers require serving.len() == replica_set.len() to consider a BG.
         pub fn activate_all_replicas<B: TryInto<BgId> + Copy>(&self, bg_id: B) {
             let bg_id = bg_id.try_into().ok().expect("bg_id out of range");
-            let bg = self.ctx.bgtable_manager.bg().get_bg(BGKind::Hash, bg_id).expect("bg");
+            let bg = self
+                .ctx
+                .bgtable_manager
+                .bg()
+                .get_bg(BGKind::Hash, bg_id)
+                .expect("bg");
             for wid in bg.replica_set.iter().copied() {
                 self.ctx.bgtable_manager.bg().set_replica_state(
                     BGKind::Hash,

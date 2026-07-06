@@ -27,6 +27,10 @@ impl super::Checker for HashPlacementRuleChecker {
         "placement-rule-checker"
     }
 
+    fn supported_kinds(&self) -> &[BGKind] {
+        &[BGKind::Hash]
+    }
+
     fn check_bg(&self, bg: &BlockGroupInfo, ctx: &CoordinatorContext) -> Option<BGOperator> {
         if !is_hash_repair_candidate(bg) {
             return None;
@@ -42,7 +46,7 @@ impl super::Checker for HashPlacementRuleChecker {
             .placement_rule_for_table(&table);
         let min_level = rule.min_isolation_level.as_ref()?;
 
-        let resident = ctx.bgtable_manager.bg().replica_set_workers(BGKind::Hash, bg.bg_id);
+        let resident = ctx.bgtable_manager.bg().replica_set_workers(bg.kind, bg.bg_id);
         if resident.len() < 2 {
             return None;
         }
@@ -91,7 +95,7 @@ impl super::Checker for HashPlacementRuleChecker {
         let new_worker = best_replacement?;
 
         let mut builder = OperatorBuilder::new(
-            BGKind::Hash,
+            bg.kind,
             OperatorKind::Balance,
             bg.bg_id,
             format!(

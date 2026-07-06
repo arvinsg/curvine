@@ -16,7 +16,7 @@ use super::checker::{default_checkers, Checker};
 use super::operator::BGOperator;
 use super::operator_controller::OperatorController;
 use super::CoordinatorContext;
-use curvine_common::state::{BGOpState, NodeState, NodeType};
+use curvine_common::state::{BGKind, BGOpState, NodeState, NodeType};
 use std::sync::Arc;
 
 /// Runs all checkers in priority order during patrol.
@@ -53,30 +53,39 @@ impl CheckerController {
         let mut added_ops = Vec::new();
         let mut rejected = 0u32;
 
-        // Phase 1: Per-BG scan
-        let all_bgs = self
-            .ctx
-            .bgtable_manager
-            .bg()
-            .list_bgs(curvine_common::state::BGKind::Hash, None);
-        for bg in &all_bgs {
-            if bg.op_state != BGOpState::Idle {
+        // Phase 1: per-BG scan, grouped by kind. For each kind, only the checkers
+        // that declare support for it inspect that kind's BGs — so a Hash checker
+        // never runs against a Capacity BG (and vice versa). Kinds with no
+        // supporting checker (e.g. Capacity today) are skipped entirely.
+        for &kind in &[BGKind::Hash, BGKind::Capacity] {
+            let kind_checkers: Vec<&dyn Checker> = self
+                .checkers
+                .iter()
+                .filter(|c| c.supported_kinds().contains(&kind))
+                .map(|c| c.as_ref())
+                .collect();
+            if kind_checkers.is_empty() {
                 continue;
             }
-            for checker in &self.checkers {
-                if let Some(mut op) = checker.check_bg(bg, &self.ctx) {
-                    op.id = self.operator_controller.next_operator_id();
-                    if self.operator_controller.add_operator(op.clone()) {
-                        added_ops.push(op);
-                    } else {
-                        rejected += 1;
-                        log::warn!(
-                            "checker '{}': operator for bg {} rejected by operator_controller",
-                            checker.name(),
-                            bg.bg_id
-                        );
+            for bg in &self.ctx.bgtable_manager.bg().list_bgs(kind, None) {
+                if bg.op_state != BGOpState::Idle {
+                    continue;
+                }
+                for checker in &kind_checkers {
+                    if let Some(mut op) = checker.check_bg(bg, &self.ctx) {
+                        op.id = self.operator_controller.next_operator_id();
+                        if self.operator_controller.add_operator(op.clone()) {
+                            added_ops.push(op);
+                        } else {
+                            rejected += 1;
+                            log::warn!(
+                                "checker '{}': operator for bg {} rejected by operator_controller",
+                                checker.name(),
+                                bg.bg_id
+                            );
+                        }
+                        break;
                     }
-                    break;
                 }
             }
         }

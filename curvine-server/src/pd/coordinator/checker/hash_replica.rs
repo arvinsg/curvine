@@ -50,7 +50,7 @@ impl HashReplicaChecker {
         }
 
         let mut builder = OperatorBuilder::new(
-            BGKind::Hash,
+            bg.kind,
             OperatorKind::Repair,
             bg.bg_id,
             format!(
@@ -86,7 +86,7 @@ impl HashReplicaChecker {
         let excess = candidate_replicas.len() - desired;
         let primary = Some(bg.primary.node_id);
         let mut to_remove =
-            Self::select_replicas_to_remove(ctx, candidate_replicas, excess, primary);
+            Self::select_replicas_to_remove(ctx, bg.kind, candidate_replicas, excess, primary);
         if to_remove.is_empty() {
             return None;
         }
@@ -119,7 +119,7 @@ impl HashReplicaChecker {
         }
 
         let mut builder = OperatorBuilder::new(
-            BGKind::Hash,
+            bg.kind,
             OperatorKind::Repair,
             bg.bg_id,
             format!("Remove {} excess replicas", to_remove.len()),
@@ -147,6 +147,7 @@ impl HashReplicaChecker {
     ///   4. healthy replicas, ranked by topology+load policy
     fn select_replicas_to_remove(
         ctx: &CoordinatorContext,
+        kind: BGKind,
         candidate_replicas: &[u32],
         count: usize,
         primary: Option<u32>,
@@ -163,7 +164,7 @@ impl HashReplicaChecker {
             })
             .collect();
         let healthy_ranked =
-            Self::rank_healthy_by_policy(ctx, candidate_replicas, &healthy, primary);
+            Self::rank_healthy_by_policy(ctx, kind, candidate_replicas, &healthy, primary);
 
         let mut chosen: Vec<u32> = Vec::with_capacity(count);
         for w in on_decommission
@@ -187,6 +188,7 @@ impl HashReplicaChecker {
     /// load come first.
     fn rank_healthy_by_policy(
         ctx: &CoordinatorContext,
+        kind: BGKind,
         candidate_replicas: &[u32],
         healthy: &[u32],
         primary: Option<u32>,
@@ -205,7 +207,7 @@ impl HashReplicaChecker {
             .map(|&w| {
                 let is_owner = Some(w) == primary;
                 let iso = Self::isolation_without(w, candidate_replicas, &rule, &worker_labels);
-                let load = ctx.bgtable_manager.bg().bgs_on_worker(BGKind::Hash, w, None).len();
+                let load = ctx.bgtable_manager.bg().bgs_on_worker(kind, w, None).len();
                 (w, (is_owner, iso, load))
             })
             .collect();
@@ -271,6 +273,10 @@ fn filter_by_node_state(
 impl super::Checker for HashReplicaChecker {
     fn name(&self) -> &str {
         "replica-checker"
+    }
+
+    fn supported_kinds(&self) -> &[BGKind] {
+        &[BGKind::Hash]
     }
 
     fn check_bg(&self, bg: &BlockGroupInfo, ctx: &CoordinatorContext) -> Option<BGOperator> {

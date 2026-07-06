@@ -2,7 +2,7 @@ use super::error::ClusterError;
 use crate::pd::http::ApiResponse;
 use crate::pd::http_handler::PdHttpHandler;
 use axum::{extract::Path as PathParam, http::StatusCode, response::IntoResponse, Extension, Json};
-use curvine_common::state::{BGTableSummary, NodeInfo, NodeState, NodeType, PoolInfo, PoolType};
+use curvine_common::state::{BGTableSummary, NodeInfo, NodeState, NodeType, PoolInfo, StorageType};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -75,7 +75,7 @@ pub async fn get_pool_handler(
     Extension(instance): Extension<Arc<PdHttpHandler>>,
     PathParam(pool_type): PathParam<String>,
 ) -> impl IntoResponse {
-    let parsed = match PoolType::try_from(pool_type.as_str()) {
+    let parsed = match StorageType::try_from(pool_type.as_str()) {
         Ok(v) => v,
         Err(_) => {
             let err = ClusterError::pool_not_found(pool_type);
@@ -102,10 +102,10 @@ pub async fn get_pool_handler(
 pub async fn list_bg_tables_handler(
     Extension(instance): Extension<Arc<PdHttpHandler>>,
 ) -> impl IntoResponse {
-    let bg_mgr = instance.cluster_manager.bg_manager();
+    let bgtable_mgr = instance.cluster_manager.bgtable_manager();
     // Deref Arc<BGTable> for serde — the Arc wrapper isn't Serialize without
     // the `serde_with` rc feature.
-    let tables: Vec<crate::pd::bg::BGTable> = bg_mgr
+    let tables: Vec<crate::pd::bgtable::BGTable> = bgtable_mgr
         .list_tables()
         .into_iter()
         .map(|arc| (*arc).clone())
@@ -120,8 +120,8 @@ pub async fn get_bg_table_handler(
 ) -> impl IntoResponse {
     match instance
         .cluster_manager
-        .bg_manager()
-        .build_table_summary(table_id)
+        .bgtable_manager()
+        .build_table_summary(table_id as curvine_common::state::TableId)
     {
         Some(summary) => ApiResponse::success(summary),
         None => ApiResponse::<BGTableSummary>::success_with_status_code(StatusCode::NOT_FOUND),
@@ -130,7 +130,7 @@ pub async fn get_bg_table_handler(
 
 #[derive(Debug, Deserialize)]
 pub struct RebuildBody {
-    pub pool_type: PoolType,
+    pub pool_type: StorageType,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -145,7 +145,8 @@ pub async fn rebuild_bg_handler(
 ) -> impl IntoResponse {
     match instance
         .cluster_manager
-        .bg_manager()
+        .bgtable_manager()
+        .hash_placement()
         .rebuild_tables_for_pool(body.pool_type)
     {
         Ok(()) => ApiResponse::success(RebuildResult { success: true }),
