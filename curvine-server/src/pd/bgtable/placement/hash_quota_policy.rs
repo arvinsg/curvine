@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::context::HashPlacementContext;
-use super::policy::{
+use super::hash_policy::{
     build_hash_effective_counts, compute_equal_quota, select_by_hunger, HashPlacementPolicy,
     HashPolicyState,
 };

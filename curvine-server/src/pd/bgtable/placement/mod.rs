@@ -13,22 +13,19 @@
 // limitations under the License.
 
 pub mod context;
+pub mod hash_build;
 pub mod hash_capacity_weighted_policy;
-pub mod hash_plan;
+pub mod hash_policy;
 pub mod hash_quota_policy;
-pub mod policy;
 pub mod rule;
 
 use crate::pd::config::keys;
 
 pub use context::*;
+pub use hash_build::{BuildHashTableResult, HashPlanner, HashTableSpec, RebuildHashTableResult};
 pub use hash_capacity_weighted_policy::HashCapacityWeightedPolicy;
-pub(crate) use hash_plan::select_with_fallback;
-pub use hash_plan::{
-    build_hash_table, rebuild_hash_table, BuildHashTableResult, RebuildHashTableResult,
-};
+pub use hash_policy::*;
 pub use hash_quota_policy::HashQuotaPolicy;
-pub use policy::*;
 pub use rule::*;
 
 /// Create a Hash BG placement policy by strategy name.

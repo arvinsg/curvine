@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::context::HashPlacementContext;
-use super::policy::{
+use super::hash_policy::{
     build_hash_effective_counts, compute_equal_quota, HashPlacementPolicy, HashPolicyState,
 };
 use curvine_common::{FsError, FsResult};

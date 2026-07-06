@@ -1,8 +1,7 @@
 use super::HashBGTableControl;
 use crate::pd::bgtable::placement::{
-    build_hash_table, build_worker_snapshots, create_hash_policy,
-    rebuild_hash_table as placement_rebuild_hash_table, select_with_fallback, BuildHashTableResult,
-    HashPlacementContext, HashPlacementPolicy, LabelConstraint, LabelOp, PendingInfluence,
+    build_worker_snapshots, create_hash_policy, BuildHashTableResult, HashPlacementContext,
+    HashPlacementPolicy, HashPlanner, HashTableSpec, LabelConstraint, LabelOp, PendingInfluence,
     PlacementContext, PlacementRule, RebuildOptions, WorkerLoadSnapshot,
 };
 use crate::pd::bgtable::{BGTable, BGTableControl};
@@ -137,20 +136,14 @@ impl<'a> HashPlacement<'a> {
         let inputs = self.prepare_placement_inputs(pool_type, &table_for_snapshot, true)?;
         let ctx = self.build_context(&inputs, table_id, bucket_count, replica_count);
         let mut state = inputs.policy.prepare_hash(&ctx)?;
-        build_hash_table(
-            table_id,
+        let spec = HashTableSpec {
             namespace_id,
             pool_type,
-            bucket_count,
-            replica_count,
             next_bg_id,
             worker_labels,
             cache_replica_policy,
-            &ctx,
-            &inputs.rule,
-            inputs.policy.as_ref(),
-            &mut state,
-        )
+        };
+        HashPlanner::new(&ctx, &inputs.rule, inputs.policy.as_ref()).build_table(&spec, &mut state)
     }
 
     /// Select replacement workers for an existing BG.
@@ -174,9 +167,8 @@ impl<'a> HashPlacement<'a> {
             ht.bucket_count(),
             table.replica_count(),
         );
-        let worker_labels = ctx.worker_labels();
-        let constrained = inputs.rule.filter(&ctx.worker_ids(), &worker_labels);
         let mut state = inputs.policy.prepare_hash(&ctx)?;
+        let planner = HashPlanner::new(&ctx, &inputs.rule, inputs.policy.as_ref());
 
         let mut selected: Vec<u32> = Vec::with_capacity(count as usize);
         let mut exclude: HashSet<u32> = bg.replica_set.iter().copied().collect();
@@ -189,18 +181,9 @@ impl<'a> HashPlacement<'a> {
                 .chain(selected.iter().copied())
                 .collect();
 
-            let picked = select_with_fallback(
-                &ctx,
-                &mut state,
-                &inputs.rule,
-                inputs.policy.as_ref(),
-                &constrained,
-                &worker_labels,
-                &current,
-                &exclude,
-            );
-            let Some(picked) = picked else { break };
-
+            let Some(picked) = planner.select_with_fallback(&current, &exclude, &mut state) else {
+                break;
+            };
             selected.push(picked);
             exclude.insert(picked);
             state.record_bg_change(None, picked);
@@ -281,14 +264,10 @@ impl<'a> HashPlacement<'a> {
         );
         let mut state = inputs.policy.prepare_hash(&ctx)?;
 
-        let result = placement_rebuild_hash_table(
-            &table,
+        let result = HashPlanner::new(&ctx, &inputs.rule, inputs.policy.as_ref()).rebuild_table(
             &existing_bgs,
-            &ctx,
-            &inputs.rule,
-            inputs.policy.as_ref(),
-            &mut state,
             &RebuildOptions::default(),
+            &mut state,
         )?;
 
         let old_by_id: HashMap<BgId, BlockGroupInfo> = existing_bgs
