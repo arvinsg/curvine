@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::pd::bg::BGManager;
 use crate::pd::bgtable::BGTableManager;
 use crate::pd::pool::PoolManager;
 use curvine_common::state::{BGKind, BgId, BlockGroupInfo, StorageType, TableId};
@@ -147,7 +146,7 @@ pub fn build_worker_snapshots(
     pool_manager: &PoolManager,
     influence: &PendingInfluence,
     media: StorageType,
-) -> std::collections::HashMap<u32, WorkerLoadSnapshot> {
+) -> HashMap<u32, WorkerLoadSnapshot> {
     live_workers
         .iter()
         .map(|&wid| {
@@ -209,13 +208,12 @@ fn count_worker_load(table_bgs: &[Arc<BlockGroupInfo>], wid: u32) -> (u32, u32) 
 pub fn build_hash_table_snapshot(
     table_id: TableId,
     bgtable_manager: &BGTableManager,
-    bg_manager: &BGManager,
     pool_manager: &PoolManager,
     influence: &PendingInfluence,
     media: StorageType,
-) -> std::collections::HashMap<u32, WorkerLoadSnapshot> {
+) -> HashMap<u32, WorkerLoadSnapshot> {
     let Some(table) = bgtable_manager.get_table(table_id) else {
-        return std::collections::HashMap::new();
+        return HashMap::new();
     };
     let live_workers = pool_manager.get_live_workers(table.storage_type());
     let bucket_set: HashSet<BgId> = table
@@ -225,7 +223,8 @@ pub fn build_hash_table_snapshot(
         .iter()
         .copied()
         .collect();
-    let table_bgs: Vec<Arc<BlockGroupInfo>> = bg_manager
+    let table_bgs: Vec<Arc<BlockGroupInfo>> = bgtable_manager
+        .bg()
         .list_bgs(BGKind::Hash, None)
         .into_iter()
         .filter(|bg| bucket_set.contains(&bg.bg_id))
