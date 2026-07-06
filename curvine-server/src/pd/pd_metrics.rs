@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use crate::pd::bg::BGManager;
+use crate::pd::bgtable::BGTableManager;
+use crate::pd::coordinator::OperatorController;
 use crate::pd::node::NodeManager;
 use crate::pd::pool::PoolManager;
-use crate::pd::schedule::OperatorController;
 use curvine_common::state::{BGState, NodePayload, NodeState, NodeType};
 use orpc::common::{CounterVec, Gauge, GaugeVec, HistogramVec, Metrics as m, Metrics};
 use orpc::sys::SysUtils;
@@ -27,6 +28,7 @@ pub struct PdMetrics {
     node_manager: Arc<NodeManager>,
     pool_manager: Arc<PoolManager>,
     bg_manager: Arc<BGManager>,
+    bgtable_manager: Arc<BGTableManager>,
     operator_controller: Option<Arc<OperatorController>>,
 
     // ---- Node ----
@@ -81,6 +83,7 @@ impl PdMetrics {
         node_manager: Arc<NodeManager>,
         pool_manager: Arc<PoolManager>,
         bg_manager: Arc<BGManager>,
+        bgtable_manager: Arc<BGTableManager>,
     ) -> CommonResult<Self> {
         let buckets = vec![
             10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0,
@@ -89,6 +92,7 @@ impl PdMetrics {
             node_manager,
             pool_manager,
             bg_manager,
+            bgtable_manager,
             operator_controller: None,
 
             // Node
@@ -286,7 +290,7 @@ impl PdMetrics {
     fn snapshot_pool_gauges(&self) {
         let pools = self.pool_manager.list_active_pools();
         for pool in &pools {
-            let pid = pool.pool_type.to_string();
+            let pid = pool.media.to_string();
             self.pool_capacity_bytes
                 .with_label_values(&[&pid])
                 .set(pool.stats.capacity_bytes as i64);
@@ -298,7 +302,7 @@ impl PdMetrics {
                 .set(pool.stats.used_bytes as i64);
             self.pool_worker_count
                 .with_label_values(&[&pid])
-                .set(self.pool_manager.get_workers_in_pool(pool.pool_type).len() as i64);
+                .set(self.pool_manager.get_workers_in_pool(pool.media).len() as i64);
             self.pool_block_count
                 .with_label_values(&[&pid])
                 .set(pool.stats.block_count as i64);
@@ -306,7 +310,7 @@ impl PdMetrics {
     }
 
     fn snapshot_bg_gauges(&self) {
-        let bgs = self.bg_manager.list_bgs();
+        let bgs = self.bg_manager.list_all_bgs();
         self.bg_total.set(bgs.len() as i64);
 
         for state in &BGState::ALL {
@@ -327,16 +331,16 @@ impl PdMetrics {
     }
 
     fn snapshot_bg_table_gauges(&self) {
-        let tables = self.bg_manager.list_tables();
+        let tables = self.bgtable_manager.list_tables();
         self.bg_table_count.set(tables.len() as i64);
 
         for table in &tables {
-            let tid = table.table_id.to_string();
+            let tid = table.table_id().to_string();
             self.bg_table_bucket_count
                 .with_label_values(&[&tid])
-                .set(table.bucket_count as i64);
+                .set(table.hash_table().map(|t| t.bucket_count()).unwrap_or(0) as i64);
 
-            let stats = self.bg_manager.get_table_stats(table.table_id);
+            let stats = self.bgtable_manager.get_table_stats(table.table_id());
             self.bg_table_used_bytes
                 .with_label_values(&[&tid])
                 .set(stats.used_bytes as i64);

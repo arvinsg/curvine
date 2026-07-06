@@ -13,12 +13,15 @@
 // limitations under the License.
 
 use crate::pd::bg::{BGManager, BGStore};
+use crate::pd::bgtable::BGTableManager;
+use crate::pd::bgtable::BGTableStore;
 use crate::pd::cluster::ClusterManager;
 use crate::pd::config::ConfigManager;
 use crate::pd::http_handler::PdHttpHandler;
 use crate::pd::journal::{self, PdAppStorage};
-use crate::pd::meta::{MetaManager, RouteStore};
+use crate::pd::metaroute::{MetaRouteManager, MetaRouteStore};
 use crate::pd::mount::MountManager;
+use crate::pd::namespace::NamespaceManager;
 use crate::pd::node::NodeManager;
 use crate::pd::node::NodeStore;
 use crate::pd::pd_metrics::PdMetrics;
@@ -28,7 +31,7 @@ use curvine_common::conf::PdConf;
 use curvine_common::raft::storage::{LogStorage, RocksLogStorage};
 use curvine_common::raft::{RaftClient, RaftJournal, RoleMonitor};
 use curvine_common::rocksdb::DBEngine;
-use curvine_common::state::{FederationRouteMode, MetaNodeMode};
+use curvine_common::state::{FederationRouteConfig, MetaNodeMode};
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::info;
 use once_cell::sync::OnceCell;
@@ -55,13 +58,6 @@ fn parse_metanode_mode(s: &str) -> MetaNodeMode {
     }
 }
 
-fn parse_federation_route_mode(s: &str) -> FederationRouteMode {
-    match s.to_lowercase().as_str() {
-        "static" => FederationRouteMode::Static,
-        _ => FederationRouteMode::Hash,
-    }
-}
-
 type PdRaftJournal = RaftJournal<RocksLogStorage, PdAppStorage>;
 
 #[derive(Clone)]
@@ -69,6 +65,7 @@ struct PdService {
     conf: PdConf,
     config_manager: Arc<ConfigManager>,
     mount_manager: Arc<MountManager>,
+    namespace_manager: Arc<NamespaceManager>,
     cluster_manager: Arc<ClusterManager>,
 }
 
@@ -79,6 +76,7 @@ impl HandlerService for PdService {
         PdRpcHandler::new(
             self.config_manager.clone(),
             self.mount_manager.clone(),
+            self.namespace_manager.clone(),
             self.cluster_manager.clone(),
         )
     }
@@ -91,6 +89,7 @@ impl WebHandlerService for PdService {
         PdHttpHandler::new(
             self.config_manager.clone(),
             self.mount_manager.clone(),
+            self.namespace_manager.clone(),
             self.cluster_manager.clone(),
         )
     }
@@ -137,9 +136,6 @@ impl Pd {
             journal_client.clone(),
             conf.dynamic_config.clone(),
         ));
-        let mount_manager = Arc::new(MountManager::new(store.clone(), journal_client.clone()));
-        mount_manager.restore()?;
-
         let node_store = Arc::new(NodeStore::new(store.clone()));
         let node_manager = Arc::new(NodeManager::new(
             node_store,
@@ -152,38 +148,56 @@ impl Pd {
         pool_manager.restore()?;
 
         let bg_store = Arc::new(BGStore::new(store.clone()));
-        let bg_manager = Arc::new(BGManager::new(
-            bg_store,
+        let bg_manager = Arc::new(BGManager::new(bg_store, journal_client.clone()));
+
+        let table_store = Arc::new(BGTableStore::new(store.clone()));
+        let bgtable_manager = Arc::new(BGTableManager::new(
+            table_store,
+            bg_manager.clone(),
             pool_manager.clone(),
-            journal_client.clone(),
             config_manager.clone(),
-            conf.bucket_count,
-            conf.replica_counts.clone(),
             conf.location_labels.clone(),
         ));
-        bg_manager.restore()?;
+        // BGTableManager owns the BG-world restore order (BG metadata, then
+        // reset, then table indexes).
+        bgtable_manager.restore()?;
+
+        let namespace_manager = Arc::new(NamespaceManager::new(
+            store.clone(),
+            bgtable_manager.clone(),
+            journal_client.clone(),
+        ));
+        namespace_manager.restore()?;
+
+        let mount_manager = Arc::new(MountManager::new(
+            store.clone(),
+            journal_client.clone(),
+            namespace_manager.clone(),
+        ));
+        mount_manager.restore()?;
 
         PD_METRICS.get_or_init(|| {
             PdMetrics::new(
                 node_manager.clone(),
                 pool_manager.clone(),
                 bg_manager.clone(),
+                bgtable_manager.clone(),
             )
             .expect("Failed to initialize PD metrics")
         });
 
         let metanode_mode = parse_metanode_mode(&conf.metanode.mode);
-        let federation_route_mode = Some(parse_federation_route_mode(&conf.metanode.route_mode));
-        let route_store = Arc::new(RouteStore::new(store.clone()));
-        let meta_manager = Arc::new(MetaManager::new(
+        let federation_route_config =
+            FederationRouteConfig::new(conf.metanode.federation_hash_level);
+        let route_store = Arc::new(MetaRouteStore::new(store.clone()));
+        let metaroute_manager = Arc::new(MetaRouteManager::new(
             metanode_mode,
-            federation_route_mode,
-            conf.metanode.hash_level,
+            federation_route_config,
             node_manager.clone(),
             route_store,
             journal_client.clone(),
         ));
-        meta_manager.restore()?;
+        metaroute_manager.restore()?;
 
         let app_store = PdAppStorage::new(
             engine,
@@ -192,36 +206,37 @@ impl Pd {
             mount_manager.clone(),
             node_manager.clone(),
             pool_manager.clone(),
-            bg_manager.clone(),
-            meta_manager.clone(),
+            bgtable_manager.clone(),
+            namespace_manager.clone(),
+            metaroute_manager.clone(),
         );
 
         let role_monitor = RoleMonitor::new();
         let role_ctl = role_monitor.read_ctl();
         let leader_checker: Arc<dyn LeaderChecker> = Arc::new(RaftLeaderChecker::new(role_ctl));
 
-        // Wire the leader checker into the journal client so propose_as_leader*
+        // Wire the leader checker into the journal client so propose
         // paths can fast-fail when this node is no longer the raft leader.
         journal_client.set_leader_checker(leader_checker.clone());
 
         let rpc_conf = conf.pd_server_conf();
         let rpc_rt: Arc<Runtime> = Arc::new(rpc_conf.create_runtime());
-        let scheduler_rt: Arc<Runtime> = Arc::new(Runtime::new(
-            "pd-scheduler",
-            conf.scheduler_io_threads,
-            conf.scheduler_worker_threads,
+        let coordinator_rt: Arc<Runtime> = Arc::new(Runtime::new(
+            "pd-coordinator",
+            conf.coordinator_io_threads,
+            conf.coordinator_worker_threads,
         ));
 
         let cluster_manager = Arc::new(ClusterManager::new(
             conf.cluster_id.clone(),
             node_manager,
             pool_manager,
-            bg_manager,
+            bgtable_manager,
             config_manager.clone(),
             mount_manager.clone(),
-            meta_manager,
+            metaroute_manager,
             leader_checker,
-            scheduler_rt,
+            coordinator_rt,
         ));
 
         let raft_journal = PdRaftJournal::new(
@@ -236,6 +251,7 @@ impl Pd {
             conf: conf.clone(),
             config_manager,
             mount_manager,
+            namespace_manager,
             cluster_manager,
         };
         let rpc_server = RpcServer::with_rt(rpc_rt.clone(), rpc_conf, service.clone());
@@ -321,16 +337,17 @@ pub fn init_metrics_for_test() {
         let node_store = Arc::new(NodeStore::new(store.clone()));
         let node_mgr = Arc::new(NodeManager::new(node_store, config.clone(), jc.clone()));
         let pool_mgr = Arc::new(PoolManager::new(node_mgr.clone()));
-        let bg_store = Arc::new(BGStore::new(store));
-        let bg_mgr = Arc::new(BGManager::new(
-            bg_store,
+        let bg_store = Arc::new(BGStore::new(store.clone()));
+        let bg_mgr = Arc::new(BGManager::new(bg_store, jc.clone()));
+        let table_store = Arc::new(crate::pd::bgtable::BGTableStore::new(store));
+        let bgtable_mgr = Arc::new(crate::pd::bgtable::BGTableManager::new(
+            table_store,
+            bg_mgr.clone(),
             pool_mgr.clone(),
-            jc.clone(),
             config.clone(),
-            1024,
-            vec![3],
             vec![],
         ));
-        PdMetrics::new(node_mgr, pool_mgr, bg_mgr).expect("Failed to init test metrics")
+        PdMetrics::new(node_mgr, pool_mgr, bg_mgr, bgtable_mgr)
+            .expect("Failed to init test metrics")
     });
 }

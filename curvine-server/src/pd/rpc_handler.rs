@@ -15,6 +15,7 @@
 use crate::pd::cluster::ClusterManager;
 use crate::pd::config::ConfigManager;
 use crate::pd::mount::MountManager;
+use crate::pd::namespace::NamespaceManager;
 use crate::pd::pd_server::Pd;
 use crate::pd::rpc_context::RpcContext;
 use curvine_common::error::FsError;
@@ -32,6 +33,7 @@ use std::sync::Arc;
 pub struct PdRpcHandler {
     config_manager: Arc<ConfigManager>,
     mount_manager: Arc<MountManager>,
+    namespace_manager: Arc<NamespaceManager>,
     cluster_manager: Arc<ClusterManager>,
 }
 
@@ -39,11 +41,13 @@ impl PdRpcHandler {
     pub fn new(
         config_manager: Arc<ConfigManager>,
         mount_manager: Arc<MountManager>,
+        namespace_manager: Arc<NamespaceManager>,
         cluster_manager: Arc<ClusterManager>,
     ) -> Self {
         Self {
             config_manager,
             mount_manager,
+            namespace_manager,
             cluster_manager,
         }
     }
@@ -82,7 +86,7 @@ impl MessageHandler for PdRpcHandler {
                 let req: MountRequest = ctx.parse_header()?;
                 let mnt_opt = ProtoUtils::mount_options_from_pb(req.mount_options);
                 self.mount_manager
-                    .mount(None, &req.cv_path, &req.ufs_path, &mnt_opt)?;
+                    .mount(&req.cv_path, &req.ufs_path, &mnt_opt)?;
                 ctx.response(MountResponse::default())?
             }
             RpcCode::UnMount => {
@@ -109,9 +113,52 @@ impl MessageHandler for PdRpcHandler {
             }
             RpcCode::GetMetaRouteSummary => {
                 let _req: GetMetaRouteSummaryRequest = ctx.parse_header()?;
-                let summary = self.cluster_manager.meta_manager().build_client_summary()?;
+                let summary = self
+                    .cluster_manager
+                    .metaroute_manager()
+                    .build_client_summary()?;
                 ctx.response(GetMetaRouteSummaryResponse {
                     summary: ProtoUtils::meta_route_summary_to_pb(&summary),
+                })?
+            }
+            RpcCode::CreateNamespace => {
+                let req_pb: CreateNamespaceRequestProto = ctx.parse_header()?;
+                let req = ProtoUtils::create_namespace_request_from_pb(req_pb)?;
+                let name = req.name.clone();
+                self.namespace_manager.create_namespace(req)?;
+                let namespace = self
+                    .namespace_manager
+                    .get_namespace_by_name(&name)
+                    .ok_or_else(|| FsError::not_found(format!("namespace {} not found", name)))?;
+                ctx.response(CreateNamespaceResponseProto {
+                    namespace: ProtoUtils::namespace_info_to_pb(&namespace),
+                })?
+            }
+            RpcCode::GetNamespace => {
+                let req: GetNamespaceRequestProto = ctx.parse_header()?;
+                let namespace = if let Some(id) = req.id {
+                    self.namespace_manager
+                        .get_namespace(id as curvine_common::state::NamespaceId)
+                } else if let Some(name) = req.name {
+                    self.namespace_manager.get_namespace_by_name(&name)
+                } else {
+                    None
+                };
+                ctx.response(GetNamespaceResponseProto {
+                    namespace: namespace
+                        .as_ref()
+                        .map(|ns| ProtoUtils::namespace_info_to_pb(ns)),
+                })?
+            }
+            RpcCode::ListNamespaces => {
+                let _req: ListNamespacesRequestProto = ctx.parse_header()?;
+                let mut namespaces = self.namespace_manager.list_namespaces();
+                namespaces.sort_by_key(|ns| ns.id);
+                ctx.response(ListNamespacesResponseProto {
+                    namespaces: namespaces
+                        .iter()
+                        .map(|ns| ProtoUtils::namespace_info_to_pb(ns))
+                        .collect(),
                 })?
             }
             RpcCode::NodeRegister => {

@@ -16,9 +16,11 @@ use crate::pd::cluster::http_handler::*;
 use crate::pd::cluster::ClusterManager;
 use crate::pd::config::http_handler::*;
 use crate::pd::config::ConfigManager;
-use crate::pd::meta::http_handler::*;
+use crate::pd::metaroute::http_handler::*;
 use crate::pd::mount::http_handler::*;
 use crate::pd::mount::MountManager;
+use crate::pd::namespace::http_handler::*;
+use crate::pd::namespace::NamespaceManager;
 use crate::pd::pd_server::Pd;
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Router};
@@ -29,6 +31,7 @@ use std::sync::Arc;
 pub struct PdHttpHandler {
     pub(crate) config_manager: Arc<ConfigManager>,
     pub(crate) mount_manager: Arc<MountManager>,
+    pub(crate) namespace_manager: Arc<NamespaceManager>,
     pub(crate) cluster_manager: Arc<ClusterManager>,
 }
 
@@ -36,11 +39,13 @@ impl PdHttpHandler {
     pub fn new(
         config_manager: Arc<ConfigManager>,
         mount_manager: Arc<MountManager>,
+        namespace_manager: Arc<NamespaceManager>,
         cluster_manager: Arc<ClusterManager>,
     ) -> Self {
         Self {
             config_manager,
             mount_manager,
+            namespace_manager,
             cluster_manager,
         }
     }
@@ -61,6 +66,10 @@ impl RouterHandler for PdHttpHandler {
             .route("/api/v1/config/:key", get(get_config_handler))
             .route("/api/v1/config/:key", put(set_config_handler))
             .route("/api/v1/config", get(list_configs_handler))
+            // Namespace
+            .route("/api/v1/namespace", get(list_or_get_namespace_handler))
+            .route("/api/v1/namespace", post(create_namespace_handler))
+            .route("/api/v1/namespace", put(update_namespace_handler))
             // Mount
             .route("/api/v1/mount", get(list_mounts_handler))
             .route("/api/v1/mount", post(create_mount_handler))
