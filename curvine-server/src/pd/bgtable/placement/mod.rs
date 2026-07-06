@@ -13,12 +13,12 @@
 // limitations under the License.
 
 pub mod context;
+pub mod hash_capacity_weighted_policy;
 pub mod hash_plan;
 pub mod hash_quota_policy;
 pub mod policy;
 pub mod rule;
 pub mod snapshot;
-pub mod storage_weighted_hash_policy;
 
 use crate::pd::config::keys;
 
@@ -27,6 +27,7 @@ pub(crate) use hash_plan::select_with_fallback;
 pub use hash_plan::{
     build_hash_table, rebuild_hash_table, BuildHashTableResult, RebuildHashTableResult,
 };
+pub use hash_capacity_weighted_policy::HashCapacityWeightedPolicy;
 pub use hash_quota_policy::HashQuotaPolicy;
 pub use policy::{
     is_bg_gap_sufficient, is_primary_gap_sufficient, HashPlacementPolicy, HashPolicyState,
@@ -37,12 +38,11 @@ pub use rule::{
     worker_passes_constraints, worst_replica, LabelConstraint, LabelOp, Labels, PlacementRule,
 };
 pub use snapshot::{build_hash_table_snapshot, build_worker_snapshots};
-pub use storage_weighted_hash_policy::StorageWeightedHashPolicy;
 
 /// Create a Hash BG placement policy by strategy name.
 pub fn create_hash_policy(strategy: &str) -> Box<dyn HashPlacementPolicy> {
     match strategy {
-        keys::PD_BG_BALANCE_POLICY_CAPACITY => Box::new(StorageWeightedHashPolicy::new()),
+        keys::PD_BG_BALANCE_POLICY_CAPACITY => Box::new(HashCapacityWeightedPolicy::new()),
         _ => Box::new(HashQuotaPolicy::new()),
     }
 }
