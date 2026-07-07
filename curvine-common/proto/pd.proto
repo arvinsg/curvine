@@ -256,6 +256,7 @@ message NodeHeartbeatResponseProto {
     optional WorkerHeartbeatResponseProto worker = 5;
     optional MetaHeartbeatResponseProto meta = 6;
     optional TaskHeartbeatResponseProto task = 7;
+    optional SimpleClusterViewHintProto simple_cluster_view_hint = 8;
 }
 
 message NodeRegisterRequest {
@@ -307,6 +308,71 @@ message MetaRouteSummaryProto {
     repeated uint64 group_id_order = 6;
 }
 
+message SimpleBGTableViewProto {
+    required uint32 table_id = 1;
+    required uint32 kind = 2;
+    required StorageTypeProto storage_type = 3;
+    required uint32 replica_count = 4;
+    required uint64 route_epoch = 5;
+}
+
+message SimpleNamespaceViewProto {
+    required uint32 namespace_id = 1;
+    required string name = 2;
+    repeated SimpleBGTableViewProto cache_tier_tables = 3;
+    optional SimpleBGTableViewProto write_buffer_table = 4;
+}
+
+message SimpleMountBriefProto {
+    required uint32 mount_id = 1;
+    required string cv_path = 2;
+    required uint32 namespace_id = 3;
+    required uint64 version = 4;
+}
+
+message SimpleMountViewProto {
+    required uint64 version = 1;
+    repeated SimpleMountBriefProto mounts = 2;
+}
+
+message SimpleMetaRouteViewProto {
+    required MetaNodeModeProto mode = 1;
+    required uint64 static_route_version = 2;
+    required uint64 group_view_epoch = 3;
+}
+
+message SimpleClusterViewProto {
+    required string cluster_id = 1;
+    repeated SimpleNamespaceViewProto namespaces = 2;
+    required SimpleMountViewProto mount = 3;
+    required SimpleMetaRouteViewProto meta_route = 4;
+}
+
+message SimpleMetaRouteHintProto {
+    required uint64 static_route_version = 1;
+    required uint64 group_view_epoch = 2;
+}
+
+message SimpleClusterViewHintProto {
+    required uint64 mount_version = 1;
+    map<uint32, uint64> bg_table_route_epochs = 2;
+    required SimpleMetaRouteHintProto meta_route = 3;
+}
+
+message GetSimpleClusterViewRequest {
+}
+
+message GetSimpleClusterViewResponse {
+    required SimpleClusterViewProto view = 1;
+}
+
+message GetBGTableSummaryRequest {
+    required uint32 table_id = 1;
+}
+
+message GetBGTableSummaryResponse {
+    optional BGTableSummaryProto summary = 1;
+}
 
 // Namespace / BGTable creation API. Phase 1 supports Hash cache-tier tables only.
 message LabelMatchProto {

@@ -114,6 +114,9 @@ pub use self::node_rpc::*;
 mod meta_route;
 pub use self::meta_route::*;
 
+mod cluster;
+pub use self::cluster::*;
+
 mod node_info;
 pub use self::node_info::*;
 

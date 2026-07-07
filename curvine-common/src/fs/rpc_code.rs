@@ -90,6 +90,10 @@ pub enum RpcCode {
     CreateNamespace = 107,
     GetNamespace = 108,
     ListNamespaces = 109,
+
+    // pd cluster view / route details.
+    GetSimpleClusterView = 110,
+    GetBGTableSummary = 111,
 }
 
 impl RpcCode {
@@ -149,6 +153,8 @@ impl RpcCode {
             RpcCode::CreateNamespace => "CreateNamespace",
             RpcCode::GetNamespace => "GetNamespace",
             RpcCode::ListNamespaces => "ListNamespaces",
+            RpcCode::GetSimpleClusterView => "GetSimpleClusterView",
+            RpcCode::GetBGTableSummary => "GetBGTableSummary",
         }
     }
 

@@ -2,9 +2,30 @@ use super::error::ClusterError;
 use crate::pd::http::ApiResponse;
 use crate::pd::http_handler::PdHttpHandler;
 use axum::{extract::Path as PathParam, http::StatusCode, response::IntoResponse, Extension, Json};
-use curvine_common::state::{BGTableSummary, NodeInfo, NodeState, NodeType, PoolInfo, StorageType};
+use curvine_common::state::{
+    BGTableSummary, NodeInfo, NodeState, NodeType, PoolInfo, SimpleClusterView, StorageType,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+// ========== Cluster View ==========
+
+/// GET /api/v1/cluster/simple-view — lightweight cluster manifest.
+pub async fn get_simple_cluster_view_handler(
+    Extension(instance): Extension<Arc<PdHttpHandler>>,
+) -> impl IntoResponse {
+    match instance.cluster_manager.build_simple_cluster_view() {
+        Ok(view) => ApiResponse::success(view),
+        Err(e) => {
+            let err = ClusterError::internal_error(e);
+            ApiResponse::<SimpleClusterView>::error(
+                err.code().into(),
+                err.to_string(),
+                err.status_code(),
+            )
+        }
+    }
+}
 
 // ========== Node ==========
 

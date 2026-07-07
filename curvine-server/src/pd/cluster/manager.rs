@@ -164,72 +164,92 @@ impl ClusterManager {
         Ok(())
     }
 
-    fn validate_worker_register(&self, req: &RegisterRequest) -> FsResult<()> {
-        self.validate_cluster_id(&req.cluster_id)?;
-        if req.base.node_type != NodeType::Worker || !matches!(&req.payload, NodePayload::Worker(_))
-        {
+    /// Validate cluster_id, node type, and that the payload variant matches the
+    /// expected node type. `payload_matches` is computed by the caller because
+    /// register and heartbeat carry different payload enums. `what` names the
+    /// message context (e.g. "register" / "heartbeat").
+    fn validate_node(
+        &self,
+        cluster_id: &str,
+        actual: NodeType,
+        expected: NodeType,
+        payload_matches: bool,
+        what: &str,
+    ) -> FsResult<()> {
+        self.validate_cluster_id(cluster_id)?;
+        if actual != expected || !payload_matches {
             return Err(FsError::common(format!(
-                "expected Worker register payload, got node_type={:?}",
-                req.base.node_type
+                "expected {:?} {} payload, got node_type={:?}",
+                expected, what, actual
             )));
         }
         Ok(())
+    }
+
+    fn validate_worker_register(&self, req: &RegisterRequest) -> FsResult<()> {
+        let ok = matches!(&req.payload, NodePayload::Worker(_));
+        self.validate_node(
+            &req.cluster_id,
+            req.base.node_type,
+            NodeType::Worker,
+            ok,
+            "register",
+        )
     }
 
     fn validate_meta_register(&self, req: &RegisterRequest) -> FsResult<()> {
-        self.validate_cluster_id(&req.cluster_id)?;
-        if req.base.node_type != NodeType::Meta || !matches!(&req.payload, NodePayload::Meta(_)) {
-            return Err(FsError::common(format!(
-                "expected Meta register payload, got node_type={:?}",
-                req.base.node_type
-            )));
-        }
-        Ok(())
+        let ok = matches!(&req.payload, NodePayload::Meta(_));
+        self.validate_node(
+            &req.cluster_id,
+            req.base.node_type,
+            NodeType::Meta,
+            ok,
+            "register",
+        )
     }
 
     fn validate_task_register(&self, req: &RegisterRequest) -> FsResult<()> {
-        self.validate_cluster_id(&req.cluster_id)?;
-        if req.base.node_type != NodeType::Task || !matches!(&req.payload, NodePayload::Task(_)) {
-            return Err(FsError::common(format!(
-                "expected Task register payload, got node_type={:?}",
-                req.base.node_type
-            )));
-        }
-        Ok(())
+        let ok = matches!(&req.payload, NodePayload::Task(_));
+        self.validate_node(
+            &req.cluster_id,
+            req.base.node_type,
+            NodeType::Task,
+            ok,
+            "register",
+        )
     }
 
     fn validate_worker_heartbeat(&self, req: &HeartbeatRequest) -> FsResult<()> {
-        self.validate_cluster_id(&req.cluster_id)?;
-        if req.node_type != NodeType::Worker || !matches!(&req.payload, HeartbeatPayload::Worker(_))
-        {
-            return Err(FsError::common(format!(
-                "expected Worker heartbeat payload, got node_type={:?}",
-                req.node_type
-            )));
-        }
-        Ok(())
+        let ok = matches!(&req.payload, HeartbeatPayload::Worker(_));
+        self.validate_node(
+            &req.cluster_id,
+            req.node_type,
+            NodeType::Worker,
+            ok,
+            "heartbeat",
+        )
     }
 
     fn validate_meta_heartbeat(&self, req: &HeartbeatRequest) -> FsResult<()> {
-        self.validate_cluster_id(&req.cluster_id)?;
-        if req.node_type != NodeType::Meta || !matches!(&req.payload, HeartbeatPayload::Meta(_)) {
-            return Err(FsError::common(format!(
-                "expected Meta heartbeat payload, got node_type={:?}",
-                req.node_type
-            )));
-        }
-        Ok(())
+        let ok = matches!(&req.payload, HeartbeatPayload::Meta(_));
+        self.validate_node(
+            &req.cluster_id,
+            req.node_type,
+            NodeType::Meta,
+            ok,
+            "heartbeat",
+        )
     }
 
     fn validate_task_heartbeat(&self, req: &HeartbeatRequest) -> FsResult<()> {
-        self.validate_cluster_id(&req.cluster_id)?;
-        if req.node_type != NodeType::Task || !matches!(&req.payload, HeartbeatPayload::Task(_)) {
-            return Err(FsError::common(format!(
-                "expected Task heartbeat payload, got node_type={:?}",
-                req.node_type
-            )));
-        }
-        Ok(())
+        let ok = matches!(&req.payload, HeartbeatPayload::Task(_));
+        self.validate_node(
+            &req.cluster_id,
+            req.node_type,
+            NodeType::Task,
+            ok,
+            "heartbeat",
+        )
     }
 
     pub fn handle_worker_register(&self, req: RegisterRequest) -> FsResult<HeartbeatResponse> {

@@ -234,6 +234,7 @@ impl Pd {
             bgtable_manager,
             config_manager.clone(),
             mount_manager.clone(),
+            namespace_manager.clone(),
             metaroute_manager,
             leader_checker,
             coordinator_rt,

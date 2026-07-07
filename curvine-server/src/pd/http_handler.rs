@@ -75,6 +75,8 @@ impl RouterHandler for PdHttpHandler {
             .route("/api/v1/mount", post(create_mount_handler))
             .route("/api/v1/mount", delete(delete_mount_handler))
             .route("/api/v1/mount/path", get(get_mount_by_path_handler))
+            // Cluster View
+            .route("/api/v1/cluster/view", get(get_simple_cluster_view_handler))
             // Node
             .route("/api/v1/node/:node_type", get(list_nodes_by_type_handler))
             .route("/api/v1/node/detail/:node_id", get(get_node_detail_handler))
