@@ -121,6 +121,25 @@ impl MessageHandler for PdRpcHandler {
                     summary: ProtoUtils::meta_route_summary_to_pb(&summary),
                 })?
             }
+            RpcCode::GetSimpleClusterView => {
+                let _req: GetSimpleClusterViewRequest = ctx.parse_header()?;
+                let view = self.cluster_manager.build_simple_cluster_view()?;
+                ctx.response(GetSimpleClusterViewResponse {
+                    view: ProtoUtils::simple_cluster_view_to_pb(&view),
+                })?
+            }
+            RpcCode::GetBGTableSummary => {
+                let req: GetBgTableSummaryRequest = ctx.parse_header()?;
+                let table_id = u16::try_from(req.table_id).map_err(|_| {
+                    FsError::common(format!("table_id out of range: {}", req.table_id))
+                })?;
+                let summary = self
+                    .cluster_manager
+                    .bgtable_manager()
+                    .build_table_summary(table_id)
+                    .map(|summary| ProtoUtils::bg_table_summary_to_pb(&summary));
+                ctx.response(GetBgTableSummaryResponse { summary })?
+            }
             RpcCode::CreateNamespace => {
                 let req_pb: CreateNamespaceRequestProto = ctx.parse_header()?;
                 let req = ProtoUtils::create_namespace_request_from_pb(req_pb)?;

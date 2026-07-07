@@ -191,6 +191,7 @@ impl NodeManager {
             epoch: latest.epoch,
             mount_version: 0,
             table_epochs: Default::default(),
+            simple_cluster_view_hint: Default::default(),
             payload: Self::default_heartbeat_response(latest.base.node_type),
         })
     }

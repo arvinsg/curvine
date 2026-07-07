@@ -18,7 +18,9 @@ use crate::state::node_state::{NodeAddress, NodeBase, NodeType};
 use crate::state::task_node_info::TaskNodeStats;
 use crate::state::worker_node_info::StorageStats;
 use crate::state::PathRouteEntry;
-use crate::state::{BGKind, BGStats, BgId, BlockGroupInfo, ReplicaState, TableId};
+use crate::state::{
+    BGKind, BGStats, BgId, BlockGroupInfo, ReplicaState, SimpleClusterViewHint, TableId,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -117,6 +119,8 @@ pub struct HeartbeatResponse {
     pub mount_version: u64,
     #[serde(default)]
     pub table_epochs: HashMap<TableId, u64>,
+    #[serde(default)]
+    pub simple_cluster_view_hint: SimpleClusterViewHint,
     pub payload: HeartbeatResponsePayload,
 }
 

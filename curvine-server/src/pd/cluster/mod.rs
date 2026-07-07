@@ -15,6 +15,7 @@
 mod error;
 pub(crate) mod http_handler;
 pub mod manager;
+mod view;
 
 pub use error::ClusterError;
 pub use manager::ClusterManager;

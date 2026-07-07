@@ -17,6 +17,7 @@ use crate::pd::config::ConfigManager;
 use crate::pd::coordinator::{Coordinator, CoordinatorContext, OperatorController};
 use crate::pd::metaroute::MetaRouteManager;
 use crate::pd::mount::MountManager;
+use crate::pd::namespace::NamespaceManager;
 use crate::pd::node::NodeManager;
 use crate::pd::pool::PoolManager;
 use curvine_common::state::{
@@ -37,13 +38,14 @@ pub use crate::pd::leader::{LeaderChecker, RaftLeaderChecker};
 /// Cluster manager: ties node, pool, bg and coordinator.
 /// Owns the leader lifecycle: starts/stops schedule+liveness loops on leader change.
 pub struct ClusterManager {
-    cluster_id: String,
-    node_manager: Arc<NodeManager>,
-    pool_manager: Arc<PoolManager>,
-    bgtable_manager: Arc<BGTableManager>,
-    config_manager: Arc<ConfigManager>,
-    mount_manager: Arc<MountManager>,
-    metaroute_manager: Arc<MetaRouteManager>,
+    pub(crate) cluster_id: String,
+    pub(crate) node_manager: Arc<NodeManager>,
+    pub(crate) pool_manager: Arc<PoolManager>,
+    pub(crate) bgtable_manager: Arc<BGTableManager>,
+    pub(crate) config_manager: Arc<ConfigManager>,
+    pub(crate) mount_manager: Arc<MountManager>,
+    pub(crate) namespace_manager: Arc<NamespaceManager>,
+    pub(crate) metaroute_manager: Arc<MetaRouteManager>,
     coordinator: Arc<Coordinator>,
     leader_checker: Arc<dyn LeaderChecker>,
     runtime: Arc<orpc::runtime::Runtime>,
@@ -58,6 +60,7 @@ impl ClusterManager {
         bgtable_manager: Arc<BGTableManager>,
         config_manager: Arc<ConfigManager>,
         mount_manager: Arc<MountManager>,
+        namespace_manager: Arc<NamespaceManager>,
         metaroute_manager: Arc<MetaRouteManager>,
         leader_checker: Arc<dyn LeaderChecker>,
         runtime: Arc<orpc::runtime::Runtime>,
@@ -83,6 +86,7 @@ impl ClusterManager {
             bgtable_manager,
             config_manager,
             mount_manager,
+            namespace_manager,
             metaroute_manager,
             coordinator,
             leader_checker,
@@ -270,6 +274,7 @@ impl ClusterManager {
             epoch: new_epoch,
             mount_version: self.mount_manager.version(),
             table_epochs: self.bgtable_manager.get_table_epochs(),
+            simple_cluster_view_hint: self.build_simple_cluster_view_hint(),
             payload: HeartbeatResponsePayload::Worker(WorkerHeartbeatResponse {
                 add_bgs: worker_bgs,
                 remove_bgs: vec![],
@@ -319,6 +324,7 @@ impl ClusterManager {
 
         resp.mount_version = self.mount_manager.version();
         resp.table_epochs = self.bgtable_manager.get_table_epochs();
+        resp.simple_cluster_view_hint = self.build_simple_cluster_view_hint();
 
         let commands = self
             .coordinator
@@ -349,6 +355,7 @@ impl ClusterManager {
             epoch: new_epoch,
             mount_version: self.mount_manager.version(),
             table_epochs: self.bgtable_manager.get_table_epochs(),
+            simple_cluster_view_hint: self.build_simple_cluster_view_hint(),
             payload: HeartbeatResponsePayload::Meta(meta_resp),
         })
     }
@@ -358,6 +365,7 @@ impl ClusterManager {
         let mut resp = self.node_manager.handle_heartbeat(req)?;
         resp.mount_version = self.mount_manager.version();
         resp.table_epochs = self.bgtable_manager.get_table_epochs();
+        resp.simple_cluster_view_hint = self.build_simple_cluster_view_hint();
         if let HeartbeatResponsePayload::Meta(ref mut meta) = resp.payload {
             meta.path_route_update = self.metaroute_manager.get_path_route_update();
             meta.node_group_update = self.metaroute_manager.get_node_group_update();
@@ -375,6 +383,7 @@ impl ClusterManager {
             epoch: new_epoch,
             mount_version: self.mount_manager.version(),
             table_epochs: self.bgtable_manager.get_table_epochs(),
+            simple_cluster_view_hint: self.build_simple_cluster_view_hint(),
             payload: HeartbeatResponsePayload::Task(TaskHeartbeatResponse::default()),
         })
     }
@@ -384,6 +393,7 @@ impl ClusterManager {
         let mut resp = self.node_manager.handle_heartbeat(req)?;
         resp.mount_version = self.mount_manager.version();
         resp.table_epochs = self.bgtable_manager.get_table_epochs();
+        resp.simple_cluster_view_hint = self.build_simple_cluster_view_hint();
         Ok(resp)
     }
 
@@ -405,6 +415,10 @@ impl ClusterManager {
 
     pub fn config_manager(&self) -> Arc<ConfigManager> {
         self.config_manager.clone()
+    }
+
+    pub fn namespace_manager(&self) -> Arc<NamespaceManager> {
+        self.namespace_manager.clone()
     }
 
     pub fn metaroute_manager(&self) -> Arc<MetaRouteManager> {

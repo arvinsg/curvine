@@ -1490,6 +1490,206 @@ impl ProtoUtils {
         }
     }
 
+    pub fn simple_bg_table_view_to_pb(view: &SimpleBGTableView) -> SimpleBgTableViewProto {
+        SimpleBgTableViewProto {
+            table_id: view.table_id as u32,
+            kind: Self::bg_kind_to_pb(view.kind),
+            storage_type: view.storage_type.into(),
+            replica_count: view.replica_count as u32,
+            route_epoch: view.route_epoch,
+        }
+    }
+
+    pub fn simple_bg_table_view_from_pb(
+        view: SimpleBgTableViewProto,
+    ) -> FsResult<SimpleBGTableView> {
+        Ok(SimpleBGTableView {
+            table_id: u16::try_from(view.table_id).map_err(|_| {
+                Self::invalid_proto(format!("table_id out of range: {}", view.table_id))
+            })?,
+            kind: Self::bg_kind_from_pb(view.kind)?,
+            storage_type: StorageType::from(view.storage_type),
+            replica_count: u16::try_from(view.replica_count).map_err(|_| {
+                Self::invalid_proto(format!(
+                    "replica_count out of range: {}",
+                    view.replica_count
+                ))
+            })?,
+            route_epoch: view.route_epoch,
+        })
+    }
+
+    pub fn simple_namespace_view_to_pb(view: &SimpleNamespaceView) -> SimpleNamespaceViewProto {
+        SimpleNamespaceViewProto {
+            namespace_id: view.namespace_id as u32,
+            name: view.name.clone(),
+            cache_tier_tables: view
+                .cache_tier_tables
+                .iter()
+                .map(Self::simple_bg_table_view_to_pb)
+                .collect(),
+            write_buffer_table: view
+                .write_buffer_table
+                .as_ref()
+                .map(Self::simple_bg_table_view_to_pb),
+        }
+    }
+
+    pub fn simple_namespace_view_from_pb(
+        view: SimpleNamespaceViewProto,
+    ) -> FsResult<SimpleNamespaceView> {
+        let mut cache_tier_tables = Vec::with_capacity(view.cache_tier_tables.len());
+        for table in view.cache_tier_tables {
+            cache_tier_tables.push(Self::simple_bg_table_view_from_pb(table)?);
+        }
+        Ok(SimpleNamespaceView {
+            namespace_id: u16::try_from(view.namespace_id).map_err(|_| {
+                Self::invalid_proto(format!("namespace_id out of range: {}", view.namespace_id))
+            })?,
+            name: view.name,
+            cache_tier_tables,
+            write_buffer_table: view
+                .write_buffer_table
+                .map(Self::simple_bg_table_view_from_pb)
+                .transpose()?,
+        })
+    }
+
+    pub fn simple_mount_brief_to_pb(view: &SimpleMountBrief) -> SimpleMountBriefProto {
+        SimpleMountBriefProto {
+            mount_id: view.mount_id,
+            cv_path: view.cv_path.clone(),
+            namespace_id: view.namespace_id as u32,
+            version: view.version,
+        }
+    }
+
+    pub fn simple_mount_brief_from_pb(view: SimpleMountBriefProto) -> FsResult<SimpleMountBrief> {
+        Ok(SimpleMountBrief {
+            mount_id: view.mount_id,
+            cv_path: view.cv_path,
+            namespace_id: u16::try_from(view.namespace_id).map_err(|_| {
+                Self::invalid_proto(format!("namespace_id out of range: {}", view.namespace_id))
+            })?,
+            version: view.version,
+        })
+    }
+
+    pub fn simple_mount_view_to_pb(view: &SimpleMountView) -> SimpleMountViewProto {
+        SimpleMountViewProto {
+            version: view.version,
+            mounts: view
+                .mounts
+                .iter()
+                .map(Self::simple_mount_brief_to_pb)
+                .collect(),
+        }
+    }
+
+    pub fn simple_mount_view_from_pb(view: SimpleMountViewProto) -> FsResult<SimpleMountView> {
+        let mut mounts = Vec::with_capacity(view.mounts.len());
+        for mount in view.mounts {
+            mounts.push(Self::simple_mount_brief_from_pb(mount)?);
+        }
+        Ok(SimpleMountView {
+            version: view.version,
+            mounts,
+        })
+    }
+
+    pub fn simple_meta_route_view_to_pb(view: &SimpleMetaRouteView) -> SimpleMetaRouteViewProto {
+        SimpleMetaRouteViewProto {
+            mode: Self::meta_node_mode_to_pb(view.mode),
+            static_route_version: view.static_route_version,
+            group_view_epoch: view.group_view_epoch,
+        }
+    }
+
+    pub fn simple_meta_route_view_from_pb(
+        view: SimpleMetaRouteViewProto,
+    ) -> FsResult<SimpleMetaRouteView> {
+        Ok(SimpleMetaRouteView {
+            mode: Self::meta_node_mode_from_pb(view.mode)?,
+            static_route_version: view.static_route_version,
+            group_view_epoch: view.group_view_epoch,
+        })
+    }
+
+    pub fn simple_cluster_view_to_pb(view: &SimpleClusterView) -> SimpleClusterViewProto {
+        SimpleClusterViewProto {
+            cluster_id: view.cluster_id.clone(),
+            namespaces: view
+                .namespaces
+                .iter()
+                .map(Self::simple_namespace_view_to_pb)
+                .collect(),
+            mount: Self::simple_mount_view_to_pb(&view.mount),
+            meta_route: Self::simple_meta_route_view_to_pb(&view.meta_route),
+        }
+    }
+
+    pub fn simple_cluster_view_from_pb(
+        view: SimpleClusterViewProto,
+    ) -> FsResult<SimpleClusterView> {
+        let mut namespaces = Vec::with_capacity(view.namespaces.len());
+        for namespace in view.namespaces {
+            namespaces.push(Self::simple_namespace_view_from_pb(namespace)?);
+        }
+        Ok(SimpleClusterView {
+            cluster_id: view.cluster_id,
+            namespaces,
+            mount: Self::simple_mount_view_from_pb(view.mount)?,
+            meta_route: Self::simple_meta_route_view_from_pb(view.meta_route)?,
+        })
+    }
+
+    pub fn simple_meta_route_hint_to_pb(hint: &SimpleMetaRouteHint) -> SimpleMetaRouteHintProto {
+        SimpleMetaRouteHintProto {
+            static_route_version: hint.static_route_version,
+            group_view_epoch: hint.group_view_epoch,
+        }
+    }
+
+    pub fn simple_meta_route_hint_from_pb(hint: SimpleMetaRouteHintProto) -> SimpleMetaRouteHint {
+        SimpleMetaRouteHint {
+            static_route_version: hint.static_route_version,
+            group_view_epoch: hint.group_view_epoch,
+        }
+    }
+
+    pub fn simple_cluster_view_hint_to_pb(
+        hint: &SimpleClusterViewHint,
+    ) -> SimpleClusterViewHintProto {
+        SimpleClusterViewHintProto {
+            mount_version: hint.mount_version,
+            bg_table_route_epochs: hint
+                .bg_table_route_epochs
+                .iter()
+                .map(|(k, v)| (*k as u32, *v))
+                .collect(),
+            meta_route: Self::simple_meta_route_hint_to_pb(&hint.meta_route),
+        }
+    }
+
+    pub fn simple_cluster_view_hint_from_pb(
+        hint: SimpleClusterViewHintProto,
+    ) -> FsResult<SimpleClusterViewHint> {
+        Ok(SimpleClusterViewHint {
+            mount_version: hint.mount_version,
+            bg_table_route_epochs: hint
+                .bg_table_route_epochs
+                .into_iter()
+                .map(|(k, v)| {
+                    let key = u16::try_from(k).map_err(|_| {
+                        Self::invalid_proto(format!("table_id out of range: {}", k))
+                    })?;
+                    Ok((key, v))
+                })
+                .collect::<FsResult<_>>()?,
+            meta_route: Self::simple_meta_route_hint_from_pb(hint.meta_route),
+        })
+    }
+
     pub fn worker_heartbeat_response_to_pb(
         resp: &crate::state::WorkerHeartbeatResponse,
     ) -> WorkerHeartbeatResponseProto {
@@ -1698,6 +1898,9 @@ impl ProtoUtils {
             worker,
             meta,
             task,
+            simple_cluster_view_hint: Some(Self::simple_cluster_view_hint_to_pb(
+                &resp.simple_cluster_view_hint,
+            )),
         }
     }
 
@@ -1737,6 +1940,11 @@ impl ProtoUtils {
                     Ok((key, v))
                 })
                 .collect::<FsResult<_>>()?,
+            simple_cluster_view_hint: resp
+                .simple_cluster_view_hint
+                .map(Self::simple_cluster_view_hint_from_pb)
+                .transpose()?
+                .unwrap_or_default(),
             payload,
         })
     }
@@ -2251,12 +2459,51 @@ mod pd_proto_utils_tests {
     }
 
     #[test]
+    fn simple_cluster_view_round_trip() {
+        let view = SimpleClusterView {
+            cluster_id: "cluster-a".to_string(),
+            namespaces: vec![SimpleNamespaceView {
+                namespace_id: 1,
+                name: "default".to_string(),
+                cache_tier_tables: vec![SimpleBGTableView {
+                    table_id: 0x11,
+                    kind: BGKind::Hash,
+                    storage_type: StorageType::Ssd,
+                    replica_count: 3,
+                    route_epoch: 7,
+                }],
+                write_buffer_table: None,
+            }],
+            mount: SimpleMountView {
+                version: 9,
+                mounts: vec![SimpleMountBrief {
+                    mount_id: 1,
+                    cv_path: "/".to_string(),
+                    namespace_id: 1,
+                    version: 2,
+                }],
+            },
+            meta_route: SimpleMetaRouteView {
+                mode: MetaNodeMode::Federation,
+                static_route_version: 3,
+                group_view_epoch: 4,
+            },
+        };
+
+        let decoded =
+            ProtoUtils::simple_cluster_view_from_pb(ProtoUtils::simple_cluster_view_to_pb(&view))
+                .expect("simple cluster view round trip");
+        assert_eq!(decoded, view);
+    }
+
+    #[test]
     fn heartbeat_response_task_round_trip() {
         let resp = HeartbeatResponse {
             error: None,
             epoch: 5,
             mount_version: 6,
             table_epochs: HashMap::from([(2, 10)]),
+            simple_cluster_view_hint: Default::default(),
             payload: HeartbeatResponsePayload::Task(TaskHeartbeatResponse::default()),
         };
         let decoded =
@@ -2275,6 +2522,7 @@ mod pd_proto_utils_tests {
             epoch: 3,
             mount_version: 4,
             table_epochs: HashMap::from([(1, 9)]),
+            simple_cluster_view_hint: Default::default(),
             payload: HeartbeatResponsePayload::Worker(WorkerHeartbeatResponse {
                 add_bgs: vec![BlockGroupInfo {
                     bg_id: 7,
@@ -2426,6 +2674,7 @@ mod pd_proto_utils_tests {
             epoch: 1,
             mount_version: 1,
             table_epochs: HashMap::new(),
+            simple_cluster_view_hint: Default::default(),
             payload: HeartbeatResponsePayload::Worker(WorkerHeartbeatResponse::default()),
         };
         let mut pb = ProtoUtils::heartbeat_response_to_pb(&resp);
